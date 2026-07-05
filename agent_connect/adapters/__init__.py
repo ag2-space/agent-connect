@@ -1,8 +1,9 @@
 """Per-agent adapters. An adapter maps (task, sandbox, cwd) -> output text."""
 from . import codex  # noqa: F401
 from . import ollama  # noqa: F401
+from . import omnigent  # noqa: F401
 
-ADAPTERS = {"codex": codex, "ollama": ollama}
+ADAPTERS = {"codex": codex, "ollama": ollama, "omnigent": omnigent}
 
 
 def get(name):
