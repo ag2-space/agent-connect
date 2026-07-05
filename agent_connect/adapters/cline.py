@@ -11,7 +11,13 @@ with no credentials it fails fast with an auth message, which we surface.
 allowFrom-restricted agent. For non-owner tiers, set CLINE_COMMAND_PERMISSIONS
 to restrict the command set (follow-up; today's agents are owner-only).
 
-  AGENT_CONNECT_CLINE_BIN   cline binary [default: cline]
+Cline is model-agnostic — set the provider/model to run it on any backend
+(e.g. Google Gemini): authenticate once with `cline auth google`, or pin per
+agent via the env below. Auth (the API key) lives in Cline's own store, not here.
+
+  AGENT_CONNECT_CLINE_BIN        cline binary [default: cline]
+  AGENT_CONNECT_CLINE_PROVIDER   provider id, e.g. google (adds -P)
+  AGENT_CONNECT_CLINE_MODEL      model id,   e.g. gemini-2.5-pro (adds -m)
 """
 from __future__ import annotations
 
@@ -19,10 +25,17 @@ import os
 import subprocess
 
 BIN = os.environ.get("AGENT_CONNECT_CLINE_BIN", "cline")
+PROVIDER = os.environ.get("AGENT_CONNECT_CLINE_PROVIDER", "").strip()
+MODEL = os.environ.get("AGENT_CONNECT_CLINE_MODEL", "").strip()
 
 
 def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
-    cmd = [BIN, "-y", task]
+    cmd = [BIN, "-y"]
+    if PROVIDER:
+        cmd += ["-P", PROVIDER]
+    if MODEL:
+        cmd += ["-m", MODEL]
+    cmd += [task]
     try:
         proc = subprocess.run(
             cmd,

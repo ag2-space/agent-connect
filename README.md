@@ -54,13 +54,21 @@ sandbox so a stranger in a shared room can't make your agent edit your files:
 An adapter is ~20 lines: "given a task string + sandbox + working dir, run the
 agent and return its output." Ships with:
 
-Roadmap (owner-confirmed 2026-07-05) — each is a ~20-line `run(task, sandbox, cwd)`:
-1. **Codex** — `codex exec`. ✅ worker verified.
-2. **Hermes**
-3. **OpenClaw**
-4. **Cline**
-5. **PI**
-6. **Kilo**
+**Three integration levers** (pick per agent):
+1. **Direct adapter** — a ~30-line wrapper around an agent's own headless CLI. Best when the agent has a clean exec mode.
+2. **`omnigent` adapter** — one adapter that drives [omnigent](https://github.com/omnigent-ai/omnigent)'s whole harness catalog (claude, codex, cursor, kimi, qwen, goose, hermes, pi, opencode, …). Unlocks many agents from a single file and isolates that (alpha) dependency. Per-message `[harness]` prefix selects the harness.
+3. **ACP adapter** *(planned)* — one adapter for any agent that speaks the Agent Client Protocol (Cline, Pi, Codex, Claude, OpenClaw via `acpx`).
+
+**Shipped adapters:**
+- **codex** — `codex exec`. ✅ verified, live.
+- **ollama** — local model via the Ollama HTTP API (fully private, no provider auth). ✅ verified, live.
+- **omnigent** — drives any omnigent harness. ✅ verified, live.
+- **cline** — `cline -y`. ✅ verified (command path + auth handling); go-live needs Cline auth.
+- **kilo** — `kilo run --auto`. ⚠️ scaffold; headless output capture unverified (needs Kilo auth to confirm / finish).
+
+**Roadmap coverage** (owner list Codex/Hermes/OpenClaw/Cline/PI/Kilo): Codex ✅ · Hermes ✅ (omnigent) · PI ✅ (omnigent / ACP) · Cline ✅ (direct / ACP) · Kilo ⚠️ (direct scaffold, or omnigent's opencode harness) · OpenClaw = a personal-assistant *gateway*, not a coding harness → reach its coding via ACP.
+
+**Auth model — two independent layers:** (1) agent identity → AG2 Space (a relay token we issue); (2) the agent's own tool auth (its login / provider API key), which AG2 Space never sees. `ollama` needs no provider auth (the model is local).
 
 The framework is agent-agnostic; the transport + onboarding + access-tiers are shared.
 
