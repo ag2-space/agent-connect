@@ -21,16 +21,41 @@ agent via the env below. Auth (the API key) lives in Cline's own store, not here
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 
 BIN = os.environ.get("AGENT_CONNECT_CLINE_BIN", "cline")
 PROVIDER = os.environ.get("AGENT_CONNECT_CLINE_PROVIDER", "").strip()
 MODEL = os.environ.get("AGENT_CONNECT_CLINE_MODEL", "").strip()
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _extract(stdout: str) -> str:
+    """Pull the answer out of Cline's `--json` NDJSON stream. Cline (act mode)
+    finishes with a `run_result` event whose text summarizes what it did — the
+    cleanest thing to surface. Fall back to ANSI-stripped raw output."""
+    result = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") == "run_result" and ev.get("text"):
+            result = ev["text"]
+    if result:
+        # cline prefixes completion summaries with "Submission recorded (verified): "
+        return re.sub(r"^Submission recorded \(verified\):\s*", "", result).strip()
+    return _ANSI.sub("", stdout).strip()
+
 
 def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
-    cmd = [BIN, "-y"]
+    cmd = [BIN, "--json", "-y"]  # --json => parseable event stream
     if PROVIDER:
         cmd += ["-P", PROVIDER]
     if MODEL:
@@ -49,7 +74,7 @@ def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
         return f"agent-connect: `{BIN}` not found — install Cline (`npm i -g cline`, Node 22+)."
     except subprocess.TimeoutExpired:
         return f"agent-connect: cline timed out after {timeout}s."
-    out = (proc.stdout or "").strip()
+    out = _extract(proc.stdout or "")
     if proc.returncode != 0 and not out:
         return f"agent-connect: cline exited {proc.returncode}.\n{(proc.stderr or '')[-1000:]}"
     return out or "(cline produced no output)"
