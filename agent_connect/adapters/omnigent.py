@@ -30,8 +30,11 @@ MODEL = os.environ.get("AGENT_CONNECT_OMNIGENT_MODEL", "").strip()
 
 # Per-message harness selection: a leading "[<harness>]" picks the harness for
 # that message, overriding the env default — so ONE @omnigent agent can route to
-# any harness ("[kimi] fix the bug", "[cursor] …"). No bracket → env default.
-_HARNESS_PREFIX = re.compile(r"^\s*\[([a-zA-Z0-9_-]+)\]\s*(.*)$", re.S)
+# any harness. Accepts both the terse "[kimi] …" and the explicit
+# "[harness: kimi] …" / "[harness:kimi] …" forms. No bracket → env default.
+_HARNESS_PREFIX = re.compile(
+    r"^\s*\[\s*(?:harness\s*:\s*)?([a-zA-Z0-9_-]+)\s*\]\s*(.*)$", re.S | re.I
+)
 
 
 def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
