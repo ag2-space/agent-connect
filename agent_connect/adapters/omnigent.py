@@ -21,15 +21,25 @@ is the working dir the harness operates in — for coding harnesses this is the
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 BIN = os.environ.get("AGENT_CONNECT_OMNIGENT_BIN", "omnigent")
 HARNESS = os.environ.get("AGENT_CONNECT_OMNIGENT_HARNESS", "claude")
 MODEL = os.environ.get("AGENT_CONNECT_OMNIGENT_MODEL", "").strip()
 
+# Per-message harness selection: a leading "[<harness>]" picks the harness for
+# that message, overriding the env default — so ONE @omnigent agent can route to
+# any harness ("[kimi] fix the bug", "[cursor] …"). No bracket → env default.
+_HARNESS_PREFIX = re.compile(r"^\s*\[([a-zA-Z0-9_-]+)\]\s*(.*)$", re.S)
+
 
 def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
-    cmd = [BIN, "run", "--harness", HARNESS]
+    harness = HARNESS
+    m = _HARNESS_PREFIX.match(task)
+    if m:
+        harness, task = m.group(1), m.group(2)
+    cmd = [BIN, "run", "--harness", harness]
     if MODEL:
         cmd += ["--model", MODEL]
     cmd += ["-p", task]
@@ -48,11 +58,11 @@ def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
             "(`uv tool install omnigent`)."
         )
     except subprocess.TimeoutExpired:
-        return f"agent-connect: omnigent ({HARNESS}) timed out after {timeout}s."
+        return f"agent-connect: omnigent ({harness}) timed out after {timeout}s."
     out = (proc.stdout or "").strip()
     if proc.returncode != 0 and not out:
         return (
-            f"agent-connect: omnigent ({HARNESS}) exited {proc.returncode}.\n"
+            f"agent-connect: omnigent ({harness}) exited {proc.returncode}.\n"
             f"{(proc.stderr or '')[-1000:]}"
         )
     return out or "(omnigent produced no output)"
