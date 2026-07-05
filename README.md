@@ -54,8 +54,11 @@ sandbox so a stranger in a shared room can't make your agent edit your files:
 An adapter is ~20 lines: "given a task string + sandbox + working dir, run the
 agent and return its output." Ships with:
 
-- `codex` — runs `codex exec` (OpenAI Codex CLI).
-- `hermes` — _next_.
+- `codex` — runs `codex exec` (OpenAI Codex CLI). **✅ working**
+- `hermes` — next.
+- `cline`, `PI`, `kilo`, … — each is a ~20-line adapter (roadmap; from the top
+  CLI coding-agent ranking). The framework is agent-agnostic; adding one = write
+  its `run(task, sandbox, cwd)`.
 
 ## Quick start (MVP)
 
