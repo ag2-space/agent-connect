@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-connect"
+version = "0.1.0"
+description = "Connect your local agent (Codex, Hermes, …) to AG2 Space as a first-class room agent."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["ag2space", "codex", "matrix", "agent", "bridge"]
+dependencies = []
+
+[project.scripts]
+agent-connect = "agent_connect.worker:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_connect*"]
