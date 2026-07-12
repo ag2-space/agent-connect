@@ -87,7 +87,8 @@ RELAY_DIR="$HOME/.sutando-relay-client"
 mkdir -p "$RELAY_DIR"
 say "fetching relay client into $RELAY_DIR"
 for f in remote-gateway-bridge.py workspace_default.py task_archive.py \
-         local_task_protocol.py result_markers.py send_allowlist.py; do
+         local_task_protocol.py result_markers.py send_allowlist.py \
+         util_paths.py sutando_config.py; do
   curl -fsSL "$RELAY_RAW_BASE/$f" -o "$RELAY_DIR/$f" || {
     echo "install.sh: failed to fetch $f from $RELAY_RAW_BASE" >&2; exit 1; }
 done

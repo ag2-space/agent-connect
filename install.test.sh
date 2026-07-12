@@ -53,10 +53,11 @@ fi
 # the 6 relay files should have landed in the fake HOME
 missing=0
 for f in remote-gateway-bridge.py workspace_default.py task_archive.py \
-         local_task_protocol.py result_markers.py send_allowlist.py; do
+         local_task_protocol.py result_markers.py send_allowlist.py \
+         util_paths.py sutando_config.py; do
   [ -f "$TMP/.sutando-relay-client/$f" ] || { missing=$((missing+1)); }
 done
-[ "$missing" -eq 0 ] && ok "relay client + 5 deps fetched" || bad "$missing relay files missing"
+[ "$missing" -eq 0 ] && ok "relay client + 7 deps fetched" || bad "$missing relay files missing"
 # the compat shim should exist too
 [ -f "$TMP/.sutando-relay-client/remote-relay-bridge.py" ] && ok "compat shim written" || bad "compat shim missing"
 
