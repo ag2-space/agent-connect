@@ -65,7 +65,23 @@ if [ -f "$LAUNCHER" ]; then
   grep -q 'exec "' "$LAUNCHER" && ok "launcher execs the worker" || bad "launcher missing worker exec"
 fi
 
-# 6) the sparse-fetch path is gone for good (PyPI is the single source)
+# 6) --sutando-workspace relay-only mode: launcher wired to the given
+#    workspace, NO worker exec, worker install skipped
+SWS="$TMP/sutando-ws"; mkdir -p "$SWS"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token TESTTOK --sutando-workspace "$SWS" --no-start 2>&1) || {
+  printf '%s\n' "$out" | sed 's/^/    /'; bad "sutando-mode dry-run exited non-zero"; }
+printf '%s\n' "$out" | grep -q "relay-only" && ok "sutando mode announces relay-only" || bad "sutando mode missing relay-only notice"
+L="$TMP/.agent-connect/launch.sh"
+if sh -n "$L"; then ok "sutando launch.sh syntax clean"; else bad "sutando launch.sh syntax"; fi
+grep -q "$SWS/tasks" "$L" && ok "launcher wired to sutando tasks/" || bad "launcher missing sutando tasks dir"
+grep -q "$SWS/results" "$L" && ok "launcher wired to sutando results/" || bad "launcher missing sutando results dir"
+grep -q 'exec "'"$TMP"'/ag2-sparrow"' "$L" && ok "launcher execs the relay" || bad "launcher missing relay exec"
+if grep -q "agent-connect\"$" "$L"; then bad "sutando launcher must NOT exec a worker (double-processing)"; else ok "no worker exec in sutando launcher"; fi
+# bogus workspace path is refused early
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --sutando-workspace "$TMP/nope" --no-start >/dev/null 2>&1; then
+  bad "nonexistent --sutando-workspace should fail"; else ok "nonexistent --sutando-workspace → refused"; fi
+
+# 7) the sparse-fetch path is gone for good (PyPI is the single source)
 if grep -q "raw.githubusercontent.com" "$SCRIPT"; then
   bad "install.sh still sparse-fetches from raw.githubusercontent.com"
 else
