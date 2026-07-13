@@ -29,11 +29,20 @@ set -eu
 # ── args ────────────────────────────────────────────────────────────────────
 TOKEN="${AGENT_CONNECT_TOKEN:-}"
 ADAPTER="${AGENT_CONNECT_ADAPTER:-codex}"
-REPO="${AGENT_CONNECT_REPO:-$(pwd)}"
+# Working dir default is ~/agents (NOT pwd): a pwd default silently bakes
+# wherever the user happened to run the installer into the service config —
+# including TCC-protected folders like ~/Documents where a launchd-run agent
+# cannot write (live-caught 2026-07-13). Explicit --repo (or env) still wins.
+REPO="${AGENT_CONNECT_REPO:-$HOME/agents}"
 SUTANDO_WS="${AGENT_CONNECT_SUTANDO_WORKSPACE:-}"
 START=1
 # agent-connect source: overridable so this same script serves both the
 # private-repo phase (git+ssh for repo-holders) and the public phase (PyPI).
+# Worker install source. Default stays the git spec until the PyPI publish
+# (name pending owner confirmation) actually completes — flipping the default
+# to an unpublished package would break every fresh install in the gap. The
+# one-line flip to "ag2-agent-connect>=0.2.0" (or the confirmed name) lands as
+# the publish commit.
 AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-git+https://github.com/ag2-space/agent-connect.git}"
 # relay client: the ag2-sparrow package on PyPI (transport-only; long-polls YOUR
 # agent's tasks and posts results back). Overridable for pre-release testing.
@@ -79,6 +88,16 @@ if [ -n "$SUTANDO_WS" ]; then
 fi
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
+
+# Working directory: state it loudly (invisible defaults are how agents end up
+# in the wrong folder), create it if it's the default, and warn on macOS
+# TCC-protected paths where a service-run agent gets EPERM on writes.
+mkdir -p "$REPO" 2>/dev/null || true
+say "agent working directory: $REPO   (change with --repo <path>)"
+case "$REPO" in
+  "$HOME/Documents"*|"$HOME/Desktop"*|"$HOME/Downloads"*)
+    echo "install.sh: WARNING — '$REPO' is in a macOS privacy-protected folder; the agent may get 'operation not permitted' on writes when running as a service. Prefer a path like \$HOME/agents." >&2 ;;
+esac
 
 # ── prerequisites ───────────────────────────────────────────────────────────
 command -v python3 >/dev/null 2>&1 || {
