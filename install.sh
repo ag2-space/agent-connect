@@ -2,9 +2,9 @@
 # install.sh — one-line installer for agent-connect.
 #
 # Turns "clone the repo, place the relay client, configure, run" into a single
-# paste. Fetches the worker + the AG2 Space relay client (+ its stdlib-only
-# deps, all from the PUBLIC sonichi/sutando repo), then starts your local agent
-# as a first-class AG2 Space room agent.
+# paste. Installs the worker + the AG2 Space relay client (the `ag2-sparrow`
+# package, from PyPI), then starts your local agent as a first-class AG2 Space
+# room agent.
 #
 #   curl -fsSL <installer-url>/install.sh | sh -s -- --token <TOKEN> [--adapter codex]
 #
@@ -30,8 +30,9 @@ START=1
 # agent-connect source: overridable so this same script serves both the
 # private-repo phase (git+ssh for repo-holders) and the public phase (PyPI).
 AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-git+https://github.com/ag2-space/agent-connect.git}"
-# public raw base for the relay client + its deps (these ARE public today).
-RELAY_RAW_BASE="${RELAY_RAW_BASE:-https://raw.githubusercontent.com/sonichi/sutando/main/src}"
+# relay client: the ag2-sparrow package on PyPI (transport-only; long-polls YOUR
+# agent's tasks and posts results back). Overridable for pre-release testing.
+RELAY_PIP_SPEC="${RELAY_PIP_SPEC:-ag2-sparrow>=0.2.0}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -56,63 +57,91 @@ say() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
 # ── prerequisites ───────────────────────────────────────────────────────────
 command -v python3 >/dev/null 2>&1 || {
   echo "install.sh: python3 not found — install Python 3.9+ first." >&2; exit 1; }
-command -v curl >/dev/null 2>&1 || {
-  echo "install.sh: curl not found." >&2; exit 1; }
 PIP="python3 -m pip"
 $PIP --version >/dev/null 2>&1 || {
   echo "install.sh: pip not available (python3 -m pip). Install pip first." >&2; exit 1; }
 
-# ── 1) install the worker ───────────────────────────────────────────────────
+APP_DIR="$HOME/.agent-connect"
+mkdir -p "$APP_DIR"
+
+# ── 1) install the worker + the relay client ────────────────────────────────
 # Two isolation strategies, both PEP-668-safe (a bare `pip install --user` fails
 # on externally-managed envs — Homebrew Python, modern Debian/Ubuntu):
-#   pipx (preferred)  → isolated app install; handles git+ AND PyPI specs.
-#   dedicated venv    → fallback; deterministic worker path for the service unit.
+#   pipx (preferred)  → isolated app installs; handles git+ AND PyPI specs.
+#   dedicated venv    → fallback; deterministic bin paths for the service unit.
 WORKER_BIN=""
-say "installing agent-connect worker"
+RELAY_BIN=""
+say "installing agent-connect worker + ag2-sparrow relay client"
 if command -v pipx >/dev/null 2>&1; then
   pipx install --force "$AC_PIP_SPEC" >/dev/null
+  pipx install --force "$RELAY_PIP_SPEC" >/dev/null
   WORKER_BIN="$(command -v agent-connect || echo "$HOME/.local/bin/agent-connect")"
+  RELAY_BIN="$(command -v ag2-sparrow || echo "$HOME/.local/bin/ag2-sparrow")"
 else
-  VENV="$HOME/.sutando-relay-client/venv"
+  VENV="$APP_DIR/venv"
   python3 -m venv "$VENV"
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
-  "$VENV/bin/python" -m pip install --upgrade "$AC_PIP_SPEC" >/dev/null
+  "$VENV/bin/python" -m pip install --upgrade "$AC_PIP_SPEC" "$RELAY_PIP_SPEC" >/dev/null
   WORKER_BIN="$VENV/bin/agent-connect"
+  RELAY_BIN="$VENV/bin/ag2-sparrow"
 fi
 
-# ── 2) fetch the relay client + its (stdlib-only) deps ──────────────────────
-# The relay client is transport-only; it long-polls YOUR agent's tasks and posts
-# results back. It + these deps live in the public sutando repo.
-RELAY_DIR="$HOME/.sutando-relay-client"
-mkdir -p "$RELAY_DIR"
-say "fetching relay client into $RELAY_DIR"
-for f in remote-gateway-bridge.py workspace_default.py task_archive.py \
-         local_task_protocol.py result_markers.py send_allowlist.py; do
-  curl -fsSL "$RELAY_RAW_BASE/$f" -o "$RELAY_DIR/$f" || {
-    echo "install.sh: failed to fetch $f from $RELAY_RAW_BASE" >&2; exit 1; }
-done
-# Compat: run-agent.sh's default RELAY_CLIENT still points at the old filename.
-# Leave a shim so either name works.
-if [ ! -f "$RELAY_DIR/remote-relay-bridge.py" ]; then
-  cat > "$RELAY_DIR/remote-relay-bridge.py" <<'SHIM'
-#!/usr/bin/env python3
-# compat shim: relay client was renamed remote-relay-bridge -> remote-gateway-bridge.
-import runpy, sys
-from pathlib import Path
-runpy.run_path(str(Path(__file__).resolve().parent / "remote-gateway-bridge.py"),
-               run_name="__main__")
-SHIM
-fi
-
-# ── 3) resolve the worker entrypoint ────────────────────────────────────────
 [ -x "$WORKER_BIN" ] || {
   echo "install.sh: worker binary not found at '$WORKER_BIN' after install." >&2; exit 1; }
+[ -x "$RELAY_BIN" ] || {
+  echo "install.sh: relay binary not found at '$RELAY_BIN' after install." >&2; exit 1; }
 # Make the pipx bin dir reachable this session even if not yet on PATH.
 case ":$PATH:" in *":$HOME/.local/bin:"*) : ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
 export PATH
 
-RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN AGENT_CONNECT_ADAPTER=$ADAPTER AGENT_CONNECT_REPO=$REPO \
-RELAY_CLIENT=$RELAY_DIR/remote-gateway-bridge.py $WORKER_BIN"
+# ── 2) write the launcher ────────────────────────────────────────────────────
+# One code path for every start mode (launchd / systemd / nohup / by hand):
+# starts the relay client wired to the worker's workspace via the dir-interface
+# env vars, then execs the worker. Pre-flip, the service units launched ONLY the
+# worker — the relay never ran under launchd/systemd, so tasks never arrived.
+LAUNCHER="$APP_DIR/launch.sh"
+say "writing launcher $LAUNCHER"
+cat > "$LAUNCHER" <<LAUNCH
+#!/bin/sh
+# launch.sh — written by install.sh; starts relay client + worker as one unit.
+# Caller env: AGENT_CONNECT_TOKEN (required), AGENT_CONNECT_ADAPTER,
+# AGENT_CONNECT_REPO, AGENT_CONNECT_WORKSPACE, REMOTE_TASK_URL (optional).
+set -eu
+: "\${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN (from the Agent Portal)}"
+WS="\${AGENT_CONNECT_WORKSPACE:-\$HOME/.agent-connect/workspace}"
+export AGENT_CONNECT_WORKSPACE="\$WS"
+mkdir -p "\$WS/tasks" "\$WS/results" "\$WS/state"
+
+# Kill a prior instance for THIS workspace before starting a new one (pidfile
+# keyed to the workspace — sibling agents on other workspaces are untouched).
+PIDFILE="\$WS/.worker.pids"
+if [ -f "\$PIDFILE" ]; then
+  while read -r _old; do
+    [ -n "\$_old" ] && kill "\$_old" 2>/dev/null || true
+  done < "\$PIDFILE"
+  rm -f "\$PIDFILE"
+fi
+
+# Relay client (transport-only): pulls THIS agent's tasks into the workspace
+# and posts results back, identified by the token. The AGENT_CONNECT_*_DIR
+# trio is ag2-sparrow's dir interface — it aligns the relay's queue with the
+# worker's \$WS/tasks + \$WS/results convention.
+AGENT_CONNECT_TASK_DIR="\$WS/tasks" \\
+AGENT_CONNECT_RESULT_DIR="\$WS/results" \\
+AGENT_CONNECT_STATE_DIR="\$WS/state" \\
+REMOTE_TASK_TOKEN="\$AGENT_CONNECT_TOKEN" \\
+REMOTE_TASK_URL="\${REMOTE_TASK_URL:-https://chat.ag2.space/relay}" \\
+"$RELAY_BIN" &
+echo "\$!" > "\$PIDFILE"
+
+# Worker: turns each pulled task into an agent run. \$\$ survives the exec, so
+# the pidfile lets the next launch kill this instance too.
+echo "\$\$" >> "\$PIDFILE"
+exec "$WORKER_BIN"
+LAUNCH
+chmod +x "$LAUNCHER"
+
+RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN AGENT_CONNECT_ADAPTER=$ADAPTER AGENT_CONNECT_REPO=$REPO sh $LAUNCHER"
 
 if [ "$START" -eq 0 ]; then
   say "install complete (not started). Run your agent with:"
@@ -120,7 +149,7 @@ if [ "$START" -eq 0 ]; then
   exit 0
 fi
 
-# ── 4) start it (persistent) ────────────────────────────────────────────────
+# ── 3) start it (persistent) ────────────────────────────────────────────────
 # Prefer a per-user service so the agent survives logout/reboot; fall back to a
 # nohup background process if no service manager is available.
 OS="$(uname -s)"
@@ -133,23 +162,24 @@ if [ "$OS" = "Darwin" ]; then
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>space.ag2.agent-connect</string>
-  <key>ProgramArguments</key><array><string>$WORKER_BIN</string></array>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>$LAUNCHER</string>
+  </array>
   <key>EnvironmentVariables</key><dict>
     <key>AGENT_CONNECT_TOKEN</key><string>$TOKEN</string>
     <key>AGENT_CONNECT_ADAPTER</key><string>$ADAPTER</string>
     <key>AGENT_CONNECT_REPO</key><string>$REPO</string>
-    <key>RELAY_CLIENT</key><string>$RELAY_DIR/remote-gateway-bridge.py</string>
     <key>PATH</key><string>$PATH</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$RELAY_DIR/agent-connect.log</string>
-  <key>StandardErrorPath</key><string>$RELAY_DIR/agent-connect.log</string>
+  <key>StandardOutPath</key><string>$APP_DIR/agent-connect.log</string>
+  <key>StandardErrorPath</key><string>$APP_DIR/agent-connect.log</string>
 </dict></plist>
 PLIST
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load "$PLIST"
-  say "loaded. Logs: $RELAY_DIR/agent-connect.log"
+  say "loaded. Logs: $APP_DIR/agent-connect.log"
 elif command -v systemctl >/dev/null 2>&1; then
   say "starting via systemd (per-user unit)"
   UNIT_DIR="$HOME/.config/systemd/user"; mkdir -p "$UNIT_DIR"
@@ -161,8 +191,7 @@ After=network-online.target
 Environment=AGENT_CONNECT_TOKEN=$TOKEN
 Environment=AGENT_CONNECT_ADAPTER=$ADAPTER
 Environment=AGENT_CONNECT_REPO=$REPO
-Environment=RELAY_CLIENT=$RELAY_DIR/remote-gateway-bridge.py
-ExecStart=$WORKER_BIN
+ExecStart=/bin/sh $LAUNCHER
 Restart=always
 [Install]
 WantedBy=default.target
@@ -174,9 +203,9 @@ else
   say "no service manager found — starting in the background (nohup)"
   # shellcheck disable=SC2086
   env AGENT_CONNECT_TOKEN="$TOKEN" AGENT_CONNECT_ADAPTER="$ADAPTER" \
-      AGENT_CONNECT_REPO="$REPO" RELAY_CLIENT="$RELAY_DIR/remote-gateway-bridge.py" \
-      nohup "$WORKER_BIN" >"$RELAY_DIR/agent-connect.log" 2>&1 &
-  say "started (pid $!). Logs: $RELAY_DIR/agent-connect.log"
+      AGENT_CONNECT_REPO="$REPO" \
+      nohup sh "$LAUNCHER" >"$APP_DIR/agent-connect.log" 2>&1 &
+  say "started (pid $!). Logs: $APP_DIR/agent-connect.log"
 fi
 
 say "done. Your agent should appear in AG2 Space shortly — @-mention it in an allowed room."
