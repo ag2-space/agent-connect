@@ -12,6 +12,10 @@
 #   --token   AGENT_CONNECT_TOKEN    your agent's relay token from the Agent Portal [required]
 #   --adapter AGENT_CONNECT_ADAPTER  codex | omnigent | ollama | cline  [default: codex]
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in            [default: cwd]
+#   --sutando-workspace PATH         connect an ALREADY-RUNNING Sutando instead of
+#             (AGENT_CONNECT_SUTANDO_WORKSPACE)  installing a worker: relay-only mode,
+#             task/result/state dirs point at that Sutando's workspace — its own
+#             core session processes the tasks. --adapter/--repo are ignored.
 #   --no-start                       install only; print the run command, don't launch
 #
 # Adapter → agent quick map:
@@ -26,6 +30,7 @@ set -eu
 TOKEN="${AGENT_CONNECT_TOKEN:-}"
 ADAPTER="${AGENT_CONNECT_ADAPTER:-codex}"
 REPO="${AGENT_CONNECT_REPO:-$(pwd)}"
+SUTANDO_WS="${AGENT_CONNECT_SUTANDO_WORKSPACE:-}"
 START=1
 # agent-connect source: overridable so this same script serves both the
 # private-repo phase (git+ssh for repo-holders) and the public phase (PyPI).
@@ -39,10 +44,12 @@ while [ $# -gt 0 ]; do
     --token)   TOKEN="$2"; shift 2 ;;
     --adapter) ADAPTER="$2"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
+    --sutando-workspace) SUTANDO_WS="$2"; shift 2 ;;
     --no-start) START=0; shift ;;
     --token=*)   TOKEN="${1#*=}"; shift ;;
     --adapter=*) ADAPTER="${1#*=}"; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
+    --sutando-workspace=*) SUTANDO_WS="${1#*=}"; shift ;;
     *) echo "install.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -50,6 +57,25 @@ done
 if [ -z "$TOKEN" ]; then
   echo "install.sh: --token is required (get it from the AG2 Space Agent Portal)." >&2
   exit 2
+fi
+
+if [ -n "$SUTANDO_WS" ]; then
+  if [ ! -d "$SUTANDO_WS" ]; then
+    echo "install.sh: --sutando-workspace '$SUTANDO_WS' does not exist — run \`sutando whoami\` (or \`bash scripts/sutando-config.sh workspace\` in the Sutando repo) to get the right path." >&2
+    exit 2
+  fi
+  # Canonicalize to an absolute path BEFORE it is persisted into launch.sh —
+  # a relative path would be interpreted against whatever cwd launchd/systemd
+  # runs the launcher from later, silently wiring the relay to a wrong queue.
+  SUTANDO_WS="$(cd "$SUTANDO_WS" && pwd)"
+  # Shape check: a running Sutando workspace always has tasks/ (the resolver's
+  # bootstrap creates the canonical subdirs). Rejecting anything else catches
+  # typos like \$HOME that would otherwise install "successfully" while the
+  # running Sutando never sees a task.
+  if [ ! -d "$SUTANDO_WS/tasks" ]; then
+    echo "install.sh: '$SUTANDO_WS' does not look like a Sutando workspace (no tasks/ dir) — run \`sutando whoami\` on the Sutando instance and use its \"workspace\" value." >&2
+    exit 2
+  fi
 fi
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
@@ -71,9 +97,13 @@ mkdir -p "$APP_DIR"
 #   dedicated venv    → fallback; deterministic bin paths for the service unit.
 WORKER_BIN=""
 RELAY_BIN=""
-say "installing agent-connect worker + ag2-sparrow relay client"
+if [ -n "$SUTANDO_WS" ]; then
+  say "installing ag2-sparrow relay client (relay-only: the running Sutando is the worker)"
+else
+  say "installing agent-connect worker + ag2-sparrow relay client"
+fi
 if command -v pipx >/dev/null 2>&1; then
-  pipx install --force "$AC_PIP_SPEC" >/dev/null
+  [ -n "$SUTANDO_WS" ] || pipx install --force "$AC_PIP_SPEC" >/dev/null
   pipx install --force "$RELAY_PIP_SPEC" >/dev/null
   WORKER_BIN="$(command -v agent-connect || echo "$HOME/.local/bin/agent-connect")"
   RELAY_BIN="$(command -v ag2-sparrow || echo "$HOME/.local/bin/ag2-sparrow")"
@@ -81,13 +111,19 @@ else
   VENV="$APP_DIR/venv"
   python3 -m venv "$VENV"
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
-  "$VENV/bin/python" -m pip install --upgrade "$AC_PIP_SPEC" "$RELAY_PIP_SPEC" >/dev/null
+  if [ -n "$SUTANDO_WS" ]; then
+    "$VENV/bin/python" -m pip install --upgrade "$RELAY_PIP_SPEC" >/dev/null
+  else
+    "$VENV/bin/python" -m pip install --upgrade "$AC_PIP_SPEC" "$RELAY_PIP_SPEC" >/dev/null
+  fi
   WORKER_BIN="$VENV/bin/agent-connect"
   RELAY_BIN="$VENV/bin/ag2-sparrow"
 fi
 
-[ -x "$WORKER_BIN" ] || {
-  echo "install.sh: worker binary not found at '$WORKER_BIN' after install." >&2; exit 1; }
+if [ -z "$SUTANDO_WS" ]; then
+  [ -x "$WORKER_BIN" ] || {
+    echo "install.sh: worker binary not found at '$WORKER_BIN' after install." >&2; exit 1; }
+fi
 [ -x "$RELAY_BIN" ] || {
   echo "install.sh: relay binary not found at '$RELAY_BIN' after install." >&2; exit 1; }
 # Make the pipx bin dir reachable this session even if not yet on PATH.
@@ -101,7 +137,34 @@ export PATH
 # worker — the relay never ran under launchd/systemd, so tasks never arrived.
 LAUNCHER="$APP_DIR/launch.sh"
 say "writing launcher $LAUNCHER"
-cat > "$LAUNCHER" <<LAUNCH
+if [ -n "$SUTANDO_WS" ]; then
+  # Relay-only launcher: the running Sutando's core session consumes the
+  # tasks, so there is NO worker here — starting one would double-process
+  # the same queue. Dirs point at the Sutando workspace (its watcher + the
+  # dashboard already know these paths).
+  cat > "$LAUNCHER" <<LAUNCH
+#!/bin/sh
+# launch.sh — written by install.sh (--sutando-workspace mode): relay only,
+# wired to the running Sutando instance's workspace.
+set -eu
+: "\${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN (from the Agent Portal)}"
+PIDFILE="$APP_DIR/.relay.pids"
+if [ -f "\$PIDFILE" ]; then
+  while read -r _old; do
+    [ -n "\$_old" ] && kill "\$_old" 2>/dev/null || true
+  done < "\$PIDFILE"
+  rm -f "\$PIDFILE"
+fi
+echo "\$\$" > "\$PIDFILE"
+AGENT_CONNECT_TASK_DIR="$SUTANDO_WS/tasks" \\
+AGENT_CONNECT_RESULT_DIR="$SUTANDO_WS/results" \\
+AGENT_CONNECT_STATE_DIR="$SUTANDO_WS/state" \\
+REMOTE_TASK_TOKEN="\$AGENT_CONNECT_TOKEN" \\
+REMOTE_TASK_URL="\${REMOTE_TASK_URL:-https://chat.ag2.space/relay}" \\
+exec "$RELAY_BIN"
+LAUNCH
+else
+  cat > "$LAUNCHER" <<LAUNCH
 #!/bin/sh
 # launch.sh — written by install.sh; starts relay client + worker as one unit.
 # Caller env: AGENT_CONNECT_TOKEN (required), AGENT_CONNECT_ADAPTER,
@@ -139,9 +202,14 @@ echo "\$!" > "\$PIDFILE"
 echo "\$\$" >> "\$PIDFILE"
 exec "$WORKER_BIN"
 LAUNCH
+fi
 chmod +x "$LAUNCHER"
 
-RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN AGENT_CONNECT_ADAPTER=$ADAPTER AGENT_CONNECT_REPO=$REPO sh $LAUNCHER"
+if [ -n "$SUTANDO_WS" ]; then
+  RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN sh $LAUNCHER"
+else
+  RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN AGENT_CONNECT_ADAPTER=$ADAPTER AGENT_CONNECT_REPO=$REPO sh $LAUNCHER"
+fi
 
 if [ "$START" -eq 0 ]; then
   say "install complete (not started). Run your agent with:"
