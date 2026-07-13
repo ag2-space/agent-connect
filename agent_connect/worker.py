@@ -30,20 +30,47 @@ def _ws() -> Path:
     ).expanduser()
 
 
+# Header keys the AG2 Space relay writes (ag2-sparrow's task-file layout).
+# The relay deliberately writes `access_tier` as the LAST header — after
+# `task:` — as an anti-forgery invariant, so the parser must keep reading
+# headers after the task line instead of treating everything to EOF as body.
+_HEADER_KEYS = {
+    "id", "timestamp", "task", "source", "channel_id", "chat_id", "room_name",
+    "sender_name", "user_id", "priority", "interaction_type", "access_tier",
+    "collaborator", "reply_to_event", "reply_to_me", "thread_ts",
+}
+
+
 def parse_task(text: str) -> dict:
-    """Parse an AG2 Space task file. `task:` may span the rest of the file."""
+    """Parse an AG2 Space task file.
+
+    Headers are `key: value` lines with a known key; `task:` starts the body,
+    which may span multiple lines and ends at the next known-header line.
+    The relay sanitizes newlines out of wire fields, so a message body cannot
+    fabricate a header line of its own. Defense-in-depth on top of that:
+    if more than one `access_tier` header appears, fail closed to "other".
+    """
     fields: dict = {"access_tier": "other", "task": ""}
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if line.startswith("task:"):
-            # task body is the rest of the file from here (may be multi-line).
-            body = [line[len("task:") :].lstrip()]
-            body.extend(lines[i + 1 :])
-            fields["task"] = "\n".join(body).strip()
-            break
-        if ":" in line:
-            k, _, v = line.partition(":")
-            fields[k.strip()] = v.strip()
+    body: list = []
+    tiers: list = []
+    in_body = False
+    for line in text.splitlines():
+        k, sep, v = line.partition(":")
+        key = k.strip()
+        if sep and key in _HEADER_KEYS and not line[:1].isspace():
+            in_body = key == "task"
+            if key == "task":
+                body.append(v.lstrip())
+            elif key == "access_tier":
+                tiers.append(v.strip())
+            else:
+                fields[key] = v.strip()
+        elif in_body:
+            body.append(line)
+    fields["task"] = "\n".join(body).strip()
+    if len(tiers) == 1:
+        fields["access_tier"] = tiers[0]
+    # zero headers → default "other"; multiple → forged/ambiguous → "other"
     return fields
 
 
