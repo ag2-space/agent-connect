@@ -96,7 +96,16 @@ else
   bad "relative workspace persisted non-absolute"
 fi
 
-# 7) the sparse-fetch path is gone for good (PyPI is the single source)
+# 7) working-dir defaults + warnings
+out=$(PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --no-start 2>&1) || bad "default-repo dry-run failed"
+printf '%s\n' "$out" | grep -q "agent working directory: $TMP/agents" && ok "default working dir = ~/agents, printed loudly" || bad "missing ~/agents default print"
+[ -d "$TMP/agents" ] && ok "default working dir created" || bad "~/agents not created"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --repo "$TMP/Documents/proj" --no-start 2>&1) || true
+printf '%s\n' "$out" | grep -q "privacy-protected" && ok "TCC-protected --repo warns" || bad "missing TCC warning"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --repo "$TMP/elsewhere" --no-start 2>&1) || true
+printf '%s\n' "$out" | grep -q "privacy-protected" && bad "false TCC warning on safe path" || ok "no TCC warning on safe path"
+
+# 8) the sparse-fetch path is gone for good (PyPI is the single source)
 if grep -q "raw.githubusercontent.com" "$SCRIPT"; then
   bad "install.sh still sparse-fetches from raw.githubusercontent.com"
 else
