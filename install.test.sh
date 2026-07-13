@@ -67,7 +67,7 @@ fi
 
 # 6) --sutando-workspace relay-only mode: launcher wired to the given
 #    workspace, NO worker exec, worker install skipped
-SWS="$TMP/sutando-ws"; mkdir -p "$SWS"
+SWS="$TMP/sutando-ws"; mkdir -p "$SWS/tasks"
 out=$(PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token TESTTOK --sutando-workspace "$SWS" --no-start 2>&1) || {
   printf '%s\n' "$out" | sed 's/^/    /'; bad "sutando-mode dry-run exited non-zero"; }
 printf '%s\n' "$out" | grep -q "relay-only" && ok "sutando mode announces relay-only" || bad "sutando mode missing relay-only notice"
@@ -80,6 +80,21 @@ if grep -q "agent-connect\"$" "$L"; then bad "sutando launcher must NOT exec a w
 # bogus workspace path is refused early
 if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --sutando-workspace "$TMP/nope" --no-start >/dev/null 2>&1; then
   bad "nonexistent --sutando-workspace should fail"; else ok "nonexistent --sutando-workspace → refused"; fi
+# existing dir that is NOT a Sutando workspace (no tasks/) is refused too —
+# a typo like \$HOME must not install a relay wired to a dead queue
+NOTWS="$TMP/not-a-workspace"; mkdir -p "$NOTWS"
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --sutando-workspace "$NOTWS" --no-start >/dev/null 2>&1; then
+  bad "non-workspace dir should be refused"; else ok "existing non-workspace dir → refused (no tasks/)"; fi
+# a RELATIVE workspace path is canonicalized before being persisted into the
+# launcher (a literal relative path would resolve against the service's cwd)
+RELWS_ABS="$TMP/rel-sutando/workspace"; mkdir -p "$RELWS_ABS/tasks"
+( cd "$TMP/rel-sutando" && PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --sutando-workspace "workspace" --no-start >/dev/null 2>&1 )
+if grep -q "AGENT_CONNECT_TASK_DIR=\"$RELWS_ABS/tasks\"" "$TMP/.agent-connect/launch.sh"; then
+  ok "relative workspace canonicalized to absolute in launcher"
+else
+  grep "AGENT_CONNECT_TASK_DIR" "$TMP/.agent-connect/launch.sh" | sed 's/^/    /'
+  bad "relative workspace persisted non-absolute"
+fi
 
 # 7) the sparse-fetch path is gone for good (PyPI is the single source)
 if grep -q "raw.githubusercontent.com" "$SCRIPT"; then

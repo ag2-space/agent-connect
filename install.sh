@@ -59,9 +59,23 @@ if [ -z "$TOKEN" ]; then
   exit 2
 fi
 
-if [ -n "$SUTANDO_WS" ] && [ ! -d "$SUTANDO_WS" ]; then
-  echo "install.sh: --sutando-workspace '$SUTANDO_WS' does not exist — run \`sutando whoami\` (or \`bash scripts/sutando-config.sh workspace\` in the Sutando repo) to get the right path." >&2
-  exit 2
+if [ -n "$SUTANDO_WS" ]; then
+  if [ ! -d "$SUTANDO_WS" ]; then
+    echo "install.sh: --sutando-workspace '$SUTANDO_WS' does not exist — run \`sutando whoami\` (or \`bash scripts/sutando-config.sh workspace\` in the Sutando repo) to get the right path." >&2
+    exit 2
+  fi
+  # Canonicalize to an absolute path BEFORE it is persisted into launch.sh —
+  # a relative path would be interpreted against whatever cwd launchd/systemd
+  # runs the launcher from later, silently wiring the relay to a wrong queue.
+  SUTANDO_WS="$(cd "$SUTANDO_WS" && pwd)"
+  # Shape check: a running Sutando workspace always has tasks/ (the resolver's
+  # bootstrap creates the canonical subdirs). Rejecting anything else catches
+  # typos like \$HOME that would otherwise install "successfully" while the
+  # running Sutando never sees a task.
+  if [ ! -d "$SUTANDO_WS/tasks" ]; then
+    echo "install.sh: '$SUTANDO_WS' does not look like a Sutando workspace (no tasks/ dir) — run \`sutando whoami\` on the Sutando instance and use its \"workspace\" value." >&2
+    exit 2
+  fi
 fi
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
