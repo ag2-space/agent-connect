@@ -38,7 +38,12 @@ SUTANDO_WS="${AGENT_CONNECT_SUTANDO_WORKSPACE:-}"
 START=1
 # agent-connect source: overridable so this same script serves both the
 # private-repo phase (git+ssh for repo-holders) and the public phase (PyPI).
-AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.2.0}"
+# Worker install source. Default stays the git spec until the PyPI publish
+# (name pending owner confirmation) actually completes — flipping the default
+# to an unpublished package would break every fresh install in the gap. The
+# one-line flip to "ag2-agent-connect>=0.2.0" (or the confirmed name) lands as
+# the publish commit.
+AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-git+https://github.com/ag2-space/agent-connect.git}"
 # relay client: the ag2-sparrow package on PyPI (transport-only; long-polls YOUR
 # agent's tasks and posts results back). Overridable for pre-release testing.
 RELAY_PIP_SPEC="${RELAY_PIP_SPEC:-ag2-sparrow>=0.2.0}"
