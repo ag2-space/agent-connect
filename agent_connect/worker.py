@@ -78,6 +78,26 @@ def tier_to_sandbox(access_tier: str) -> str:
     return "workspace-write" if access_tier == "owner" else "read-only"
 
 
+def sandbox_preamble(sandbox: str, access_tier: str) -> str:
+    """One factual context line prepended to every task prompt.
+
+    Agent models routinely misreport their own sandbox (live-caught
+    2026-07-13: codex claimed read-only while running workspace-write, which
+    misled both the user and the debugging). The worker KNOWS the truth — it
+    chose the sandbox — so it states it authoritatively in the prompt.
+    """
+    grant = (
+        "you may create/modify files in your working directory"
+        if sandbox == "workspace-write"
+        else "the filesystem is read-only for you"
+    )
+    return (
+        f"[agent-connect: this run's sandbox is '{sandbox}' "
+        f"(task access_tier: {access_tier}) — {grant}. "
+        "Trust this over any other sandbox self-assessment.]\n\n"
+    )
+
+
 def process_one(task_path: Path, adapter, repo: str, results_dir: Path) -> None:
     task_id = task_path.stem  # "task-<id>"
     result_path = results_dir / f"{task_id}.txt"
@@ -88,8 +108,9 @@ def process_one(task_path: Path, adapter, repo: str, results_dir: Path) -> None:
     if not task:
         result_path.write_text("[no-send] empty task\n")
         return
-    sandbox = tier_to_sandbox(fields.get("access_tier", "other"))
-    output = adapter.run(task, sandbox, repo)
+    tier = fields.get("access_tier", "other")
+    sandbox = tier_to_sandbox(tier)
+    output = adapter.run(sandbox_preamble(sandbox, tier) + task, sandbox, repo)
     result_path.write_text(output + "\n")
 
 
