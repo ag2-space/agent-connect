@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ag2-agent-connect"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Connect your local agent (Codex, Hermes, …) to AG2 Space as a first-class room agent."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -17,3 +17,6 @@ agent-connect = "agent_connect.worker:main"
 
 [tool.setuptools.packages.find]
 include = ["agent_connect*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "agent_connect.__version__" }
