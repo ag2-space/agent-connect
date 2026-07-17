@@ -8,7 +8,8 @@ an agent run.
 Env:
   AGENT_CONNECT_WORKSPACE   workspace dir (has tasks/ + results/). Default: ~/.agent-connect/workspace
   AGENT_CONNECT_ADAPTER     adapter name, e.g. "codex" (required)
-  AGENT_CONNECT_REPO        working dir the agent operates in. Default: cwd
+  AGENT_CONNECT_REPO        working dir the agent operates in. Default: ~/agents
+                            (dedicated, non-TCC-protected; warns if under one)
   AGENT_CONNECT_POLL        seconds between scans (default 1.0)
 
 Task files are the AG2 Space convention: `tasks/task-<id>.txt` with `id:`,
@@ -28,6 +29,44 @@ def _ws() -> Path:
         os.environ.get("AGENT_CONNECT_WORKSPACE")
         or (Path.home() / ".agent-connect" / "workspace")
     ).expanduser()
+
+
+# macOS TCC-protected locations: an agent operating out of one of these hits
+# permission walls on file access unless the launching process has Full Disk
+# Access. The old cwd default silently put the agent in whatever dir the user
+# launched from — often ~/Documents / ~/Desktop — which produced opaque TCC
+# failures (owner-caught friction). We default to a dedicated ~/agents dir and
+# warn loudly if the resolved repo still lands under a protected path.
+_TCC_PROTECTED = ("Desktop", "Documents", "Downloads")
+
+
+def _resolve_repo() -> Path:
+    """Resolve the working dir the agent operates in.
+
+    `AGENT_CONNECT_REPO` (if set) wins; otherwise default to ``~/agents`` — a
+    dedicated, non-TCC-protected dir — instead of the launch cwd. Creates the
+    dir when defaulting, prints where it landed, and warns if the path is under
+    a macOS TCC-protected location (agent file ops there need Full Disk Access).
+    """
+    explicit = os.environ.get("AGENT_CONNECT_REPO")
+    repo = Path(explicit).expanduser() if explicit else (Path.home() / "agents")
+    if not explicit:
+        repo.mkdir(parents=True, exist_ok=True)
+        print(f"agent-connect: no AGENT_CONNECT_REPO set — defaulting repo to {repo}")
+
+    home = Path.home()
+    try:
+        rel = repo.resolve().relative_to(home.resolve())
+        top = rel.parts[0] if rel.parts else ""
+    except ValueError:
+        top = ""
+    if top in _TCC_PROTECTED:
+        print(
+            f"agent-connect: WARNING — repo {repo} is under a macOS TCC-protected "
+            f"location (~/{top}); the agent's file operations may fail without "
+            f"Full Disk Access. Set AGENT_CONNECT_REPO to a dir like ~/agents."
+        )
+    return repo
 
 
 # Header keys the AG2 Space relay writes (ag2-sparrow's task-file layout).
@@ -119,7 +158,7 @@ def main() -> None:
     if not adapter_name:
         raise SystemExit("set AGENT_CONNECT_ADAPTER (e.g. codex)")
     adapter = get_adapter(adapter_name)
-    repo = os.environ.get("AGENT_CONNECT_REPO") or os.getcwd()
+    repo = str(_resolve_repo())
     poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
 
     ws = _ws()
