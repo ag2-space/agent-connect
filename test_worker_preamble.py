@@ -2,9 +2,11 @@
 
 Run: python3 test_worker_preamble.py
 """
+import asyncio
 import tempfile
 from pathlib import Path
 
+from agent_connect.adapters import ShimAdapter
 from agent_connect.worker import process_one, sandbox_preamble
 
 fails = 0
@@ -39,7 +41,10 @@ tasks.mkdir(); results.mkdir()
 tf = tasks / "task-p1.txt"
 tf.write_text("id: task-p1\ntask: do the thing\nsource: ag2space\naccess_tier: owner\n")
 stub = StubAdapter()
-process_one(tf, stub, "/repo", results)
+# The seam is asynchronous now, and a synchronous adapter reaches it through
+# the shim — but what the adapter is handed, and what lands in results/, are
+# unchanged, which is what these assertions are about.
+asyncio.run(process_one(tf, ShimAdapter("stub", stub), "/repo", results))
 sent_task, sent_sandbox, _ = stub.calls[0]
 check(sent_sandbox == "workspace-write", "owner task → workspace-write sandbox arg")
 check(sent_task.startswith("[agent-connect: this run's sandbox is 'workspace-write'"),

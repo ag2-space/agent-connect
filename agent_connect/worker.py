@@ -5,6 +5,11 @@ runs the configured agent adapter on each task, and writes `results/`. The relay
 client handles all Matrix transport + posting back — this only turns a task into
 an agent run.
 
+Tasks are processed **concurrently across rooms** and serialised within one
+Session: a ten-minute request in one room no longer silences every other room,
+while two Tasks that share a Session still run one at a time, because only one
+Turn at a time may be open on a Session.
+
 Env:
   AGENT_CONNECT_WORKSPACE   workspace dir (has tasks/ + results/). Default: ~/.agent-connect/workspace
   AGENT_CONNECT_ADAPTER     adapter name, e.g. "codex" (required)
@@ -16,11 +21,13 @@ Task files are the AG2 Space convention: `tasks/task-<id>.txt` with `id:`,
 """
 from __future__ import annotations
 
+import asyncio
 import os
-import time
 from pathlib import Path
 
 from .adapters import get as get_adapter
+from .events import Done, MessageChunk, TurnContext, final_text
+from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
 
 
 def _ws() -> Path:
@@ -89,44 +96,119 @@ def parse_task(text: str) -> dict:
     return fields
 
 
-def tier_to_sandbox(access_tier: str) -> str:
-    return "workspace-write" if access_tier == "owner" else "read-only"
+def turn_context(fields: dict, task_id: str, repo: str) -> TurnContext:
+    """Build the context one Turn travels with, from a parsed Task.
 
-
-def sandbox_preamble(sandbox: str, access_tier: str) -> str:
-    """One factual context line prepended to every task prompt.
-
-    Agent models routinely misreport their own sandbox (live-caught
-    2026-07-13: codex claimed read-only while running workspace-write, which
-    misled both the user and the debugging). The worker KNOWS the truth — it
-    chose the sandbox — so it states it authoritatively in the prompt.
+    The Sandbox is derived here, from the Access Tier the parser fought to
+    establish — never from anything else in the file, all of which the sender
+    can write. The room identifier is the relay's `channel_id` (a Matrix room
+    id); `room_name` is the human label and is carried for display only.
     """
-    grant = (
-        "you may create/modify files in your working directory"
-        if sandbox == "workspace-write"
-        else "the filesystem is read-only for you"
-    )
-    return (
-        f"[agent-connect: this run's sandbox is '{sandbox}' "
-        f"(task access_tier: {access_tier}) — {grant}. "
-        "Trust this over any other sandbox self-assessment.]\n\n"
+    tier = fields.get("access_tier", "other")
+    return TurnContext(
+        prompt=fields.get("task", "").strip(),
+        task_id=task_id,
+        room=fields.get("channel_id") or fields.get("chat_id") or "",
+        room_name=fields.get("room_name", ""),
+        access_tier=tier,
+        sender_name=fields.get("sender_name", ""),
+        user_id=fields.get("user_id", ""),
+        source_message_id=fields.get("source_message_id", ""),
+        sandbox=tier_to_sandbox(tier),
+        cwd=repo,
     )
 
 
-def process_one(task_path: Path, adapter, repo: str, results_dir: Path) -> None:
+async def run_turn(adapter, ctx: TurnContext) -> str:
+    """Drive one Turn to its end and return the answer.
+
+    Consumes the whole event stream. Only message chunks and the terminal
+    `Done` reach the result today; the rest of the vocabulary is what the
+    `TurnReporter` will read to keep a room posted while this is happening.
+    """
+    chunks: list = []
+    done = None
+    async for event in adapter.turn(ctx):
+        if isinstance(event, MessageChunk):
+            chunks.append(event.text)
+        elif isinstance(event, Done):
+            done = event
+    text = final_text(done, chunks)
+    if done is not None and done.note:
+        text = f"{text}\n\n{done.note}".strip()
+    return text
+
+
+class _NoLock:
+    """Stand-in for a Session lock when the caller is not serialising."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+async def process_one(
+    task_path: Path, adapter, repo: str, results_dir: Path, sessions: dict = None
+) -> None:
+    """Handle one Task file: parse it, run a Turn, write the result once.
+
+    `sessions` — when given — maps a Session key to the lock that keeps one
+    Turn at a time open on it. Tasks with different keys never contend, which
+    is what makes two rooms concurrent.
+    """
     task_id = task_path.stem  # "task-<id>"
     result_path = results_dir / f"{task_id}.txt"
     if result_path.exists():
         return
     fields = parse_task(task_path.read_text(errors="replace"))
-    task = fields.get("task", "").strip()
-    if not task:
+    ctx = turn_context(fields, task_id, repo)
+    if not ctx.prompt:
         result_path.write_text("[no-send] empty task\n")
         return
-    tier = fields.get("access_tier", "other")
-    sandbox = tier_to_sandbox(tier)
-    output = adapter.run(sandbox_preamble(sandbox, tier) + task, sandbox, repo)
+    if sessions is None:
+        lock = _NoLock()
+    else:
+        lock = sessions.setdefault(ctx.session_key, asyncio.Lock())
+    async with lock:
+        output = await run_turn(adapter, ctx)
     result_path.write_text(output + "\n")
+
+
+async def handle_one(
+    task_path: Path, adapter, repo: str, results_dir: Path, sessions: dict = None
+) -> None:
+    """`process_one`, with the guarantee that it cannot take the Worker down.
+
+    One Task failing is one Task's problem. The failure is written where the
+    relay looks for the answer, so the person who asked hears something back
+    rather than nothing.
+    """
+    try:
+        await process_one(task_path, adapter, repo, results_dir, sessions)
+    except Exception as e:  # noqa: BLE001 — never die on one bad task
+        result_path = results_dir / f"{task_path.stem}.txt"
+        if not result_path.exists():
+            result_path.write_text(f"agent-connect: worker error: {e}\n")
+
+
+async def serve(adapter, repo: str, results_dir: Path, tasks_dir: Path, poll: float) -> None:
+    """Scan for Tasks forever, starting each one without waiting for the last."""
+    seen: set = set()
+    sessions: dict = {}
+    running: set = set()
+    while True:
+        for task_path in sorted(tasks_dir.glob("task-*.txt")):
+            if task_path.name in seen:
+                continue
+            seen.add(task_path.name)
+            fut = asyncio.ensure_future(
+                handle_one(task_path, adapter, repo, results_dir, sessions)
+            )
+            running.add(fut)
+            fut.add_done_callback(running.discard)
+        await asyncio.sleep(poll)
 
 
 def main() -> None:
@@ -144,19 +226,7 @@ def main() -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"agent-connect worker: adapter={adapter_name} repo={repo} ws={ws}")
-    seen: set = set()
-    while True:
-        for task_path in sorted(tasks_dir.glob("task-*.txt")):
-            if task_path.name in seen:
-                continue
-            try:
-                process_one(task_path, adapter, repo, results_dir)
-            except Exception as e:  # noqa: BLE001 — never die on one bad task
-                (results_dir / f"{task_path.stem}.txt").write_text(
-                    f"agent-connect: worker error: {e}\n"
-                )
-            seen.add(task_path.name)
-        time.sleep(poll)
+    asyncio.run(serve(adapter, repo, results_dir, tasks_dir, poll))
 
 
 if __name__ == "__main__":
