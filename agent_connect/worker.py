@@ -34,10 +34,19 @@ def _ws() -> Path:
 # The relay deliberately writes `access_tier` as the LAST header — after
 # `task:` — as an anti-forgery invariant, so the parser must keep reading
 # headers after the task line instead of treating everything to EOF as body.
+#
+# Any key missing from this set lands in the prompt body instead, so the Local
+# Agent reads relay metadata as if a person had typed it. The attachment keys
+# are written after `task:`, which is how they came to leak; the parser itself
+# is order-independent, so their position is relay trivia, not an invariant.
 _HEADER_KEYS = {
     "id", "timestamp", "task", "source", "channel_id", "chat_id", "room_name",
     "sender_name", "user_id", "priority", "interaction_type", "access_tier",
     "collaborator", "reply_to_event", "reply_to_me", "thread_ts",
+    # attachments
+    "content_modalities", "media_form", "attachments",
+    # provenance
+    "source_message_id", "platform_card",
 }
 
 
@@ -49,8 +58,14 @@ def parse_task(text: str) -> dict:
     The relay sanitizes newlines out of wire fields, so a message body cannot
     fabricate a header line of its own. Defense-in-depth on top of that:
     if more than one `access_tier` header appears, fail closed to "other".
+
+    `access_tier`, `task` and `source_message_id` always come back, because
+    each has a meaningful default — downstream threading reads the source
+    message identifier on every Task, including ones the relay wrote without
+    one. Every other known header is returned verbatim under its own key only
+    when the relay wrote it, so read those with `.get()`.
     """
-    fields: dict = {"access_tier": "other", "task": ""}
+    fields: dict = {"access_tier": "other", "task": "", "source_message_id": ""}
     body: list = []
     tiers: list = []
     in_body = False
