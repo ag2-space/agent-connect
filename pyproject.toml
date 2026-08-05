@@ -10,7 +10,12 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 keywords = ["ag2space", "codex", "matrix", "agent", "bridge"]
-dependencies = []
+# `dependencies = []` ended at docs/adr/0001: the maintained ACP SDK for Python
+# carries pydantic, and that was accepted knowingly when ACP became the local
+# execution seam. Verified interoperating with
+# @agentclientprotocol/claude-agent-acp 0.64.2 at 0.12.0; pinned below 1.0
+# because it is pre-1.0 and its callback signatures are not yet stable.
+dependencies = ["agent-client-protocol>=0.12,<1.0"]
 
 [project.scripts]
 agent-connect = "agent_connect.worker:main"
