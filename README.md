@@ -49,6 +49,40 @@ sandbox so a stranger in a shared room can't make your agent edit your files:
 - **owner** → `workspace-write` (edit files, run builds)
 - **everyone else** → `read-only` (read/analyse/answer only)
 
+This is **operating-system confinement**: the sandbox is enforced by the agent CLI
+and the OS, so an agent that ignores it is still stopped. The `acp` adapter is the
+exception — see below.
+
+## The ACP adapter: cooperative confinement, owner only
+
+The `acp` adapter drives any agent that speaks the [Agent Client
+Protocol](https://agentclientprotocol.com) (Claude Code via
+`@agentclientprotocol/claude-agent-acp`, Cline, PI, …). **Its safety story is
+different from every other adapter's, and weaker. Read this before enabling it.**
+
+- **There is no sandbox.** ACP gives the OS no say in what the agent touches. The
+  agent does its own file access and asks the worker for permission as it goes.
+- **The limit is a *permission policy*, and it is cooperative.** agent-connect
+  allows operations under the session's working directory and rejects the rest —
+  but that binds only an agent that *chooses to ask*. An agent that just writes
+  the file is not stopped, because nothing is there to stop it. It is a
+  convention, not a guarantee; it is not a substitute for a sandbox.
+- **Owner-tier under ACP is therefore MORE permissive than owner-tier under
+  codex.** Same tier, weaker confinement: no OS sandbox, and network access is
+  always on (`codex exec --sandbox workspace-write` gives neither).
+- **Non-owner tasks are refused outright** and never reach ACP, with a message
+  saying why. Shipping a read-only *tier* on top of a cooperative *policy* would
+  be offering a limit that only looks like one.
+
+```bash
+export AGENT_CONNECT_ADAPTER=acp
+export AGENT_CONNECT_ACP_COMMAND="npx @agentclientprotocol/claude-agent-acp"
+export AGENT_CONNECT_REPO=/path/to/the/repo   # the session's working directory
+```
+
+Refused permission requests are reported back in the reply, so a blocked agent is
+distinguishable from a lazy one.
+
 ## Adapters
 
 An adapter is ~20 lines: "given a task string + sandbox + working dir, run the
@@ -57,13 +91,14 @@ agent and return its output." Ships with:
 **Three integration levers** (pick per agent):
 1. **Direct adapter** — a ~30-line wrapper around an agent's own headless CLI. Best when the agent has a clean exec mode.
 2. **`omnigent` adapter** — one adapter that drives [omnigent](https://github.com/omnigent-ai/omnigent)'s whole harness catalog (claude, codex, cursor, kimi, qwen, goose, hermes, pi, opencode, …). Unlocks many agents from a single file and isolates that (alpha) dependency. Per-message `[harness]` prefix selects the harness.
-3. **ACP adapter** *(planned)* — one adapter for any agent that speaks the Agent Client Protocol (Cline, Pi, Codex, Claude, OpenClaw via `acpx`).
+3. **`acp` adapter** — one adapter for any agent that speaks the Agent Client Protocol (Cline, Pi, Codex, Claude, OpenClaw via `acpx`). **Owner-tier only, cooperative confinement — see the section above.**
 
 **Shipped adapters:**
 - **codex** — `codex exec`. ✅ verified, live.
 - **ollama** — local model via the Ollama HTTP API (fully private, no provider auth). ✅ verified, live.
 - **omnigent** — drives any omnigent harness. ✅ verified, live.
 - **cline** — `cline -y`. ✅ verified (command path + auth handling); go-live needs Cline auth.
+- **acp** — any ACP-speaking agent, driven over stdio. ⚠️ owner-tier only, and the confinement is cooperative (see above).
 - **kilo** — `kilo run --auto`. ⚠️ scaffold; headless output capture unverified (needs Kilo auth to confirm / finish).
 
 **Roadmap coverage** (owner list Codex/Hermes/OpenClaw/Cline/PI/Kilo): Codex ✅ · Hermes ✅ (omnigent) · PI ✅ (omnigent / ACP) · Cline ✅ (direct / ACP) · Kilo ⚠️ (direct scaffold, or omnigent's opencode harness) · OpenClaw = a personal-assistant *gateway*, not a coding harness → reach its coding via ACP.
