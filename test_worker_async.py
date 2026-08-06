@@ -221,14 +221,19 @@ check(
     "the vocabulary module depends on nothing but the standard library",
 )
 check("acp" not in imported_modules(root / "adapters" / "shim.py"), "the shim knows no protocol either")
+# The list is closed on purpose: it grows by argument, not by accident. It grew
+# once, for `notice` — Sessions have to tell a room that its context was reset,
+# and that is neither the answer, nor progress towards it, nor a footnote on how
+# it ended, so none of the other seven could carry it honestly.
 check(
-    {"message_chunk", "thinking", "tool_started", "tool_finished", "plan", "permission_asked", "done"}
+    {"message_chunk", "thinking", "tool_started", "tool_finished", "plan",
+     "permission_asked", "notice", "done"}
     == {
         cls.kind
         for cls in vars(ev).values()
         if isinstance(cls, type) and issubclass(cls, ev.TurnEvent) and cls is not ev.TurnEvent
     },
-    "the vocabulary is exactly the seven agreed events",
+    "the vocabulary is exactly the eight agreed events",
 )
 
 

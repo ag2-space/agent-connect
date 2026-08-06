@@ -26,6 +26,7 @@ try:
     from agent_connect.adapters import NATIVE, get as get_adapter
     from agent_connect.adapters.acp import REFUSAL, AcpAdapter, command_from_env
     from agent_connect.acp.core import AcpError
+    from agent_connect.sessions import SessionStore
     from agent_connect.worker import handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(
@@ -62,7 +63,13 @@ class Bench:
         self.script_path = base / "script.json"
         self.set_script(script)
         self.report_path = base / "report.json"
-        self.adapter = AcpAdapter(command=[sys.executable, FAKE, str(self.script_path)])
+        # Its own Session map, inside the bench: these tests are about one Turn
+        # at a time, and a store shared with the operator's real workspace would
+        # make them remember each other. Continuation is `test_acp_sessions.py`.
+        self.adapter = AcpAdapter(
+            command=[sys.executable, FAKE, str(self.script_path)],
+            store=SessionStore(base / "sessions.json"),
+        )
 
     def set_script(self, script: dict) -> None:
         """Rewrite the script — the working directory it talks about is only

@@ -32,6 +32,9 @@ answers every prompt with one message and stops with `end_turn`.
       "newSessionError": {"code": -32000, "message": "..."},
       "loadSessionError": {...},      # refuse Session resumption
       "loadSessionReplay": [ <update>, ... ],   # replayed history on resume
+      "sessionPrefix": "roomA",       # how session ids are named (default
+                                      # "fake-session"), so several processes'
+                                      # Sessions are distinguishable
       "turns": [ <turn>, ... ],       # consumed one per session/prompt
       "defaultTurn": <turn>           # used once "turns" is exhausted
     }
@@ -256,7 +259,11 @@ class FakeAcpAgent:
         if error:
             raise _JsonRpcError(error.get("code", -32000), error.get("message", ""))
         self._session_seq += 1
-        session_id = f"fake-session-{self._session_seq}"
+        # The prefix is scriptable so that a test running several Sessions —
+        # each in its own process, each counting from one — can still tell them
+        # apart in the Session map it is asserting on.
+        prefix = self.script.get("sessionPrefix") or "fake-session"
+        session_id = f"{prefix}-{self._session_seq}"
         self.report["sessions"].append(
             {
                 "method": "session/new",

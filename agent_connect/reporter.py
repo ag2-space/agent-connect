@@ -29,6 +29,12 @@ Turn is.
 consumer *may* read it. The room is not that consumer, and there is a test that
 says so.
 
+A `Notice` breaks the one-message shape on purpose, and only it does. An
+announcement — "the context was reset" — is a fact about the run and not part of
+the answer, so it is posted as **its own message** and the placeholder is left
+alone. Editing the placeholder into an announcement would replace the answer
+with a remark about it.
+
 The reporter is the only thing that knows this contract. It works the same for
 the ACP Adapter and for a shimmed one, which simply emits fewer events: a
 shimmed Adapter gets a placeholder and a final answer, with nothing in between,
@@ -45,6 +51,7 @@ from .events import (
     COMPLETED,
     Done,
     MessageChunk,
+    Notice,
     PermissionAsked,
     ToolFinished,
     ToolStarted,
@@ -133,8 +140,11 @@ class TurnReporter:
         self._steps: List[str] = []      # tool titles, in the order they started
         self._failed: set = set()        # titles of tool calls that failed
         self._refused: List[str] = []    # what the Permission Policy rejected
+        self._unposted: List[str] = []   # notices the room could not be told
         #: Number of progress edits actually issued — the throttle, observable.
         self.progress_edits = 0
+        #: Number of `Notice` events posted as their own message.
+        self.notices_posted = 0
 
     # -- the Ladder ---------------------------------------------------------
 
@@ -186,6 +196,8 @@ class TurnReporter:
             self._refused.append(
                 f"{event.title} — {event.reason}" if event.reason else event.title
             )
+        elif isinstance(event, Notice):
+            await self._notice(event.text)
 
     async def finish(self, answer: str, note: str = "") -> str:
         """Edit the placeholder into the answer; return what to write as result.
@@ -196,7 +208,9 @@ class TurnReporter:
         not fit: the placeholder becomes a short pointer and the answer itself
         is the result body, which the relay client chunks as it always has.
         """
-        body = _assemble(answer, note, self._steps, self._failed, self._refused)
+        body = _assemble(
+            answer, note, self._steps, self._failed, self._refused, self._unposted
+        )
         if not self.event_id:
             return body
         if len(body) > self.settings.ceiling:
@@ -208,6 +222,29 @@ class TurnReporter:
         return f"{REPLIED}\n\n{body}"
 
     # -- internals ----------------------------------------------------------
+
+    async def _notice(self, text: str) -> None:
+        """Tell the room something about the run, as its own message.
+
+        **Never by editing the placeholder.** The placeholder belongs to this
+        Task's answer; editing it into "the context was reset" would replace the
+        answer with a remark about it. A notice is a second message, posted the
+        moment it is true, and the Ladder carries on above it untouched.
+
+        A room that cannot be posted to does not lose the notice: it rides out
+        on the result body instead, where the delivery path will post it.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        if self.ops is not None and self._room and getattr(self.ops, "available", True):
+            try:
+                await self.ops.message(self._room, text)
+                self.notices_posted += 1
+                return
+            except RoomOpError:
+                pass
+        self._unposted.append(text)
 
     async def _progress(self) -> None:
         if not self.settings.live or not self.event_id or not self._steps:
@@ -233,7 +270,7 @@ class TurnReporter:
         return True
 
 
-def _assemble(answer: str, note: str, steps, failed, refused) -> str:
+def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str:
     """The answer, its ending, and a compact summary of what was done.
 
     The summary is not a log. It is the two or three lines that let a person see
@@ -241,8 +278,15 @@ def _assemble(answer: str, note: str, steps, failed, refused) -> str:
     Policy rejected*, because without them a blocked agent is indistinguishable
     from a lazy one and the person is left wondering why the thing did not
     happen.
+
+    `notices` are announcements that could not be posted as their own message
+    (no relay, no room, a refused op). They lead the body rather than being
+    dropped: a Worker with no room ops must still be able to say that the
+    conversation started over.
     """
-    parts = [answer.strip()] if answer.strip() else []
+    parts = [n.strip() for n in notices if n and n.strip()]
+    if answer.strip():
+        parts.append(answer.strip())
     if note.strip():
         parts.append(note.strip())
     summary = _summary(steps, failed, refused)

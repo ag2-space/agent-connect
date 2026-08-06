@@ -30,13 +30,14 @@ from .events import TurnContext
 from .reporter import LadderSettings, TurnReporter
 from .roomops import room_ops_from_env
 from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
+from .sessions import workspace_dir
 
 
 def _ws() -> Path:
-    return Path(
-        os.environ.get("AGENT_CONNECT_WORKSPACE")
-        or (Path.home() / ".agent-connect" / "workspace")
-    ).expanduser()
+    # One definition of "the workspace", shared with the Session map that lives
+    # in it — `agent_connect.sessions` owns it because the Adapter reaches for
+    # it without going through the Worker.
+    return workspace_dir()
 
 
 # Header keys the AG2 Space relay writes (ag2-sparrow's task-file layout).

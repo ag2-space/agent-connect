@@ -43,6 +43,29 @@ logged in. It opens no Session and sends no prompt. Discovering at the first
 message in a room that the Local Agent wants a login is the failure this
 prevents — the person who asked gets an answer, not an authentication notice.
 
+**One Session per (room, Access Tier), remembered across Turns and across
+restarts.** A follow-up in a room continues the conversation, because the
+Session identifier the Local Agent gave us is kept in the Session map
+(`agent_connect.sessions`) and resumed with `session/load` on the next Turn. The
+key is the pair, never the room alone: a Session carries a permission mode, and
+a lower-trust request must inherit neither that mode nor the context of someone
+else's work in the same room.
+
+Two properties of that arrangement are deliberate and easy to undo by accident:
+
+*Resumption is silent.* `session/load` makes the Local Agent replay the entire
+prior conversation as ordinary `session/update` notifications — the same
+callback live progress arrives on. Consumed naively that dumps an old
+transcript into a live room. The Turn's update callback is therefore
+**suppressed for the duration of the load**: replayed updates are dropped before
+they become events, so nothing downstream can publish them and nothing can
+mistake them for this Turn's answer.
+
+*A conversation that cannot be continued costs context, not the request.* An
+agent that refuses to resume, or never advertised resumption, or a Session that
+retired on its Turn budget or idle timeout — each opens a fresh Session and
+tells the room so, as a `Notice`. Silent amnesia is the failure being prevented.
+
 **No interactive terminal, on any path.** ACP lets a Client offer terminal
 provisioning so the Agent can ask for a shell. The Worker does not implement it
 and does not advertise it (`CLIENT_CAPABILITIES` in `acp/core.py` is where that
@@ -58,7 +81,7 @@ import shutil
 from dataclasses import dataclass
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
-from ..acp.core import AcpClient, AcpError, Update
+from ..acp.core import AcpClient, AcpError, SessionResumeRefused, Update
 from ..acp.policy import WorkingDirectoryPolicy
 from ..events import (
     CANCELLED,
@@ -68,6 +91,7 @@ from ..events import (
     TOKEN_LIMIT,
     Done,
     MessageChunk,
+    Notice,
     PermissionAsked,
     Plan,
     Thinking,
@@ -76,6 +100,7 @@ from ..events import (
     TurnContext,
     TurnEvent,
 )
+from ..sessions import SessionSettings, SessionStore, store_from_env
 
 #: The one Access Tier this Adapter serves. See the module docstring: this is
 #: the single point the whole restriction lives at.
@@ -162,6 +187,16 @@ REFUSAL = (
     "agent-connect does not run this connection for anyone but the person who "
     "registered the agent."
 )
+
+#: What the room is told when its conversation starts over. One sentence, in
+#: the room's own terms — a person needs to know that the agent no longer
+#: remembers, and why, at the moment it becomes true.
+RESET = "🧠 agent-connect: starting a fresh conversation — {why}. I no longer have the earlier context in this room."
+
+#: Why the previous conversation ended, in the four ways it can.
+WHY_REFUSED = "the agent could not restore our previous one ({detail})"
+WHY_RETIRED = "the previous one was retired because {reason}"
+WHY_MOVED = "the working directory changed, and a session's directory is fixed when it opens"
 
 #: ACP's stop reasons, mapped onto ours. Anything unrecognised is `FAILED` on
 #: purpose: a stop reason added upstream must not read as a completed answer.
@@ -370,12 +405,22 @@ class AcpAdapter:
 
     name = "acp"
 
-    def __init__(self, command: Optional[Sequence[str]] = None, mode: Optional[str] = None):
+    def __init__(
+        self,
+        command: Optional[Sequence[str]] = None,
+        mode: Optional[str] = None,
+        store: Optional[SessionStore] = None,
+        session_settings: Optional[SessionSettings] = None,
+    ):
         # Injectable so a test does not have to set process environment; `None`
         # means "read the environment when the Turn runs", which is what the
         # Worker gets.
         self._command = list(command) if command else None
         self._mode = mode
+        # The Session map is per-Adapter, and the Adapter is per-Worker: the
+        # whole point is that two Turns in one room find the same Session.
+        self._store = store
+        self._session_settings = session_settings
         #: What `preflight` learned about the ACP Agent, if it has run.
         self.agent_description = None
 
@@ -387,6 +432,22 @@ class AcpAdapter:
 
     def mode(self) -> str:
         return self._mode if self._mode is not None else os.environ.get(MODE_ENV, "").strip()
+
+    def session_settings(self) -> SessionSettings:
+        if self._session_settings is None:
+            self._session_settings = SessionSettings.from_env()
+        return self._session_settings
+
+    def store(self) -> SessionStore:
+        """The Session map, built on first use rather than at import.
+
+        Late, because an Adapter that is constructed and then never asked to run
+        a Turn — the registry builds one to inspect it — has no business
+        touching the operator's state directory.
+        """
+        if self._store is None:
+            self._store = store_from_env()
+        return self._store
 
     async def preflight(self) -> Optional[str]:
         """Is this Worker able to serve? `None` if yes, else what to fix.
@@ -458,8 +519,21 @@ class AcpAdapter:
         cwd = ctx.cwd or os.getcwd()
         policy = WorkingDirectoryPolicy(cwd)
         queue: asyncio.Queue = asyncio.Queue()
+        settings = self.session_settings()
+        store = self.store() if settings.memory else None
+        key = ctx.session_key
+
+        # Per-Turn, not per-Adapter: two rooms run their Turns concurrently and
+        # one of them resuming must not silence the other's live progress.
+        replaying = _Suppression()
 
         def on_update(update: Update) -> None:
+            # Replayed history arrives here exactly like live progress — the
+            # core cannot tell them apart and says so. Dropping it before it
+            # becomes an event is what keeps an old transcript out of the room
+            # *and* out of this Turn's answer.
+            if replaying.on:
+                return
             for event in events_for(update):
                 queue.put_nowait(event)
 
@@ -481,15 +555,52 @@ class AcpAdapter:
             )
             return decision.option_id
 
+        # Which Session this Turn belongs to, decided before the ACP Agent is
+        # even started: a retired or misplaced one is dropped here, and the room
+        # hears about it whether or not the agent turns out to be reachable.
+        record = store.get(key) if store is not None else None
+        if record is not None:
+            why = _why_unusable(record, cwd, settings)
+            if why:
+                store.forget(key)
+                record = None
+                queue.put_nowait(Notice(text=RESET.format(why=why)))
+
         async def run():
             async with AcpClient.spawn(
                 command, cwd=cwd, on_update=on_update, permission_handler=on_permission
             ) as client:
                 await client.initialize()
-                session_id = await client.new_session(cwd=cwd)
+                session_id, turns = "", 0
+                if record is not None:
+                    # The whole of the resumption hazard is these four lines:
+                    # everything the agent replays is suppressed, and the flag
+                    # is cleared in a `finally` so a refusal cannot leave this
+                    # Turn's own progress muted.
+                    replaying.on = True
+                    try:
+                        await client.load_session(record.session_id, cwd=cwd)
+                        session_id, turns = record.session_id, record.turns
+                    except SessionResumeRefused as exc:
+                        queue.put_nowait(
+                            Notice(text=RESET.format(
+                                why=WHY_REFUSED.format(detail=exc)))
+                        )
+                    finally:
+                        replaying.on = False
+                if not session_id:
+                    session_id = await client.new_session(cwd=cwd)
+                    turns = 0
                 mode = self.mode()
                 if mode:
                     await client.set_session_mode(session_id, mode)
+                if store is not None:
+                    # Remembered *before* the prompt, not after: a Turn that
+                    # crashes or is cancelled still happened, and its history is
+                    # in the Local Agent's Session whatever this Worker does
+                    # next. Counting it now is also what makes the Turn budget
+                    # bound the tokens rather than the successes.
+                    store.remember(key, session_id, cwd, turns + 1)
                 return await client.prompt(session_id, preamble(ctx) + ctx.prompt)
 
         work = asyncio.ensure_future(run())
@@ -522,6 +633,37 @@ class AcpAdapter:
             text="".join(chunks),
             note=_note(result.stop_reason),
         )
+
+
+class _Suppression:
+    """Whether replayed history is being consumed right now.
+
+    A one-field object rather than a `nonlocal` because the flag is read from a
+    callback the core owns and written from the coroutine driving the load; a
+    mutable cell makes both sides obviously the same flag.
+    """
+
+    __slots__ = ("on",)
+
+    def __init__(self) -> None:
+        self.on = False
+
+
+def _why_unusable(record, cwd: str, settings: SessionSettings) -> str:
+    """Why this remembered Session cannot serve this Task — or `""`.
+
+    Two reasons, and neither involves asking the Local Agent. A Session's
+    working directory is fixed when it opens, so a Task from a differently
+    configured Worker needs a new one however much context the old one holds.
+    And a Session past its Turn budget or its idle timeout is retired here,
+    which is the point of the budget: the boundary is the Worker's to enforce
+    and to announce, not something to discover when the context is already
+    enormous.
+    """
+    if not record.matches(cwd):
+        return WHY_MOVED
+    reason = settings.retirement(record)
+    return WHY_RETIRED.format(reason=reason) if reason else ""
 
 
 async def _drain(queue: asyncio.Queue, work: asyncio.Future) -> AsyncIterator[TurnEvent]:

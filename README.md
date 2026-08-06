@@ -146,6 +146,33 @@ If the worker holds no relay token, or the relay refuses a room op, the answer
 travels the way it always did — as the task result the relay client posts. The
 ladder degrades; it never eats the answer.
 
+## The agent remembers the conversation (ACP)
+
+Ask for something, then say "now the same for the other module", and it works:
+each room continues one conversation with your local agent instead of starting
+over every message. The session is keyed by **room *and* access tier together**,
+never by room alone — a session carries a permission mode and its own context,
+and a lower-trust request must inherit neither.
+
+The session survives you restarting the worker: the identifier is kept in
+`<workspace>/sessions.json` and resumed on the next message. Resuming makes the
+local agent replay the whole prior exchange, which the worker consumes **in a
+suppressed mode that posts nothing** — restarting must not dump yesterday's
+transcript into a live room.
+
+**Memory is bounded, and its ending is announced.** A session retires after
+`AGENT_CONNECT_SESSION_TURNS` turns or `AGENT_CONNECT_SESSION_IDLE` seconds of
+silence, and the room is told, in its own message, that the context was reset
+and why. The same message appears when a conversation cannot be resumed — an
+agent that refuses, or one that never offered resumption at all: the request is
+answered from a fresh session rather than failed. Silent amnesia is the problem
+being solved, so nothing here happens quietly. Set
+`AGENT_CONNECT_SESSION_MEMORY=0` and every message starts fresh, as it did
+before.
+
+Only the ACP adapter has this. The other five run a one-shot CLI per task and
+have no session to continue.
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**
@@ -168,6 +195,16 @@ The ladder (see the section above):
 | `AGENT_CONNECT_LIVE_PROGRESS` | `0` turns live progress editing off and leaves the plain placeholder-then-answer ladder. **This is the one setting that retreats to the fleet-wide convention** | `1` |
 | `AGENT_CONNECT_PROGRESS_THROTTLE` | seconds between progress edits, however busy the turn is | `3.0` |
 | `AGENT_CONNECT_EDIT_CEILING` | characters an answer may have and still be edited into the placeholder; a longer one arrives as its own message | `4000` |
+
+Sessions — the conversation a room continues (ACP adapter only, see the section
+above):
+
+| Setting | What it does | Default |
+| --- | --- | --- |
+| `AGENT_CONNECT_SESSION_TURNS` | turns a session may run before it is retired and the room is told the context was reset. `0` means no budget | `20` |
+| `AGENT_CONNECT_SESSION_IDLE` | seconds of silence after which a session is retired, announced the same way. `0` means never | `3600` |
+| `AGENT_CONNECT_SESSION_MEMORY` | `0` turns continuing conversations off entirely: every task opens a fresh session and nothing is written to disk | `1` |
+| `AGENT_CONNECT_SESSION_STORE` | file the room-to-session map is kept in, so conversations survive a worker restart | `<workspace>/sessions.json` |
 
 ACP adapter (see the section above):
 

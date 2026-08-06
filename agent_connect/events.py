@@ -7,8 +7,8 @@ An Adapter no longer takes a string and returns a string. It takes a
         ...
 
 **The vocabulary is ours, not the protocol's.** Message chunk, thinking, tool
-started, tool finished, plan, permission asked, done-with-reason — that is the
-whole list. No ACP type, and no type from any other protocol an Adapter happens
+started, tool finished, plan, permission asked, notice, done-with-reason — that
+is the whole list, and it is closed: it grows by argument, not by accident. No ACP type, and no type from any other protocol an Adapter happens
 to speak, may appear here: an Adapter talking plain HTTP to a local model must
 never have to imitate ACP to report that it produced some text. Adapters
 translate *into* this vocabulary; consumers read only this vocabulary.
@@ -158,6 +158,24 @@ class PermissionAsked(TurnEvent):
     allowed: bool = False
     reason: str = ""
     detail: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Notice(TurnEvent):
+    """Something the room is told *about* this run, rather than as part of it.
+
+    "I could not restore our earlier conversation" is not an answer, not
+    progress, and not a footnote on the answer — it is a fact about the run that
+    a person needs at the moment it becomes true. So it is its own event, and a
+    consumer posts it as its own message: folding it into the reply would put a
+    remark about memory inside the answer to a question about something else.
+
+    Kept deliberately narrow. This is not a logging channel — anything the
+    operator needs and the room does not belongs on stderr.
+    """
+
+    kind: ClassVar[str] = "notice"
+    text: str = ""
 
 
 @dataclass(frozen=True)
