@@ -105,7 +105,65 @@ printf '%s\n' "$out" | grep -q "privacy-protected" && ok "TCC-protected --repo w
 out=$(PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --repo "$TMP/elsewhere" --no-start 2>&1) || true
 printf '%s\n' "$out" | grep -q "privacy-protected" && bad "false TCC warning on safe path" || ok "no TCC warning on safe path"
 
-# 8) the sparse-fetch path is gone for good (PyPI is the single source)
+# 8) the ACP bridge is PINNED, to the same version the package believes in.
+#    This is the review point: the bridge renamed itself and moves through major
+#    versions fast, so an unpinned or drifting spec is the failure to catch here
+#    rather than in a room six months from now.
+SPEC="$(sed -n 's/^ACP_BRIDGE_SPEC="\${AGENT_CONNECT_ACP_BRIDGE_SPEC:-\(.*\)}"$/\1/p' "$SCRIPT")"
+case "$SPEC" in
+  @agentclientprotocol/claude-agent-acp@[0-9]*.[0-9]*.[0-9]*)
+    ok "installer pins the bridge to an exact version ($SPEC)" ;;
+  *) bad "bridge spec is not an exact pin: '${SPEC:-<not found>}'" ;;
+esac
+case "$SPEC" in
+  *latest*|*"^"*|*"~"*|*">"*) bad "bridge spec is a range, not a pin: $SPEC" ;;
+  *) ok "no range/latest in the bridge spec" ;;
+esac
+# the package name that was renamed away from must not come back
+if grep -q "claude-code-acp" "$SCRIPT"; then
+  bad "install.sh still names the OLD bridge package (claude-code-acp)"
+else
+  ok "installer uses the current bridge package name"
+fi
+# one pinned version, agreed by the installer and the adapter that runs it
+PY_SPEC="$(sed -n 's/^BRIDGE_SPEC = f"{BRIDGE_PACKAGE}@{BRIDGE_VERSION}"$/&/p' "$HERE/agent_connect/adapters/acp.py")"
+PY_PKG="$(sed -n 's/^BRIDGE_PACKAGE = "\(.*\)"$/\1/p' "$HERE/agent_connect/adapters/acp.py")"
+PY_VER="$(sed -n 's/^BRIDGE_VERSION = "\(.*\)"$/\1/p' "$HERE/agent_connect/adapters/acp.py")"
+if [ -n "$PY_SPEC" ] && [ "$SPEC" = "$PY_PKG@$PY_VER" ]; then
+  ok "installer and adapter pin the SAME bridge version ($PY_VER)"
+else
+  bad "pin drift: install.sh has '$SPEC', acp.py has '$PY_PKG@$PY_VER'"
+fi
+
+# 9) --adapter acp: the preset name is wired through to the worker, and the
+#    bridge install is attempted with the pinned spec (npm stubbed, logged).
+cat > "$TMP/npm" <<'FAKE'
+#!/bin/sh
+echo "npm $*" >> "$TMP_NPM_LOG"
+exit 0
+FAKE
+chmod +x "$TMP/npm"
+NPM_LOG="$TMP/npm.log"; : > "$NPM_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --no-start 2>&1) || bad "acp dry-run failed"
+printf '%s\n' "$out" | grep -q "AGENT_CONNECT_ACP_AGENT=claude" \
+  && ok "acp run command names the preset agent" || bad "acp run command missing AGENT_CONNECT_ACP_AGENT"
+grep -q "install -g $SPEC" "$NPM_LOG" \
+  && ok "installer installs the pinned bridge via npm" || {
+    sed 's/^/    /' "$NPM_LOG"; bad "npm was not asked for the pinned bridge"; }
+printf '%s\n' "$out" | grep -q "never opens a terminal" \
+  && ok "acp install tells the operator to log in themselves" || bad "missing login-yourself notice"
+# a non-default preset does not silently get the Claude bridge installed
+: > "$NPM_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-agent gemini --no-start 2>&1) || bad "acp gemini dry-run failed"
+printf '%s\n' "$out" | grep -q "AGENT_CONNECT_ACP_AGENT=gemini" \
+  && ok "--acp-agent selects the preset" || bad "--acp-agent not wired through"
+grep -q "claude-agent-acp" "$NPM_LOG" \
+  && bad "the Claude bridge was installed for a non-Claude preset" \
+  || ok "no bridge installed for a preset that does not use one"
+
+# 10) the sparse-fetch path is gone for good (PyPI is the single source)
 if grep -q "raw.githubusercontent.com" "$SCRIPT"; then
   bad "install.sh still sparse-fetches from raw.githubusercontent.com"
 else

@@ -10,7 +10,10 @@
 #
 # Flags (also read from env):
 #   --token   AGENT_CONNECT_TOKEN    your agent's relay token from the Agent Portal [required]
-#   --adapter AGENT_CONNECT_ADAPTER  codex | omnigent | ollama | cline  [default: codex]
+#   --adapter AGENT_CONNECT_ADAPTER  codex | omnigent | ollama | cline | acp  [default: codex]
+#   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini
+#             [default: claude]  Any other ACP agent: set AGENT_CONNECT_ACP_COMMAND
+#             yourself — it overrides the preset.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in            [default: cwd]
 #   --sutando-workspace PATH         connect an ALREADY-RUNNING Sutando instead of
 #             (AGENT_CONNECT_SUTANDO_WORKSPACE)  installing a worker: relay-only mode,
@@ -22,6 +25,8 @@
 #   codex    → OpenAI Codex CLI (native)            — your Codex login
 #   omnigent → Claude Code, cursor, kimi, qwen, …   — `--adapter omnigent` (default harness: claude)
 #   ollama   → local model via Ollama HTTP API      — no provider auth
+#   acp      → any Agent Client Protocol agent       — `--adapter acp --acp-agent claude`
+#              (owner-tier only, cooperative confinement — see README)
 # You still log into the underlying tool yourself; the token is your AG2 Space
 # *identity*, never a model API key.
 set -eu
@@ -47,16 +52,27 @@ AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-git+https://github.com/ag2-space/agent-co
 # relay client: the ag2-sparrow package on PyPI (transport-only; long-polls YOUR
 # agent's tasks and posts results back). Overridable for pre-release testing.
 RELAY_PIP_SPEC="${RELAY_PIP_SPEC:-ag2-sparrow>=0.2.0}"
+ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-claude}"
+# The ACP bridge that makes Claude Code an ACP Agent, PINNED to an exact
+# version. It renamed itself once already (the older name is dead — do not
+# reintroduce it) and moved through many major versions inside six months; an
+# unpinned fetch would eventually drop an
+# incompatible release into an install that worked yesterday. This must stay
+# equal to BRIDGE_SPEC in agent_connect/adapters/acp.py — install.test.sh
+# asserts the two agree, so raising it is a reviewable diff in both places.
+ACP_BRIDGE_SPEC="${AGENT_CONNECT_ACP_BRIDGE_SPEC:-@agentclientprotocol/claude-agent-acp@0.64.2}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --token)   TOKEN="$2"; shift 2 ;;
     --adapter) ADAPTER="$2"; shift 2 ;;
+    --acp-agent) ACP_AGENT="$2"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --sutando-workspace) SUTANDO_WS="$2"; shift 2 ;;
     --no-start) START=0; shift ;;
     --token=*)   TOKEN="${1#*=}"; shift ;;
     --adapter=*) ADAPTER="${1#*=}"; shift ;;
+    --acp-agent=*) ACP_AGENT="${1#*=}"; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
     --sutando-workspace=*) SUTANDO_WS="${1#*=}"; shift ;;
     *) echo "install.sh: unknown arg: $1" >&2; exit 2 ;;
@@ -149,6 +165,28 @@ fi
 case ":$PATH:" in *":$HOME/.local/bin:"*) : ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
 export PATH
 
+# ── 1b) the ACP bridge, pinned ──────────────────────────────────────────────
+# Only for --adapter acp. The pin is the point: see ACP_BRIDGE_SPEC above.
+ACP_KV=""
+if [ "$ADAPTER" = "acp" ]; then
+  ACP_KV="AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
+  case "$ACP_AGENT" in
+    claude)
+      if command -v npm >/dev/null 2>&1; then
+        say "installing the ACP bridge, pinned: $ACP_BRIDGE_SPEC"
+        npm install -g "$ACP_BRIDGE_SPEC" >/dev/null 2>&1 || {
+          echo "install.sh: WARNING — could not install $ACP_BRIDGE_SPEC. Install it yourself: npm install -g $ACP_BRIDGE_SPEC" >&2; }
+      else
+        echo "install.sh: WARNING — npm not found, so the ACP bridge was not installed. Install Node.js 18+, then: npm install -g $ACP_BRIDGE_SPEC" >&2
+      fi
+      say "log in to Claude Code yourself before starting (claude, then /login) — the worker never opens a terminal for you"
+      ;;
+    *)
+      say "ACP agent '$ACP_AGENT': install and log into it yourself; agent-connect only pins the Claude Code bridge"
+      ;;
+  esac
+fi
+
 # ── 2) write the launcher ────────────────────────────────────────────────────
 # One code path for every start mode (launchd / systemd / nohup / by hand):
 # starts the relay client wired to the worker's workspace via the dir-interface
@@ -227,7 +265,7 @@ chmod +x "$LAUNCHER"
 if [ -n "$SUTANDO_WS" ]; then
   RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN sh $LAUNCHER"
 else
-  RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN AGENT_CONNECT_ADAPTER=$ADAPTER AGENT_CONNECT_REPO=$REPO sh $LAUNCHER"
+  RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN AGENT_CONNECT_ADAPTER=$ADAPTER AGENT_CONNECT_REPO=$REPO ${ACP_KV:+$ACP_KV }sh $LAUNCHER"
 fi
 
 if [ "$START" -eq 0 ]; then
@@ -239,6 +277,17 @@ fi
 # ── 3) start it (persistent) ────────────────────────────────────────────────
 # Prefer a per-user service so the agent survives logout/reboot; fall back to a
 # nohup background process if no service manager is available.
+# Adapter-specific env, carried into whichever start mode is used. Empty for
+# every adapter but acp, which is why these expand to nothing rather than to a
+# variable set to the empty string.
+ACP_PLIST=""
+ACP_UNIT=""
+if [ -n "$ACP_KV" ]; then
+  ACP_PLIST="    <key>AGENT_CONNECT_ACP_AGENT</key><string>$ACP_AGENT</string>
+"
+  ACP_UNIT="Environment=AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
+fi
+
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
   say "starting via launchd (per-user LaunchAgent)"
@@ -256,7 +305,7 @@ if [ "$OS" = "Darwin" ]; then
     <key>AGENT_CONNECT_TOKEN</key><string>$TOKEN</string>
     <key>AGENT_CONNECT_ADAPTER</key><string>$ADAPTER</string>
     <key>AGENT_CONNECT_REPO</key><string>$REPO</string>
-    <key>PATH</key><string>$PATH</string>
+$ACP_PLIST    <key>PATH</key><string>$PATH</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -278,6 +327,7 @@ After=network-online.target
 Environment=AGENT_CONNECT_TOKEN=$TOKEN
 Environment=AGENT_CONNECT_ADAPTER=$ADAPTER
 Environment=AGENT_CONNECT_REPO=$REPO
+$ACP_UNIT
 ExecStart=/bin/sh $LAUNCHER
 Restart=always
 [Install]
@@ -290,7 +340,7 @@ else
   say "no service manager found — starting in the background (nohup)"
   # shellcheck disable=SC2086
   env AGENT_CONNECT_TOKEN="$TOKEN" AGENT_CONNECT_ADAPTER="$ADAPTER" \
-      AGENT_CONNECT_REPO="$REPO" \
+      AGENT_CONNECT_REPO="$REPO" $ACP_KV \
       nohup sh "$LAUNCHER" >"$APP_DIR/agent-connect.log" 2>&1 &
   say "started (pid $!). Logs: $APP_DIR/agent-connect.log"
 fi
