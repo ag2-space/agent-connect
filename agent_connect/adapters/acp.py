@@ -494,13 +494,10 @@ class AcpAdapter:
 
         work = asyncio.ensure_future(run())
         chunks: List[str] = []
-        refused: List[str] = []
         try:
             async for event in _drain(queue, work):
                 if isinstance(event, MessageChunk):
                     chunks.append(event.text)
-                elif isinstance(event, PermissionAsked) and not event.allowed:
-                    refused.append(f"{event.title} — {event.reason}")
                 yield event
             result = work.result()
         except asyncio.CancelledError:
@@ -523,7 +520,7 @@ class AcpAdapter:
         yield Done(
             reason=STOP_REASONS.get(result.stop_reason, FAILED),
             text="".join(chunks),
-            note=_note(result.stop_reason, refused),
+            note=_note(result.stop_reason),
         )
 
 
@@ -548,16 +545,15 @@ async def _drain(queue: asyncio.Queue, work: asyncio.Future) -> AsyncIterator[Tu
     work.result()  # re-raises whatever the Turn failed with
 
 
-def _note(stop_reason: str, refused: List[str]) -> str:
-    """The operator- and room-facing footnote for a Turn that was not plain."""
+def _note(stop_reason: str) -> str:
+    """The operator- and room-facing footnote for a Turn that was not plain.
+
+    It says nothing about rejected permission requests. It used to, and then the
+    `TurnReporter` began reading `PermissionAsked` straight off the stream for
+    its summary — so this stopped, rather than telling the person twice. The
+    events still carry every rejection; this is only about who says it.
+    """
     lines: List[str] = []
-    if refused:
-        lines.append(
-            "agent-connect refused "
-            + ("1 request" if len(refused) == 1 else f"{len(refused)} requests")
-            + " from the agent:"
-        )
-        lines += [f"- {r}" for r in refused[:5]]
     mapped = STOP_REASONS.get(stop_reason)
     if mapped is None:
         lines.append(

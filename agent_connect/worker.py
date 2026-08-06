@@ -26,7 +26,9 @@ import os
 from pathlib import Path
 
 from .adapters import get as get_adapter
-from .events import Done, MessageChunk, TurnContext, final_text
+from .events import TurnContext
+from .reporter import LadderSettings, TurnReporter
+from .roomops import room_ops_from_env
 from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
 
 
@@ -119,24 +121,16 @@ def turn_context(fields: dict, task_id: str, repo: str) -> TurnContext:
     )
 
 
-async def run_turn(adapter, ctx: TurnContext) -> str:
-    """Drive one Turn to its end and return the answer.
+async def run_turn(adapter, ctx: TurnContext, ops=None, settings=None) -> str:
+    """Drive one Turn up the Ladder and return the body to write as the result.
 
-    Consumes the whole event stream. Only message chunks and the terminal
-    `Done` reach the result today; the rest of the vocabulary is what the
-    `TurnReporter` will read to keep a room posted while this is happening.
+    The whole event stream goes to the `TurnReporter`, which owns everything the
+    room sees: the placeholder, the throttled progress edits, the final edit and
+    the terminal marker. With no `ops` — a Worker holding no relay token, or a
+    test — nothing is posted and the answer travels as the result body, exactly
+    as it did before the Ladder existed.
     """
-    chunks: list = []
-    done = None
-    async for event in adapter.turn(ctx):
-        if isinstance(event, MessageChunk):
-            chunks.append(event.text)
-        elif isinstance(event, Done):
-            done = event
-    text = final_text(done, chunks)
-    if done is not None and done.note:
-        text = f"{text}\n\n{done.note}".strip()
-    return text
+    return await TurnReporter(ops, settings).run(adapter, ctx)
 
 
 class _NoLock:
@@ -150,13 +144,23 @@ class _NoLock:
 
 
 async def process_one(
-    task_path: Path, adapter, repo: str, results_dir: Path, sessions: dict = None
+    task_path: Path,
+    adapter,
+    repo: str,
+    results_dir: Path,
+    sessions: dict = None,
+    ops=None,
+    settings=None,
 ) -> None:
     """Handle one Task file: parse it, run a Turn, write the result once.
 
     `sessions` — when given — maps a Session key to the lock that keeps one
     Turn at a time open on it. Tasks with different keys never contend, which
     is what makes two rooms concurrent.
+
+    `ops` is the relay to climb the Ladder on, shared across Tasks; `settings`
+    is how much of it to climb. Both may be `None`, and then the result body is
+    the answer and the relay client posts it, as before.
     """
     task_id = task_path.stem  # "task-<id>"
     result_path = results_dir / f"{task_id}.txt"
@@ -172,12 +176,18 @@ async def process_one(
     else:
         lock = sessions.setdefault(ctx.session_key, asyncio.Lock())
     async with lock:
-        output = await run_turn(adapter, ctx)
+        output = await run_turn(adapter, ctx, ops, settings)
     result_path.write_text(output + "\n")
 
 
 async def handle_one(
-    task_path: Path, adapter, repo: str, results_dir: Path, sessions: dict = None
+    task_path: Path,
+    adapter,
+    repo: str,
+    results_dir: Path,
+    sessions: dict = None,
+    ops=None,
+    settings=None,
 ) -> None:
     """`process_one`, with the guarantee that it cannot take the Worker down.
 
@@ -186,14 +196,22 @@ async def handle_one(
     rather than nothing.
     """
     try:
-        await process_one(task_path, adapter, repo, results_dir, sessions)
+        await process_one(task_path, adapter, repo, results_dir, sessions, ops, settings)
     except Exception as e:  # noqa: BLE001 — never die on one bad task
         result_path = results_dir / f"{task_path.stem}.txt"
         if not result_path.exists():
             result_path.write_text(f"agent-connect: worker error: {e}\n")
 
 
-async def serve(adapter, repo: str, results_dir: Path, tasks_dir: Path, poll: float) -> None:
+async def serve(
+    adapter,
+    repo: str,
+    results_dir: Path,
+    tasks_dir: Path,
+    poll: float,
+    ops=None,
+    settings=None,
+) -> None:
     """Scan for Tasks forever, starting each one without waiting for the last."""
     seen: set = set()
     sessions: dict = {}
@@ -204,7 +222,7 @@ async def serve(adapter, repo: str, results_dir: Path, tasks_dir: Path, poll: fl
                 continue
             seen.add(task_path.name)
             fut = asyncio.ensure_future(
-                handle_one(task_path, adapter, repo, results_dir, sessions)
+                handle_one(task_path, adapter, repo, results_dir, sessions, ops, settings)
             )
             running.add(fut)
             fut.add_done_callback(running.discard)
@@ -248,8 +266,13 @@ def main() -> None:
     tasks_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    # The Ladder, if this Worker holds a relay token: the placeholder and its
+    # edits are Room Ops, and without a token there is nobody to ask for one.
+    ops = room_ops_from_env()
+    settings = LadderSettings.from_env()
+
     print(f"agent-connect worker: adapter={adapter_name} repo={repo} ws={ws}")
-    asyncio.run(serve(adapter, repo, results_dir, tasks_dir, poll))
+    asyncio.run(serve(adapter, repo, results_dir, tasks_dir, poll, ops, settings))
 
 
 if __name__ == "__main__":

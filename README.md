@@ -114,6 +114,38 @@ through major versions fast, so the installer never fetches `@latest`. The pin
 lives in two places that `install.test.sh` forces to agree: `ACP_BRIDGE_SPEC` in
 `install.sh` and `BRIDGE_VERSION` in `agent_connect/adapters/acp.py`.
 
+## The ladder: one message, from "on it" to the answer
+
+A request used to be met with silence until the answer arrived — sometimes ten
+minutes of it. Now a placeholder appears as soon as the worker picks the task
+up, the same message is edited as the agent works ("Read worker.py", "npm test"),
+and it is finally edited into the answer. **One message**: the room sees exactly
+one reply, and the answer carries a compact summary of what was run — including
+the operations the permission policy rejected.
+
+The shape is the relay's, not ours: the broker places the intake reaction, the
+worker posts the fleet-wide `⏳ On it...` copy and edits it, and closes the lease
+with `[REPLIED]` so nothing posts a second copy. The worker never speaks Matrix —
+every post and edit is a room op the relay performs as your agent identity, over
+the token you already have (`docs/adr/0002`).
+
+The live editing on top of that two-step shape is agent-connect's own extension.
+Edits are driven by **tool activity, not text chunks**, and throttled to at most
+one per `AGENT_CONNECT_PROGRESS_THROTTLE` seconds. **The model's internal
+reasoning never reaches the room** — the chat carries answers, not
+thinking-out-loud. Set `AGENT_CONNECT_LIVE_PROGRESS=0` and you are back to the
+plain placeholder-then-answer shape, with nothing else changed. An answer too
+long to fit in an edit is not truncated: the placeholder becomes a short pointer
+and the answer arrives in full as its own message.
+
+Adapters that are not ACP get the placeholder and the final answer too, with
+nothing in between — they have no tool activity to report, and inventing some
+would put fiction in a room.
+
+If the worker holds no relay token, or the relay refuses a room op, the answer
+travels the way it always did — as the task result the relay client posts. The
+ladder degrades; it never eats the answer.
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**
@@ -128,6 +160,14 @@ table.
 | `AGENT_CONNECT_REPO` | the working directory the agent operates in | cwd (installer: `~/agents`) |
 | `AGENT_CONNECT_WORKSPACE` | workspace dir holding `tasks/` + `results/` | `~/.agent-connect/workspace` |
 | `AGENT_CONNECT_POLL` | seconds between scans for new tasks | `1.0` |
+
+The ladder (see the section above):
+
+| Setting | What it does | Default |
+| --- | --- | --- |
+| `AGENT_CONNECT_LIVE_PROGRESS` | `0` turns live progress editing off and leaves the plain placeholder-then-answer ladder. **This is the one setting that retreats to the fleet-wide convention** | `1` |
+| `AGENT_CONNECT_PROGRESS_THROTTLE` | seconds between progress edits, however busy the turn is | `3.0` |
+| `AGENT_CONNECT_EDIT_CEILING` | characters an answer may have and still be edited into the placeholder; a longer one arrives as its own message | `4000` |
 
 ACP adapter (see the section above):
 
@@ -155,7 +195,10 @@ Other adapters:
 
 The relay client (`ag2-sparrow`) reads its own `AGENT_CONNECT_TASK_DIR`,
 `AGENT_CONNECT_RESULT_DIR`, `AGENT_CONNECT_STATE_DIR`, `REMOTE_TASK_TOKEN` and
-`REMOTE_TASK_URL`; the installer wires those into `launch.sh` for you.
+`REMOTE_TASK_URL`; the installer wires those into `launch.sh` for you. The
+worker reads those last two as well, and only for the ladder: they say which
+relay to ask for a room op and with which token. Without a token the worker
+posts nothing and the answer travels as the task result, as it always did.
 
 ## Adapters
 
