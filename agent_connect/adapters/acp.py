@@ -20,29 +20,43 @@ no second path into this Adapter that could forget it. It reads `ctx.access_tier
 and nothing else — a field the Worker's parser establishes and the sender cannot
 write, since a duplicated `access_tier` header already fails closed to "other".
 
-**Configuration here is deliberately minimal.** The ACP Agent command is given
-explicitly, in the existing `AGENT_CONNECT_*` style:
+**Naming an agent is enough; a command is always allowed to win.** The ordinary
+operator sets `AGENT_CONNECT_ACP_AGENT=claude` and a preset in this module says
+what to run. An operator with an ACP Agent nobody here anticipated sets
+`AGENT_CONNECT_ACP_COMMAND` instead, and it overrides every preset — a preset
+table must never be the reason a working ACP Agent cannot be used.
 
-    AGENT_CONNECT_ADAPTER=acp
-    AGENT_CONNECT_ACP_COMMAND="npx @agentclientprotocol/claude-agent-acp"
-    AGENT_CONNECT_ACP_MODE=default        # optional, see below
-
-Presets, version pinning and a friendly startup check are ticket 05's; this
-Adapter only promises that a missing or mistyped command produces a sentence
-rather than a traceback.
+Every setting this Adapter reads is documented once, in `README.md` §
+Settings. That section is the authoritative list for the whole Worker;
+`test_acp_settings.py` fails if a setting exists in code and not there.
 
 `AGENT_CONNECT_ACP_MODE` is optional because the mode ids are the ACP Agent's to
 name. What matters is that the Session runs in the mode that *routes* permission
 requests to the Worker rather than one that suppresses them — which is what
 every bridge's default mode does, so the default is to leave it alone. The
 variable exists for an agent whose default is something else.
+
+**Startup check, and nothing more.** `preflight()` is what the Worker runs
+before it serves its first Task: it resolves the command, notices a missing
+bridge and turns it into install advice, and asks the ACP Agent whether it is
+logged in. It opens no Session and sends no prompt. Discovering at the first
+message in a room that the Local Agent wants a login is the failure this
+prevents — the person who asked gets an answer, not an authentication notice.
+
+**No interactive terminal, on any path.** ACP lets a Client offer terminal
+provisioning so the Agent can ask for a shell. The Worker does not implement it
+and does not advertise it (`CLIENT_CAPABILITIES` in `acp/core.py` is where that
+decision is stated, and `test_acp_no_terminal.py` asserts it holds on the wire).
+A remotely-triggered process does not get a terminal on the operator's machine.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import shlex
-from typing import AsyncIterator, List, Optional, Sequence
+import shutil
+from dataclasses import dataclass
+from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 from ..acp.core import AcpClient, AcpError, Update
 from ..acp.policy import WorkingDirectoryPolicy
@@ -69,6 +83,74 @@ OWNER = "owner"
 
 COMMAND_ENV = "AGENT_CONNECT_ACP_COMMAND"
 MODE_ENV = "AGENT_CONNECT_ACP_MODE"
+AGENT_ENV = "AGENT_CONNECT_ACP_AGENT"
+SKIP_AUTH_ENV = "AGENT_CONNECT_ACP_SKIP_AUTH_CHECK"
+
+#: The bridge that makes Claude Code an ACP Agent, pinned.
+#:
+#: Pinned rather than floated because this package renamed itself (it was
+#: `claude-code-acp`) and moved through many major versions inside six months.
+#: An unpinned fetch eventually pulls an incompatible release into an install
+#: that was working yesterday, and the operator has changed nothing.
+#:
+#: **This is the pinned version of record.** `install.sh` installs this exact
+#: spec and `install.test.sh` asserts the two agree, so raising it is a diff a
+#: reviewer sees rather than something that happens on its own.
+BRIDGE_PACKAGE = "@agentclientprotocol/claude-agent-acp"
+BRIDGE_VERSION = "0.64.2"
+BRIDGE_SPEC = f"{BRIDGE_PACKAGE}@{BRIDGE_VERSION}"
+
+
+@dataclass(frozen=True)
+class Preset:
+    """What running one well-known ACP Agent takes, as far as we know it.
+
+    `binary` is what an installed copy is called on PATH; `fallback` is the
+    command to run when it is not installed — pinned, never `@latest`.
+    `verified` says whether a real Turn was actually observed against it, which
+    is the difference between a preset an operator can trust and a preset that
+    is our best reading of someone's documentation.
+    """
+
+    binary: str
+    fallback: Tuple[str, ...]
+    install: str
+    login: str
+    verified: bool
+    args: Tuple[str, ...] = ()
+    note: str = ""
+
+    def command(self, env: Optional[dict] = None) -> List[str]:
+        """The command to run: the installed copy, else the pinned fetch."""
+        path = shutil.which(self.binary, path=(env or os.environ).get("PATH"))
+        return [path, *self.args] if path else list(self.fallback)
+
+
+#: Presets live here, in code, deliberately: a table an operator has to edit is
+#: not a preset. Anything absent is served by `AGENT_CONNECT_ACP_COMMAND`, which
+#: overrides this table entirely — see the module docstring.
+PRESETS: Dict[str, Preset] = {
+    "claude": Preset(
+        binary="claude-agent-acp",
+        fallback=("npx", "-y", BRIDGE_SPEC),
+        install=f"npm install -g {BRIDGE_SPEC}",
+        login="claude  (then /login), or `claude setup-token`",
+        verified=True,
+        note=f"Claude Code through the {BRIDGE_PACKAGE} bridge, pinned to "
+             f"{BRIDGE_VERSION} — the version a full Turn was run against.",
+    ),
+    "gemini": Preset(
+        binary="gemini",
+        fallback=("npx", "-y", "@google/gemini-cli", "--experimental-acp"),
+        install="npm install -g @google/gemini-cli",
+        login="gemini  (then /auth)",
+        verified=False,
+        args=("--experimental-acp",),
+        note="Gemini CLI speaks ACP itself, behind --experimental-acp. Read "
+             "from its documentation, NOT observed here: if it has moved, set "
+             f"{COMMAND_ENV} and the preset is out of your way.",
+    ),
+}
 
 REFUSAL = (
     "I only answer my owner over this connection.\n\n"
@@ -107,11 +189,112 @@ def command_from_env(env: Optional[dict] = None) -> List[str]:
     """
     raw = (env if env is not None else os.environ).get(COMMAND_ENV, "").strip()
     if not raw:
-        raise AcpError(
-            f"set {COMMAND_ENV} to the ACP Agent's command line, e.g.\n"
-            f'    export {COMMAND_ENV}="npx @agentclientprotocol/claude-agent-acp"'
-        )
+        raise AcpError(_unconfigured())
     return shlex.split(raw)
+
+
+def _unconfigured() -> str:
+    """What to say to someone who has selected the ACP Adapter and stopped."""
+    return (
+        f"the ACP Adapter needs to know which agent to run. Either name one:\n"
+        f"    export {AGENT_ENV}={'|'.join(sorted(PRESETS))}\n"
+        f"or give the command yourself, which overrides any preset:\n"
+        f'    export {COMMAND_ENV}="npx -y {BRIDGE_SPEC}"'
+    )
+
+
+def preset_for(name: str) -> Preset:
+    """The named preset, or a sentence naming the ones that exist."""
+    preset = PRESETS.get(name.strip().lower())
+    if preset is None:
+        raise AcpError(
+            f"{AGENT_ENV}={name!r} is not a preset agent-connect knows. "
+            f"Known: {', '.join(sorted(PRESETS))}.\n"
+            f"Any other ACP Agent runs through {COMMAND_ENV}, e.g.\n"
+            f'    export {COMMAND_ENV}="my-agent --acp"'
+        )
+    return preset
+
+
+def resolve_command(env: Optional[dict] = None) -> List[str]:
+    """The ACP Agent command, from an explicit command or from a preset.
+
+    Precedence is the point of this function: an explicit `AGENT_CONNECT_ACP_
+    COMMAND` wins over `AGENT_CONNECT_ACP_AGENT` unconditionally, even when the
+    preset exists and looks better informed. A preset table that could block a
+    working ACP Agent would be worse than no presets at all.
+    """
+    env = os.environ if env is None else env
+    if (env.get(COMMAND_ENV) or "").strip():
+        return command_from_env(env)
+    name = (env.get(AGENT_ENV) or "").strip()
+    if name:
+        return preset_for(name).command(env)
+    raise AcpError(_unconfigured())
+
+
+def install_advice(command: Sequence[str], env: Optional[dict] = None) -> str:
+    """What an operator whose bridge is missing has to install, by name.
+
+    A `FileNotFoundError` traceback names a path; this names a package and the
+    line that installs it. Which package is knowable when the command came from
+    a preset, and guessable-but-not-claimed when it did not.
+    """
+    env = os.environ if env is None else env
+    missing = command[0] if command else "(no command)"
+    name = (env.get(AGENT_ENV) or "").strip().lower()
+    preset = PRESETS.get(name) if not (env.get(COMMAND_ENV) or "").strip() else None
+    lines = [f"the ACP Agent's command is not installed: {missing!r}."]
+    if preset is not None:
+        lines.append(f"Install it with:\n    {preset.install}")
+    if missing in ("npx", "npm", "node"):
+        lines.append(
+            "That command comes from Node.js, which is not on this machine's "
+            "PATH — install Node.js 18+ first (https://nodejs.org)."
+        )
+    elif preset is None:
+        lines.append(
+            f"It came from {COMMAND_ENV}, so agent-connect cannot say what "
+            f"installs it. Check the command runs in your own shell, or name a "
+            f"preset instead: {AGENT_ENV}={'|'.join(sorted(PRESETS))}."
+        )
+    return "\n".join(lines)
+
+
+def login_advice(agent, env: Optional[dict] = None) -> str:
+    """What an operator whose Local Agent is not logged in has to run.
+
+    Built from the preset when there is one, and from what the ACP Agent itself
+    advertised when there is not — `authMethods` carries a human name and often
+    a description, which is the agent's own words for its login.
+    """
+    env = os.environ if env is None else env
+    name = (env.get(AGENT_ENV) or "").strip().lower()
+    preset = PRESETS.get(name)
+    lines = [
+        "the Local Agent is not logged in — it offered agent-connect a way to "
+        "authenticate, which means it has no credentials of its own yet."
+    ]
+    if preset is not None:
+        lines.append(f"Log in with:\n    {preset.login}")
+    offered = [
+        (m.get("name") or m.get("id") or "").strip()
+        for m in (agent.auth_methods or [])
+    ]
+    offered = [o for o in offered if o]
+    if offered:
+        lines.append("The agent offered: " + ", ".join(offered) + ".")
+    lines.append(
+        "agent-connect will not log in for you: it never opens an interactive "
+        "terminal on your machine on behalf of a room. Log in yourself in your "
+        "own shell, then start the Worker again.\n"
+        f"If this check is wrong for your agent, set {SKIP_AUTH_ENV}=1."
+    )
+    return "\n".join(lines)
+
+
+def _truthy(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def preamble(ctx: TurnContext) -> str:
@@ -193,15 +376,61 @@ class AcpAdapter:
         # Worker gets.
         self._command = list(command) if command else None
         self._mode = mode
+        #: What `preflight` learned about the ACP Agent, if it has run.
+        self.agent_description = None
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<AcpAdapter {self._command or 'from ' + COMMAND_ENV}>"
 
     def command(self) -> List[str]:
-        return list(self._command) if self._command else command_from_env()
+        return list(self._command) if self._command else resolve_command()
 
     def mode(self) -> str:
         return self._mode if self._mode is not None else os.environ.get(MODE_ENV, "").strip()
+
+    async def preflight(self) -> Optional[str]:
+        """Is this Worker able to serve? `None` if yes, else what to fix.
+
+        Run once at startup, before any Task exists. It resolves the command,
+        starts the ACP Agent, and asks it who it is — `initialize` and nothing
+        else. **No Session is opened and no prompt is sent**, so this costs no
+        tokens and cannot do work; and no terminal is offered, here or anywhere.
+
+        The authentication signal is `authMethods` on the initialize response:
+        an ACP Agent that is already authenticated has no method to offer, and
+        one that offers methods is telling the Client it needs to log in. That
+        reading is verified in one direction only (an authenticated bridge
+        answers with an empty list — observed); the unauthenticated direction is
+        exercised against the fake ACP Agent rather than a real logged-out one,
+        which is why `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK=1` exists. A startup
+        check that is wrong must be escapable without editing the package.
+        """
+        try:
+            command = self.command()
+        except AcpError as exc:
+            return str(exc)
+        if shutil.which(command[0]) is None:
+            return install_advice(command)
+        try:
+            async with AcpClient.spawn(command, cwd=os.getcwd()) as client:
+                agent = await client.initialize()
+        except AcpError as exc:
+            if "not found" in str(exc):
+                return install_advice(command)
+            return f"the ACP Agent would not start: {exc}"
+        except Exception as exc:  # noqa: BLE001 — a startup check reports, never raises
+            return f"the ACP Agent would not start: {exc}"
+        self.agent_description = agent
+        if agent.auth_methods and not _truthy(os.environ.get(SKIP_AUTH_ENV)):
+            return login_advice(agent)
+        return None
+
+    def describe(self) -> str:
+        """One line about what preflight found, for the Worker's startup log."""
+        agent = getattr(self, "agent_description", None)
+        if agent is None:
+            return "acp: no ACP Agent contacted yet"
+        return f"acp: {agent.name or 'an unnamed ACP Agent'} {agent.version}".strip()
 
     async def turn(self, ctx: TurnContext) -> AsyncIterator[TurnEvent]:
         """One Turn: refuse, or run it over ACP and report what happened."""
@@ -267,8 +496,11 @@ class AcpAdapter:
         except asyncio.CancelledError:
             raise
         except AcpError as exc:
+            # A missing bridge mid-Turn gets the same install advice the startup
+            # check gives, rather than a bare "command not found".
+            note = (install_advice(command) if "not found" in str(exc) else str(exc))
             yield Done(reason=FAILED, text="".join(chunks),
-                       note=f"agent-connect: {exc}")
+                       note=f"agent-connect: {note}")
             return
         except Exception as exc:  # noqa: BLE001 — one Turn's failure is its own
             yield Done(reason=FAILED, text="".join(chunks),

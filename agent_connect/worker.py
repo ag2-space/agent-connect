@@ -10,11 +10,11 @@ Session: a ten-minute request in one room no longer silences every other room,
 while two Tasks that share a Session still run one at a time, because only one
 Turn at a time may be open on a Session.
 
-Env:
-  AGENT_CONNECT_WORKSPACE   workspace dir (has tasks/ + results/). Default: ~/.agent-connect/workspace
-  AGENT_CONNECT_ADAPTER     adapter name, e.g. "codex" (required)
-  AGENT_CONNECT_REPO        working dir the agent operates in. Default: cwd
-  AGENT_CONNECT_POLL        seconds between scans (default 1.0)
+**Settings are documented in `README.md` § Settings, and only there.** This
+docstring used to carry a second list of the same environment variables, which
+went out of date the moment an Adapter grew one of its own; there is now one
+home for all of them and `test_acp_settings.py` fails if a setting exists in the
+package and not in that section.
 
 Task files are the AG2 Space convention: `tasks/task-<id>.txt` with `id:`,
 `task:` and `access_tier:` lines. Results go to `results/task-<id>.txt`.
@@ -211,11 +211,34 @@ async def serve(adapter, repo: str, results_dir: Path, tasks_dir: Path, poll: fl
         await asyncio.sleep(poll)
 
 
+def preflight(adapter) -> None:
+    """Stop here, not in a room, if the Adapter cannot serve.
+
+    An Adapter may offer `preflight()` — a coroutine returning `None` when it is
+    able to work, or the sentence the operator has to act on. The Worker refuses
+    to start on anything but `None`, because the alternative is that the first
+    person to ask a question in a room receives an installation or login notice
+    where they expected an answer, hours after the operator walked away.
+
+    Adapters without one start as they always did.
+    """
+    check = getattr(adapter, "preflight", None)
+    if check is None:
+        return
+    problem = asyncio.run(check())
+    if problem:
+        raise SystemExit(f"agent-connect: {problem}")
+    describe = getattr(adapter, "describe", None)
+    if describe is not None:
+        print(f"agent-connect: {describe()}")
+
+
 def main() -> None:
     adapter_name = os.environ.get("AGENT_CONNECT_ADAPTER")
     if not adapter_name:
         raise SystemExit("set AGENT_CONNECT_ADAPTER (e.g. codex)")
     adapter = get_adapter(adapter_name)
+    preflight(adapter)
     repo = os.environ.get("AGENT_CONNECT_REPO") or os.getcwd()
     poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
 
