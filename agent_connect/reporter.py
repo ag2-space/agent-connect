@@ -147,7 +147,10 @@ class TurnReporter:
             self.event_id = await self.ops.message(self._room, PLACEHOLDER)
         except RoomOpError:
             self.event_id = ""
-        self._last_edit = self._clock()
+        # `_last_edit` is deliberately left at its floor: the *first* piece of
+        # tool activity edits straight away, so a room learns what the agent is
+        # doing without waiting out a throttle window. The rate limit applies
+        # from there on.
 
     async def run(self, adapter, ctx: TurnContext) -> str:
         """One whole Turn: placeholder, live edits, answer, result body."""

@@ -214,9 +214,12 @@ check(answer == {"outcome": {"outcome": "selected", "optionId": "reject"}},
       "a request outside the working directory is rejected")
 check(answer["outcome"]["outcome"] == "selected",
       "and the rejection reaches the Local Agent, which observes it and carries on")
-check("refused 1 request" in out and "/etc/passwd" in out,
+check("refused" in out and "/etc/passwd" in out,
       "the person is told what was refused, so a blocked agent is not mistaken "
       "for a lazy one")
+check(out.count("/etc/passwd") == 1,
+      "and told once: the rejection is the TurnReporter's summary to write now, "
+      "not the Adapter's note as well")
 check("done" in out, "the answer the agent gave anyway is still there")
 
 bench = permission_bench(lambda repo: str(repo / ".." / "elsewhere.txt"))
