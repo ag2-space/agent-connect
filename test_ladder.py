@@ -28,6 +28,7 @@ from agent_connect.events import (
     FAILED,
     Done,
     MessageChunk,
+    Notice,
     PermissionAsked,
     Plan,
     Thinking,
@@ -325,6 +326,60 @@ check("refused" in answer.lower(), "in words that say it was refused")
 check("Read worker.py — inside" not in answer,
       "an allowed request is not noise in the summary")
 check(len(answer.splitlines()) <= 6, "the summary is compact — a reply, not a log")
+relay.stop()
+
+
+print("\n-- an announcement is its own message, never the placeholder --")
+
+ANNOUNCE = "🧠 agent-connect: starting a fresh conversation."
+relay, ops = relay_ops()
+adapter = Scripted(
+    Notice(text=ANNOUNCE),
+    ToolStarted(tool_id="a", title="Read worker.py", action="read"),
+    MessageChunk(text="here it is"),
+    Done(reason=COMPLETED, text="here it is"),
+)
+body = asyncio.run(TurnReporter(ops, LadderSettings(throttle=0.0), Clock()).run(adapter, ctx_for()))
+messages = relay.ops_of("message")
+check(len(messages) == 2, "the announcement is posted, so the room is two messages")
+check(messages[0]["body"] == PLACEHOLDER and messages[1]["body"] == ANNOUNCE,
+      "the placeholder first, then the announcement as its own message")
+check(messages[1]["room"] == "!room:ag2.space", "into the room it is about")
+check(all(ANNOUNCE not in o["body"] for o in relay.ops_of("edit")),
+      "and NOT by editing the placeholder — that message belongs to the answer")
+check(relay.ops[-1]["op"] == "edit" and "here it is" in relay.ops[-1]["body"],
+      "so the answer still lands where it was going")
+check(ANNOUNCE not in relay.ops[-1]["body"],
+      "and is not made to carry the announcement a second time")
+check(body.startswith(REPLIED), "the reply is still complete: one answer, delivered")
+relay.stop()
+
+# No room to announce in — the announcement must not simply vanish.
+body = asyncio.run(TurnReporter(None, LadderSettings()).run(
+    Scripted(Notice(text=ANNOUNCE), MessageChunk(text="here it is"),
+             Done(reason=COMPLETED, text="here it is")),
+    ctx_for()))
+check(ANNOUNCE in body and "here it is" in body,
+      "with no relay at all the announcement rides out on the result, ahead of the answer")
+check(body.index(ANNOUNCE) < body.index("here it is"),
+      "ahead of it, because it is context for reading the answer")
+
+# A relay that refuses the announcement is the same case, arrived at later.
+relay, ops = relay_ops(fail_from=1)
+body = asyncio.run(TurnReporter(ops, LadderSettings()).run(
+    Scripted(Notice(text=ANNOUNCE), MessageChunk(text="here it is"),
+             Done(reason=COMPLETED, text="here it is")),
+    ctx_for()))
+check(ANNOUNCE in body, "a relay that refuses the announcement does not lose it either")
+check(not body.startswith(REPLIED), "and the answer is not marked delivered when it was not")
+relay.stop()
+
+# An empty notice is not a blank message in someone's room.
+relay, ops = relay_ops()
+asyncio.run(TurnReporter(ops, LadderSettings()).run(
+    Scripted(Notice(text="   "), MessageChunk(text="hi"), Done(reason=COMPLETED, text="hi")),
+    ctx_for()))
+check(len(relay.ops_of("message")) == 1, "an empty notice posts nothing")
 relay.stop()
 
 
