@@ -398,12 +398,22 @@ class AcpAdapter:
 
         The authentication signal is `authMethods` on the initialize response:
         an ACP Agent that is already authenticated has no method to offer, and
-        one that offers methods is telling the Client it needs to log in. That
-        reading is verified in one direction only (an authenticated bridge
-        answers with an empty list — observed); the unauthenticated direction is
-        exercised against the fake ACP Agent rather than a real logged-out one,
-        which is why `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK=1` exists. A startup
-        check that is wrong must be escapable without editing the package.
+        one that offers methods is telling the Client it needs to log in.
+
+        **How far that is verified, exactly.** An authenticated
+        `@agentclientprotocol/claude-agent-acp` 0.64.2 answers with an empty
+        list — observed, twice. An ACP Agent that *does* advertise methods stops
+        the Worker with the login command — observed against the fake ACP Agent.
+        What could not be observed is a genuinely logged-out Claude bridge:
+        started with `$HOME` redirected at an empty directory it still answered
+        `authMethods: []`, so it is finding credentials somewhere else (a
+        keychain, most likely) and this check would not fire for it. Treat the
+        check as a real catch for ACP Agents that advertise auth methods and as
+        no catch at all for ones that do not — and note that the honest reading
+        is "the agent said it needs authenticating", which is what the message
+        says. `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK=1` exists for the other
+        direction: a startup check that is wrong must be escapable without
+        editing the package.
         """
         try:
             command = self.command()
