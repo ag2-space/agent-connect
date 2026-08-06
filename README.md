@@ -74,14 +74,88 @@ different from every other adapter's, and weaker. Read this before enabling it.*
   saying why. Shipping a read-only *tier* on top of a cooperative *policy* would
   be offering a limit that only looks like one.
 
+Name your agent and the worker knows what to run:
+
 ```bash
 export AGENT_CONNECT_ADAPTER=acp
-export AGENT_CONNECT_ACP_COMMAND="npx @agentclientprotocol/claude-agent-acp"
-export AGENT_CONNECT_REPO=/path/to/the/repo   # the session's working directory
+export AGENT_CONNECT_ACP_AGENT=claude          # a preset: claude | gemini
+export AGENT_CONNECT_REPO=/path/to/the/repo    # the session's working directory
 ```
+
+Or install it in one line, with the bridge pinned for you:
+
+```bash
+curl -fsSL <installer-url>/install.sh | sh -s -- --token <TOKEN> --adapter acp --acp-agent claude
+```
+
+**Presets never block you.** They live in code (`agent_connect/adapters/acp.py`)
+and cover the agents we know about. For anything else, give the command
+yourself — it overrides every preset:
+
+```bash
+export AGENT_CONNECT_ACP_COMMAND="my-agent --acp"
+```
+
+**Startup checks, not surprises in a room.** Before the worker serves its first
+task it starts the ACP agent, runs `initialize`, and stops with a sentence you
+can act on if the bridge is not installed (naming the package and the install
+line) or if the local agent is not logged in (naming the login command). It
+opens no session and sends no prompt, so the check costs no tokens. The worker
+**never opens an interactive terminal** on your machine — ACP has a way for an
+agent to ask for one and agent-connect does not implement it, so logging in is
+something you do yourself, in your own shell.
 
 Refused permission requests are reported back in the reply, so a blocked agent is
 distinguishable from a lazy one.
+
+**The bridge is pinned.** `@agentclientprotocol/claude-agent-acp@0.64.2` — the
+version a full turn was actually run against. It renamed itself once and moves
+through major versions fast, so the installer never fetches `@latest`. The pin
+lives in two places that `install.test.sh` forces to agree: `ACP_BRIDGE_SPEC` in
+`install.sh` and `BRIDGE_VERSION` in `agent_connect/adapters/acp.py`.
+
+## Settings
+
+**This table is the authoritative list of every setting agent-connect reads.**
+Not the module docstrings, not the installer's `--help` — here.
+`test_acp_settings.py` fails if a setting exists in the package and not in this
+table.
+
+| Setting | What it does | Default |
+| --- | --- | --- |
+| `AGENT_CONNECT_TOKEN` | your agent identity's relay token, from the Agent Portal | *(required)* |
+| `AGENT_CONNECT_ADAPTER` | which adapter runs the task: `codex`, `ollama`, `omnigent`, `cline`, `kilo`, `acp` | *(required)* |
+| `AGENT_CONNECT_REPO` | the working directory the agent operates in | cwd (installer: `~/agents`) |
+| `AGENT_CONNECT_WORKSPACE` | workspace dir holding `tasks/` + `results/` | `~/.agent-connect/workspace` |
+| `AGENT_CONNECT_POLL` | seconds between scans for new tasks | `1.0` |
+
+ACP adapter (see the section above):
+
+| Setting | What it does | Default |
+| --- | --- | --- |
+| `AGENT_CONNECT_ACP_AGENT` | preset naming the ACP agent to run: `claude`, `gemini` | *(unset)* |
+| `AGENT_CONNECT_ACP_COMMAND` | the ACP agent's command line, split as a shell would. **Overrides any preset** | *(unset)* |
+| `AGENT_CONNECT_ACP_MODE` | session mode id to request. Left alone by default: every bridge's own default already routes permission requests to the worker, and mode ids are the agent's to name | *(unset)* |
+| `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK` | `1` to start even when the agent advertises authentication methods. The escape hatch for an agent whose `authMethods` mean something else | *(unset)* |
+| `AGENT_CONNECT_ACP_BRIDGE_SPEC` | *(installer only)* override the pinned bridge npm spec | the pin above |
+
+Other adapters:
+
+| Setting | What it does | Default |
+| --- | --- | --- |
+| `AGENT_CONNECT_OLLAMA_MODEL` | model tag the `ollama` adapter asks for | `qwen2.5:3b` |
+| `OLLAMA_HOST` | the Ollama server the `ollama` adapter talks to | `http://localhost:11434` |
+| `AGENT_CONNECT_OMNIGENT_HARNESS` | default harness for the `omnigent` adapter (a `[harness]` prefix in the message wins) | `claude` |
+| `AGENT_CONNECT_OMNIGENT_MODEL` | model passed to the omnigent harness | *(harness default)* |
+| `AGENT_CONNECT_OMNIGENT_BIN` | path to the `omnigent` binary | `omnigent` |
+| `AGENT_CONNECT_CLINE_BIN` | path to the `cline` binary | `cline` |
+| `AGENT_CONNECT_CLINE_PROVIDER` | provider the `cline` adapter selects | *(cline default)* |
+| `AGENT_CONNECT_CLINE_MODEL` | model the `cline` adapter selects | *(cline default)* |
+| `AGENT_CONNECT_KILO_BIN` | path to the `kilo` binary | `kilo` |
+
+The relay client (`ag2-sparrow`) reads its own `AGENT_CONNECT_TASK_DIR`,
+`AGENT_CONNECT_RESULT_DIR`, `AGENT_CONNECT_STATE_DIR`, `REMOTE_TASK_TOKEN` and
+`REMOTE_TASK_URL`; the installer wires those into `launch.sh` for you.
 
 ## Adapters
 

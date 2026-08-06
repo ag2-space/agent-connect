@@ -52,6 +52,9 @@ An `<action>` is one of:
     {"type": "permission",                        ask the Client for permission
         "toolCall": {...}, "options": [{"optionId": "allow", "name": "Allow",
                                         "kind": "allow_once"}, ...]}
+    {"type": "request",   "method": "terminal/create", "params": {...}}
+                                                  ask the Client for anything at
+                                                  all, and record its answer
     {"type": "sleep",     "seconds": 2.0}         delay past a deadline
     {"type": "exit",      "code": 1}              die mid-Turn
 
@@ -72,6 +75,8 @@ so a fake that was told to die mid-Turn still reports what it saw. Shape:
       "permissions": [ {"sessionId": ..., "options": [...],
                         "answer": <the Client's RequestPermissionResponse>} ],
       "cancelled":   [ <sessionId>, ... ],
+      "requests":    [ {"method": ..., "answer": <result or error>,
+                        "errored": true|false} ],
       "methods":     [ <every method name received, in order> ]
     }
 
@@ -110,6 +115,7 @@ class FakeAcpAgent:
             "prompts": [],
             "permissions": [],
             "cancelled": [],
+            "requests": [],
             "methods": [],
         }
         self._turns = list(script.get("turns") or [])
@@ -343,6 +349,24 @@ class FakeAcpAgent:
             await self._update(session_id, action.get("update") or {})
         elif kind == "permission":
             await self._ask_permission(session_id, action)
+        elif kind == "request":
+            # Any request at all, back at the Client, with whatever the Client
+            # answered recorded verbatim. This is how a test asks the question
+            # "what happens if the Agent asks for something we do not offer?" —
+            # terminal provisioning, for instance, which agent-connect
+            # deliberately does not implement.
+            response = await self._request(
+                action.get("method", ""),
+                {"sessionId": session_id, **(action.get("params") or {})},
+            )
+            self.report["requests"].append(
+                {
+                    "method": action.get("method", ""),
+                    "answer": response.get("result", response.get("error")),
+                    "errored": "error" in response,
+                }
+            )
+            self._flush_report()
         elif kind == "sleep":
             await asyncio.sleep(float(action.get("seconds", 1)))
         elif kind == "exit":

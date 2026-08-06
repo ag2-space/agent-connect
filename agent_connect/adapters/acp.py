@@ -219,10 +219,10 @@ def preset_for(name: str) -> Preset:
 def resolve_command(env: Optional[dict] = None) -> List[str]:
     """The ACP Agent command, from an explicit command or from a preset.
 
-    Precedence is the point of this function: an explicit `AGENT_CONNECT_ACP_
-    COMMAND` wins over `AGENT_CONNECT_ACP_AGENT` unconditionally, even when the
-    preset exists and looks better informed. A preset table that could block a
-    working ACP Agent would be worse than no presets at all.
+    Precedence is the point of this function: an explicit command wins over a
+    named preset unconditionally, even when the preset exists and looks better
+    informed. A preset table that could block a working ACP Agent would be
+    worse than no presets at all.
     """
     env = os.environ if env is None else env
     if (env.get(COMMAND_ENV) or "").strip():
