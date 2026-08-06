@@ -15,8 +15,11 @@ from .core import (  # noqa: F401
     Update,
     reject_all,
 )
+from .policy import Decision, WorkingDirectoryPolicy  # noqa: F401
 
 __all__ = [
+    "Decision",
+    "WorkingDirectoryPolicy",
     "AcpAgentGone",
     "AcpClient",
     "AcpError",
