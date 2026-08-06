@@ -525,14 +525,14 @@ class AcpAdapter:
 
         # Per-Turn, not per-Adapter: two rooms run their Turns concurrently and
         # one of them resuming must not silence the other's live progress.
-        replaying = _Suppression()
+        muted = _Suppression()
 
         def on_update(update: Update) -> None:
             # Replayed history arrives here exactly like live progress — the
             # core cannot tell them apart and says so. Dropping it before it
             # becomes an event is what keeps an old transcript out of the room
             # *and* out of this Turn's answer.
-            if replaying.on:
+            if muted.on:
                 return
             for event in events_for(update):
                 queue.put_nowait(event)
@@ -571,36 +571,41 @@ class AcpAdapter:
                 command, cwd=cwd, on_update=on_update, permission_handler=on_permission
             ) as client:
                 await client.initialize()
-                session_id, turns = "", 0
-                if record is not None:
-                    # The whole of the resumption hazard is these four lines:
-                    # everything the agent replays is suppressed, and the flag
-                    # is cleared in a `finally` so a refusal cannot leave this
-                    # Turn's own progress muted.
-                    replaying.on = True
-                    try:
-                        await client.load_session(record.session_id, cwd=cwd)
-                        session_id, turns = record.session_id, record.turns
-                    except SessionResumeRefused as exc:
-                        queue.put_nowait(
-                            Notice(text=RESET.format(
-                                why=WHY_REFUSED.format(detail=exc)))
-                        )
-                    finally:
-                        replaying.on = False
-                if not session_id:
-                    session_id = await client.new_session(cwd=cwd)
-                    turns = 0
-                mode = self.mode()
-                if mode:
-                    await client.set_session_mode(session_id, mode)
-                if store is not None:
-                    # Remembered *before* the prompt, not after: a Turn that
-                    # crashes or is cancelled still happened, and its history is
-                    # in the Local Agent's Session whatever this Worker does
-                    # next. Counting it now is also what makes the Turn budget
-                    # bound the tokens rather than the successes.
-                    store.remember(key, session_id, cwd, turns + 1)
+                # Muted from before the Session is touched until the prompt is
+                # sent. Not merely "during `load_session`": the boundary that
+                # actually holds is the prompt, because *nothing* arriving
+                # before it is progress on this Turn — it is history, by
+                # definition — and drawing the line there leaves no window in
+                # which a late replay notification could be mistaken for live
+                # work. Cleared in a `finally`, so a Session that refused to
+                # resume cannot leave this Turn's own progress silenced.
+                muted.on = True
+                try:
+                    session_id, turns = "", 0
+                    if record is not None:
+                        try:
+                            await client.load_session(record.session_id, cwd=cwd)
+                            session_id, turns = record.session_id, record.turns
+                        except SessionResumeRefused as exc:
+                            queue.put_nowait(
+                                Notice(text=RESET.format(
+                                    why=WHY_REFUSED.format(detail=exc)))
+                            )
+                    if not session_id:
+                        session_id = await client.new_session(cwd=cwd)
+                        turns = 0
+                    mode = self.mode()
+                    if mode:
+                        await client.set_session_mode(session_id, mode)
+                    if store is not None:
+                        # Remembered *before* the prompt, not after: a Turn that
+                        # crashes or is cancelled still happened, and its history
+                        # is in the Local Agent's Session whatever this Worker
+                        # does next. Counting it now is also what makes the Turn
+                        # budget bound the tokens rather than the successes.
+                        store.remember(key, session_id, cwd, turns + 1)
+                finally:
+                    muted.on = False
                 return await client.prompt(session_id, preamble(ctx) + ctx.prompt)
 
         work = asyncio.ensure_future(run())
@@ -636,7 +641,7 @@ class AcpAdapter:
 
 
 class _Suppression:
-    """Whether replayed history is being consumed right now.
+    """Whether updates are being dropped rather than turned into events.
 
     A one-field object rather than a `nonlocal` because the flag is read from a
     callback the core owns and written from the coroutine driving the load; a
