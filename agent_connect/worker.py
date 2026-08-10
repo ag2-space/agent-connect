@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 
 from .adapters import get as get_adapter
+from .attachments import parse as parse_attachments
 from .events import TurnContext
 from .pending import queue_for
 from .reporter import LadderSettings, TurnReporter
@@ -107,6 +108,12 @@ def turn_context(fields: dict, task_id: str, repo: str) -> TurnContext:
     establish — never from anything else in the file, all of which the sender
     can write. The room identifier is the relay's `channel_id` (a Matrix room
     id); `room_name` is the human label and is carried for display only.
+
+    Attachments come from the `attachments:` **header** and from nowhere else.
+    The relay also dual-writes a `[File attached: <path>]` line into the body,
+    and that line is left exactly where it is: it is part of what the person
+    sees themselves as having sent, and a path read out of a body would be a
+    path the sender chose. See `agent_connect.attachments`.
     """
     tier = fields.get("access_tier", "other")
     return TurnContext(
@@ -120,6 +127,7 @@ def turn_context(fields: dict, task_id: str, repo: str) -> TurnContext:
         source_message_id=fields.get("source_message_id", ""),
         sandbox=tier_to_sandbox(tier),
         cwd=repo,
+        attachments=parse_attachments(fields.get("attachments", "")),
     )
 
 

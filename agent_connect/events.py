@@ -40,6 +40,31 @@ NORMAL_REASONS = frozenset({COMPLETED})
 
 
 @dataclass(frozen=True)
+class Attachment:
+    """One file that arrived with a room message, already on this machine.
+
+    The relay client downloads whatever someone attached *before* the Task file
+    is written, so `locator` is a local path and nothing on this side of the
+    boundary fetches anything over the network. Everything else here is what the
+    relay was *told* about the file by the platform it came from: `mime` and
+    `filename` are labels, not facts, and neither decides what bytes are read.
+
+    Deliberately metadata-only — no bytes and no file handle. An Adapter that
+    cannot accept attachments at all (every shimmed one) has to be able to *see*
+    that a Task carried some, so it can say so; only an Adapter that is going to
+    pass them opens them, and `agent_connect.attachments` is the one place that
+    happens.
+    """
+
+    locator: str
+    mime: str = ""
+    filename: str = ""
+    size: int = 0
+    sha256: str = ""
+    id: str = ""
+
+
+@dataclass(frozen=True)
 class TurnContext:
     """Everything an Adapter is told about one Turn.
 
@@ -55,6 +80,11 @@ class TurnContext:
     Adapters prepend the sandbox preamble because their confinement is what it
     describes, and an Adapter with different confinement says something
     different.
+
+    `attachments` are the files that came with the message. They are carried
+    *beside* `prompt` and never folded into it: an attachment becomes content of
+    the prompt or it is reported as unreachable, and neither is allowed to
+    rewrite a word of what the person typed.
     """
 
     prompt: str
@@ -67,6 +97,7 @@ class TurnContext:
     source_message_id: str = ""
     sandbox: str = "read-only"
     cwd: str = ""
+    attachments: Tuple[Attachment, ...] = ()
 
     @property
     def session_key(self) -> Tuple[str, str]:
