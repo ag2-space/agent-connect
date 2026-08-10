@@ -242,7 +242,7 @@ class Outbox:
         if not named:
             return Delivery(text=body)
 
-        area = self._area(ctx)
+        cwd, area = self._area(ctx)
         markers: List[str] = []
         sent: List[str] = []
         refused: List[str] = []
@@ -253,7 +253,7 @@ class Outbox:
                 refused.append(NOT_SENT_LINE.format(
                     name=shown, why=TOO_MANY.format(limit=MAX_FILES)))
                 continue
-            handle, real, problem = self._open(raw, area)
+            handle, real, problem = self._open(raw, cwd, area)
             if problem:
                 refused.append(NOT_SENT_LINE.format(name=shown, why=problem))
                 continue
@@ -275,13 +275,20 @@ class Outbox:
 
     # -- internals ----------------------------------------------------------
 
-    def _area(self, ctx) -> Tuple[Path, ...]:
-        """The directories a file may be sent from, resolved once."""
+    def _area(self, ctx):
+        """Where a file may be sent from: the Turn's working directory, and the
+        outgoing directory itself for a file already written there.
+
+        Both resolved once, and the working directory returned on its own as
+        well, because a relative path is read against *it* and against nothing
+        else — resolving one against the outgoing directory would be answering a
+        different question than the agent asked.
+        """
         cwd = _resolved(getattr(ctx, "cwd", "") or "")
         here = _resolved(self.dir)
-        return tuple(p for p in (cwd, here) if p is not None)
+        return cwd, tuple(p for p in (cwd, here) if p is not None)
 
-    def _open(self, raw: str, area: Tuple[Path, ...]):
+    def _open(self, raw: str, cwd: Optional[Path], area: Tuple[Path, ...]):
         """Open the named file if it may be sent. Returns `(handle, path, why not)`.
 
         The caller closes the handle. Everything is decided on the descriptor
@@ -291,11 +298,14 @@ class Outbox:
             return None, None, "there is no path in the marker"
         if "\x00" in raw:
             return None, None, "its path is not a path"
-        if not area:
+        if cwd is None:
+            # Fail closed. Without the Turn's working directory there is no
+            # permitted area to judge against, and "send it anyway" is the one
+            # answer this module must never give.
             return None, None, NO_AREA
         path = Path(os.path.expanduser(raw))
         if not path.is_absolute():
-            path = area[0] / path
+            path = cwd / path
         try:
             real = path.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
