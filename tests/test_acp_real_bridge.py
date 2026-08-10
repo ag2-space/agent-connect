@@ -8,7 +8,7 @@ core would have had to hand-roll the JSON-RPC subset instead.
 It is **opt-in**, because unlike every other test in this repository it needs a
 real Local Agent, real credentials, real network, and real tokens:
 
-    ACP_REAL_BRIDGE=1 python3 test_acp_real_bridge.py
+    ACP_REAL_BRIDGE=1 python3 tests/test_acp_real_bridge.py
 
 Without that, it prints why it did nothing and exits 0, so it is safe to leave
 in a suite that runs on machines with no bridge installed.
@@ -19,6 +19,8 @@ The bridge command defaults to `claude-agent-acp` (npm:
     AGENT_CONNECT_ACP_COMMAND="npx -y @agentclientprotocol/claude-agent-acp@0.64.2"
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
 import os

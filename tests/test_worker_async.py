@@ -4,9 +4,11 @@ Everything here is asserted at the Worker's handle-one-Task seam or at the
 Adapter boundary: what the Adapter was handed, what events crossed, and what
 landed in results/. Nothing asserts on which internal object called which.
 
-Run: python3 test_worker_async.py
+Run: python3 tests/test_worker_async.py
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import ast
 import asyncio
@@ -213,7 +215,7 @@ def imported_modules(path: Path):
     return names
 
 
-root = Path(__file__).resolve().parent / "agent_connect"
+root = _bootstrap.ROOT / "agent_connect"
 vocab_imports = imported_modules(root / "events.py")
 check("acp" not in vocab_imports, "the vocabulary module does not import the protocol library")
 check(

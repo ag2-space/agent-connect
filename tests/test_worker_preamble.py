@@ -1,7 +1,8 @@
 """Tests for the sandbox preamble + its wiring through process_one.
 
-Run: python3 test_worker_preamble.py
+Run: python3 tests/test_worker_preamble.py
 """
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 import asyncio
 import tempfile
 from pathlib import Path

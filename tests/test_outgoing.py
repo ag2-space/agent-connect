@@ -16,9 +16,11 @@ Two outside-world surfaces, and nothing else is asserted on:
 The Adapters are stubs emitting the event vocabulary, so no ACP Agent, no
 network and no credentials are involved, and this runs under bare `python3`.
 
-Run: python3 test_outgoing.py
+Run: python3 tests/test_outgoing.py
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
 import json

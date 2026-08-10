@@ -21,9 +21,11 @@ the property was lost:
 
 Requires the `agent-client-protocol` package (see `docs/adr/0001`).
 
-Run: .venv/bin/python test_acp_no_terminal.py
+Run: .venv/bin/python tests/test_acp_no_terminal.py
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
 import json
@@ -41,10 +43,11 @@ except ImportError as exc:  # pragma: no cover — an environment problem, not a
         "This test has a dependency (see docs/adr/0001). Run it from an\n"
         "environment that has it:\n"
         "    python3 -m venv .venv && .venv/bin/pip install -e .\n"
-        "    .venv/bin/python test_acp_no_terminal.py"
+        "    .venv/bin/python tests/test_acp_no_terminal.py"
     )
 
 HERE = Path(__file__).parent
+ROOT = _bootstrap.ROOT
 FAKE = str(HERE / "fake_acp_agent.py")
 
 #: The protocol's terminal surface, in both spellings a handler could take.
@@ -127,7 +130,7 @@ def executable_code(path: Path) -> str:
     return " ".join(kept)
 
 
-sources = sorted(HERE.glob("agent_connect/**/*.py"))
+sources = sorted(ROOT.glob("agent_connect/**/*.py"))
 check(len(sources) > 5, f"the source scan found the package ({len(sources)} modules)")
 code = {p.name: executable_code(p) for p in sources}
 for method in TERMINAL_METHODS:

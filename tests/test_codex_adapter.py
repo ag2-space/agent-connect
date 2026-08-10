@@ -1,7 +1,8 @@
 """Tests for the codex adapter's command construction.
 
-Run: python3 test_codex_adapter.py
+Run: python3 tests/test_codex_adapter.py
 """
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 from agent_connect.adapters.codex import build_cmd
 
 fails = 0

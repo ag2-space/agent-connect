@@ -5,8 +5,9 @@ as the LAST header, after `task:`; the old parser stopped at `task:` and
 swallowed everything after it into the body, so every task defaulted to
 "other" → codex always ran `--sandbox read-only` even for the agent's owner.
 
-Run: python3 test_worker_parse.py
+Run: python3 tests/test_worker_parse.py
 """
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 from agent_connect.worker import parse_task
 
 SPARROW_LAYOUT = """id: task-123

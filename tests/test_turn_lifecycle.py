@@ -15,9 +15,11 @@ The Adapters are stubs emitting the event vocabulary, so this runs under bare
 `python3`. Cancellation through the ACP protocol — the other half of this
 ticket — is in `test_acp_lifecycle.py`, which needs a real ACP Agent to cancel.
 
-Run: python3 test_turn_lifecycle.py
+Run: python3 tests/test_turn_lifecycle.py
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
 import json

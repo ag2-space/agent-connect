@@ -9,9 +9,11 @@ against a real file, a real symlink, a real FIFO and a real directory.
 
 No dependencies: this is the Worker's own vocabulary, not ACP.
 
-Run: python3 test_attachments.py
+Run: python3 tests/test_attachments.py
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
 import json

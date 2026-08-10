@@ -265,7 +265,7 @@ first copy.
 
 **This table is the authoritative list of every setting agent-connect reads.**
 Not the module docstrings, not the installer's `--help` — here.
-`test_acp_settings.py` fails if a setting exists in the package and not in this
+`tests/test_acp_settings.py` fails if a setting exists in the package and not in this
 table.
 
 | Setting | What it does | Default |
@@ -363,6 +363,32 @@ The framework is agent-agnostic; the transport + onboarding + access-tiers are s
    ./run-agent.sh
    ```
 3. In an allowed room: `!codex summarize this repo` → your Codex replies.
+
+## Tests
+
+They live in `tests/` and each one is a plain script — no runner, no test
+framework, and every assertion printed as it passes. Run one by naming it:
+
+```bash
+python3 tests/test_worker_parse.py          # no dependencies
+.venv/bin/python tests/test_acp_core.py     # the ACP tests need the package
+bash install.test.sh                        # the installer
+```
+
+The split is the point: everything that can run under a bare interpreter still
+does, so a broken environment cannot quietly take the whole suite with it. The
+ACP tests are the ones that talk to `agent-client-protocol` (see
+`docs/adr/0001`); run under bare `python3` they exit with the venv command
+rather than a traceback:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e .
+```
+
+`tests/fake_acp_agent.py` is not a test — it is the fake ACP Agent the ACP tests
+drive: a real child process speaking real JSON-RPC over stdio, scripted per
+test. `tests/test_acp_real_bridge.py` is opt-in (`ACP_REAL_BRIDGE=1`) because it
+spends real tokens against a real bridge.
 
 ## Status
 

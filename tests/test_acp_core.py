@@ -6,9 +6,11 @@ Nothing here is mocked: every assertion is about what actually crossed a pipe.
 
 Requires the `agent-client-protocol` package (see `docs/adr/0001`).
 
-Run: python3 test_acp_core.py
+Run: python3 tests/test_acp_core.py
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import ast
 import asyncio
@@ -34,7 +36,7 @@ except ImportError as exc:  # pragma: no cover — an environment problem, not a
         "This is the first test here with a dependency (see docs/adr/0001). Run it\n"
         "from an environment that has it:\n"
         "    python3 -m venv .venv && .venv/bin/pip install -e .\n"
-        "    .venv/bin/python test_acp_core.py"
+        "    .venv/bin/python tests/test_acp_core.py"
     )
 
 FAKE = str(Path(__file__).parent / "fake_acp_agent.py")
@@ -374,7 +376,7 @@ check(exc is not None and "not found" in str(exc),
 
 # --- the core knows nothing about Tasks, rooms or the relay -----------------
 
-core_path = Path(__file__).parent / "agent_connect" / "acp" / "core.py"
+core_path = _bootstrap.ROOT / "agent_connect" / "acp" / "core.py"
 core_source = core_path.read_text()
 
 imported = set()

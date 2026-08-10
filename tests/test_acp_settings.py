@@ -10,14 +10,16 @@ in the package source, and require each to appear in the README section headed
 `## Settings`. A name in the README that no longer exists in code is *not* a
 failure here; a removed setting still deserves a line saying it went away.
 
-Run: python3 test_acp_settings.py   (no dependencies — pure text)
+Run: python3 tests/test_acp_settings.py   (no dependencies — pure text)
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import re
 from pathlib import Path
 
-HERE = Path(__file__).parent
+HERE = _bootstrap.ROOT
 fails = 0
 
 

@@ -12,9 +12,11 @@ on the way would fail it.
 
 Requires the `agent-client-protocol` package (see `docs/adr/0001`).
 
-Run: .venv/bin/python test_acp_attachments.py
+Run: .venv/bin/python tests/test_acp_attachments.py
 """
 from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
 import base64
@@ -35,7 +37,7 @@ except ImportError as exc:  # pragma: no cover — an environment problem, not a
         "This test has a dependency (see docs/adr/0001). Run it from an\n"
         "environment that has it:\n"
         "    python3 -m venv .venv && .venv/bin/pip install -e .\n"
-        "    .venv/bin/python test_acp_attachments.py"
+        "    .venv/bin/python tests/test_acp_attachments.py"
     )
 
 FAKE = str(Path(__file__).parent / "fake_acp_agent.py")

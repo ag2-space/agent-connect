@@ -31,9 +31,10 @@ import asyncio
 import os
 import warnings
 from collections import deque
+from collections.abc import Awaitable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 import acp
 
