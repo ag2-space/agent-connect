@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .adapters import get as get_adapter
 from .events import TurnContext
+from .pending import queue_for
 from .reporter import LadderSettings, TurnReporter
 from .roomops import room_ops_from_env
 from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
@@ -122,16 +123,21 @@ def turn_context(fields: dict, task_id: str, repo: str) -> TurnContext:
     )
 
 
-async def run_turn(adapter, ctx: TurnContext, ops=None, settings=None) -> str:
+async def run_turn(adapter, ctx: TurnContext, ops=None, settings=None, reporter=None) -> str:
     """Drive one Turn up the Ladder and return the body to write as the result.
 
     The whole event stream goes to the `TurnReporter`, which owns everything the
     room sees: the placeholder, the throttled progress edits, the final edit and
-    the terminal marker. With no `ops` — a Worker holding no relay token, or a
-    test — nothing is posted and the answer travels as the result body, exactly
-    as it did before the Ladder existed.
+    the terminal marker — or, for a Turn that produced nothing, the structured
+    rejection that leaves the failure notice to the broker. With no `ops` — a
+    Worker holding no relay token, or a test — nothing is posted and the answer
+    travels as the result body, exactly as it did before the Ladder existed.
+
+    `reporter` is for a caller that already had to speak to the room before the
+    Turn began — announcing a queued message, which happens before the
+    placeholder exists. Everyone else lets one be built here.
     """
-    return await TurnReporter(ops, settings).run(adapter, ctx)
+    return await (reporter or TurnReporter(ops, settings)).run(adapter, ctx)
 
 
 class _NoLock:
@@ -155,9 +161,12 @@ async def process_one(
 ) -> None:
     """Handle one Task file: parse it, run a Turn, write the result once.
 
-    `sessions` — when given — maps a Session key to the lock that keeps one
-    Turn at a time open on it. Tasks with different keys never contend, which
-    is what makes two rooms concurrent.
+    `sessions` — when given — maps a Session key to the `SessionQueue` that
+    keeps one Turn at a time open on it. Tasks with different keys never
+    contend, which is what makes two rooms concurrent; Tasks with the same key
+    queue, and **the person is told they are queued** rather than left
+    wondering whether their message arrived. Without a registry there is no
+    serialisation at all, which is what a single-Task caller wants.
 
     `ops` is the relay to climb the Ladder on, shared across Tasks; `settings`
     is how much of it to climb. Both may be `None`, and then the result body is
@@ -172,12 +181,20 @@ async def process_one(
     if not ctx.prompt:
         result_path.write_text("[no-send] empty task\n")
         return
+    reporter = TurnReporter(ops, settings)
+
+    async def announce(turn) -> None:
+        # Said before the wait rather than after it, and as its own message:
+        # the placeholder for this Task does not exist yet, and editing
+        # someone else's would take their answer away.
+        await reporter.queued(ctx, turn.ahead)
+
     if sessions is None:
-        lock = _NoLock()
+        held = _NoLock()
     else:
-        lock = sessions.setdefault(ctx.session_key, asyncio.Lock())
-    async with lock:
-        output = await run_turn(adapter, ctx, ops, settings)
+        held = queue_for(sessions, ctx.session_key).arrive(ctx, on_wait=announce)
+    async with held:
+        output = await run_turn(adapter, ctx, ops, settings, reporter)
     result_path.write_text(output + "\n")
 
 

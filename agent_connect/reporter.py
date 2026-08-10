@@ -30,10 +30,20 @@ consumer *may* read it. The room is not that consumer, and there is a test that
 says so.
 
 A `Notice` breaks the one-message shape on purpose, and only it does. An
-announcement — "the context was reset" — is a fact about the run and not part of
-the answer, so it is posted as **its own message** and the placeholder is left
-alone. Editing the placeholder into an announcement would replace the answer
-with a remark about it.
+announcement — "the context was reset", "your message is queued" — is a fact
+about the run and not part of the answer, so it is posted as **its own message**
+and the placeholder is left alone. Editing the placeholder into an announcement
+would replace the answer with a remark about it.
+
+**Endings tell the truth, and there are two kinds of them.** A Turn that
+produced *something* and stopped short — a timeout that nearly finished, a token
+limit — keeps what it produced and carries an explicit line saying it was
+interrupted; silence that reads like a finished answer is the failure being
+prevented. A Turn that produced *nothing* — a refusal, an empty timeout, a dead
+bridge — is a **structured rejection**: the result body is marked `[no-send]`,
+the placeholder is left exactly as it is, and the Worker writes no failure
+message of its own. The broker owns that message, and two apologies for one
+failure is the thing the spec forbids.
 
 The reporter is the only thing that knows this contract. It works the same for
 the ACP Adapter and for a shimmed one, which simply emits fewer events: a
@@ -48,7 +58,13 @@ from dataclasses import dataclass
 from typing import List, Mapping, Optional
 
 from .events import (
+    CANCELLED,
     COMPLETED,
+    FAILED,
+    NORMAL_REASONS,
+    REFUSED,
+    TIMEOUT,
+    TOKEN_LIMIT,
     Done,
     MessageChunk,
     Notice,
@@ -72,6 +88,35 @@ REPLIED = "[REPLIED]"
 #: answer follows as its own message, through the result path, which the relay
 #: client already knows how to chunk.
 POINTER = "✅ Done — the answer was too long for this message, so it follows below."
+
+#: What a person is told when their message arrives while the Session is busy.
+#: Only one Turn at a time may be open on a Session, so the message waits — and
+#: a wait nobody was told about is indistinguishable from a message that was
+#: dropped.
+QUEUED = ("📥 agent-connect: I am still working on an earlier message in this "
+          "room, so this one is queued and will be answered next{others}.")
+
+#: The structured rejection. `[no-send]` is one of the three skip markers the
+#: relay client's `parse_markers()` recognises at the start of a result body:
+#: the result is archived and **nothing at all is delivered**, which is exactly
+#: what "the broker owns the failure notice" needs. It is not a marker invented
+#: here — `worker.py` has written `[no-send] empty task` since long before the
+#: Ladder existed, and this is the same shape with a reason attached.
+NO_SEND = "[no-send]"
+
+#: The line that says a Turn ended somewhere other than a finished answer, for
+#: each reason that is not completion. Used only when the Adapter gave no note
+#: of its own; an Adapter that explained itself is not corrected. What must
+#: never happen is neither: a Turn that stopped short and reads as if it had
+#: not is the failure this table exists to prevent.
+STOP_LINES = {
+    TIMEOUT: "⏱ agent-connect: the turn ran past its deadline and was interrupted.",
+    CANCELLED: "🛑 agent-connect: the turn was cancelled before it finished.",
+    REFUSED: "🚫 agent-connect: this request was refused.",
+    TOKEN_LIMIT: "✂️ agent-connect: the agent reached its token limit, so this "
+                 "answer stops short of the whole of it.",
+    FAILED: "⚠️ agent-connect: the turn did not finish.",
+}
 
 DEFAULT_THROTTLE = 3.0
 DEFAULT_CEILING = 4000
@@ -145,6 +190,9 @@ class TurnReporter:
         self.progress_edits = 0
         #: Number of `Notice` events posted as their own message.
         self.notices_posted = 0
+        #: True when the Turn ended as a structured rejection — observable so a
+        #: caller can tell "nothing was delivered" from "nothing happened".
+        self.rejected = False
 
     # -- the Ladder ---------------------------------------------------------
 
@@ -162,6 +210,22 @@ class TurnReporter:
         # doing without waiting out a throttle window. The rate limit applies
         # from there on.
 
+    async def queued(self, ctx: TurnContext, ahead: int = 1) -> bool:
+        """Say that this Task is waiting for the Session, before it starts.
+
+        Posted *before* `start()`, and therefore before the placeholder, so the
+        room reads it in the order it happened: "this one is queued" now, "⏳ On
+        it..." when the Session is free. A person who sends a second message and
+        hears nothing cannot tell it from a message that was dropped, which is
+        the whole reason this exists.
+
+        It is deliberately not kept: an announcement that is only true while the
+        Turn is waiting must not resurface stapled to the answer.
+        """
+        self._room = ctx.room
+        others = "" if ahead <= 1 else f" ({ahead} messages are ahead of it)"
+        return await self.notice(QUEUED.format(others=others), keep=False)
+
     async def run(self, adapter, ctx: TurnContext) -> str:
         """One whole Turn: placeholder, live edits, answer, result body."""
         await self.start(ctx)
@@ -174,7 +238,11 @@ class TurnReporter:
                 done = event
             else:
                 await self.on_event(event)
-        return await self.finish(final_text(done, chunks), done.note if done else "")
+        return await self.finish(
+            final_text(done, chunks),
+            done.note if done else "",
+            done.reason if done else COMPLETED,
+        )
 
     async def on_event(self, event) -> None:
         """Note what the agent is doing, and maybe say so in the room.
@@ -197,19 +265,24 @@ class TurnReporter:
                 f"{event.title} — {event.reason}" if event.reason else event.title
             )
         elif isinstance(event, Notice):
-            await self._notice(event.text)
+            await self.notice(event.text)
 
-    async def finish(self, answer: str, note: str = "") -> str:
+    async def finish(self, answer: str, note: str = "", reason: str = COMPLETED) -> str:
         """Edit the placeholder into the answer; return what to write as result.
 
-        Two endings, and which one happened is visible in the return value. The
-        answer fits an edit: the placeholder becomes it, and the result body is
-        the terminal marker, so the delivery path posts nothing. The answer does
-        not fit: the placeholder becomes a short pointer and the answer itself
-        is the result body, which the relay client chunks as it always has.
+        Three endings, and which one happened is visible in the return value.
+        The answer fits an edit: the placeholder becomes it, and the result body
+        is the terminal marker, so the delivery path posts nothing. The answer
+        does not fit: the placeholder becomes a short pointer and the answer
+        itself is the result body, which the relay client chunks as it always
+        has. There is no answer at all: nothing is edited and the result is a
+        structured rejection — see `reject`.
         """
+        ending = _ending(reason, note)
+        if not answer.strip():
+            return self.reject(reason, ending)
         body = _assemble(
-            answer, note, self._steps, self._failed, self._refused, self._unposted
+            answer, ending, self._steps, self._failed, self._refused, self._unposted
         )
         if not self.event_id:
             return body
@@ -221,9 +294,41 @@ class TurnReporter:
             return body
         return f"{REPLIED}\n\n{body}"
 
+    def reject(self, reason: str, ending: str = "") -> str:
+        """A Turn that produced nothing: say so to the archive, not to the room.
+
+        **The Worker posts no failure message and edits nothing.** The relay
+        client reads `[no-send]` at the head of a result body as "archive this
+        and deliver nothing", so the room hears about the failure from the
+        broker, which owns that message — the spec's one rule here is that a
+        person must not receive two different apologies for one failure.
+
+        The placeholder is deliberately left as it stands. Every edit available
+        is a sentence the Worker would be writing about a failure, which is the
+        message it must not write; the broker's notice is the one that arrives.
+
+        What follows the marker is for whoever reads the archived result: the
+        machine-readable reason, the Adapter's own explanation, any
+        announcement that never reached the room, and the summary of what the
+        Turn managed to do before it ended with nothing to say.
+        """
+        self.rejected = True
+        parts = [
+            f"{NO_SEND} agent-connect: nothing to deliver — this turn produced no "
+            f"answer (reason: {reason}). The broker posts the failure notice; "
+            f"the worker posts none."
+        ]
+        parts += [n.strip() for n in self._unposted if n and n.strip()]
+        if ending.strip():
+            parts.append(ending.strip())
+        summary = _summary(self._steps, self._failed, self._refused)
+        if summary:
+            parts.append(summary)
+        return "\n\n".join(parts)
+
     # -- internals ----------------------------------------------------------
 
-    async def _notice(self, text: str) -> None:
+    async def notice(self, text: str, keep: bool = True) -> bool:
         """Tell the room something about the run, as its own message.
 
         **Never by editing the placeholder.** The placeholder belongs to this
@@ -232,19 +337,29 @@ class TurnReporter:
         moment it is true, and the Ladder carries on above it untouched.
 
         A room that cannot be posted to does not lose the notice: it rides out
-        on the result body instead, where the delivery path will post it.
+        on the result body instead, where the delivery path will post it — that
+        is `keep`, and it is what an announcement about memory needs.
+
+        `keep=False` is for an announcement that is only true *now*: "your
+        message is queued" arriving stapled to the answer is not a smaller
+        version of the same information, it is noise. A notice that could not be
+        posted while it was true is dropped.
+
+        Returns whether the room was actually told.
         """
         text = (text or "").strip()
         if not text:
-            return
+            return False
         if self.ops is not None and self._room and getattr(self.ops, "available", True):
             try:
                 await self.ops.message(self._room, text)
                 self.notices_posted += 1
-                return
+                return True
             except RoomOpError:
                 pass
-        self._unposted.append(text)
+        if keep:
+            self._unposted.append(text)
+        return False
 
     async def _progress(self) -> None:
         if not self.settings.live or not self.event_id or not self._steps:
@@ -283,6 +398,9 @@ def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str
     (no relay, no room, a refused op). They lead the body rather than being
     dropped: a Worker with no room ops must still be able to say that the
     conversation started over.
+
+    Only ever called with an answer: a Turn that produced nothing goes to
+    `TurnReporter.reject` instead, and does not travel this path at all.
     """
     parts = [n.strip() for n in notices if n and n.strip()]
     if answer.strip():
@@ -292,8 +410,23 @@ def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str
     summary = _summary(steps, failed, refused)
     if summary:
         parts.append(summary)
-    body = "\n\n".join(parts).strip()
-    return body or "agent-connect: the agent produced no answer."
+    return "\n\n".join(parts).strip()
+
+
+def _ending(reason: str, note: str) -> str:
+    """The line that says how the Turn ended, for an ending that was not plain.
+
+    A stop reason other than completion **always** produces one. The Adapter's
+    own note is preferred where there is one — it knows more than a table does,
+    and correcting it would only tell the person twice — and `STOP_LINES` is the
+    floor under an Adapter that reported a reason and no words. The case this
+    rules out is the third one: a Turn that stopped short and says nothing,
+    which a person reads as a finished answer.
+    """
+    note = (note or "").strip()
+    if reason in NORMAL_REASONS:
+        return note
+    return note or STOP_LINES.get(reason, STOP_LINES[FAILED])
 
 
 def _summary(steps, failed, refused, limit: int = 6) -> str:
