@@ -15,11 +15,15 @@ these tests notice.
 
     python3 fake_acp_agent.py            # script from $FAKE_ACP_SCRIPT, or defaults
     python3 fake_acp_agent.py script.json
+    python3 fake_acp_agent.py script.json report.json
 
 Environment:
 
   FAKE_ACP_SCRIPT   path to the script JSON (argv[1] wins over it)
-  FAKE_ACP_REPORT   path to write the report JSON to
+  FAKE_ACP_REPORT   path to write the report JSON to (argv[2] wins over it —
+                    two Turns running at once cannot share one environment
+                    variable, and concurrency across rooms is a thing tests
+                    have to observe)
 
 ## The script
 
@@ -472,7 +476,8 @@ def load_script(argv: list) -> dict:
 
 def main(argv: list | None = None) -> None:
     argv = sys.argv if argv is None else argv
-    agent = FakeAcpAgent(load_script(argv), os.environ.get("FAKE_ACP_REPORT"))
+    report = argv[2] if len(argv) > 2 else os.environ.get("FAKE_ACP_REPORT")
+    agent = FakeAcpAgent(load_script(argv), report)
     try:
         asyncio.run(agent.run())
     except KeyboardInterrupt:
