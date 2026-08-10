@@ -66,6 +66,25 @@ agent that refuses to resume, or never advertised resumption, or a Session that
 retired on its Turn budget or idle timeout — each opens a fresh Session and
 tells the room so, as a `Notice`. Silent amnesia is the failure being prevented.
 
+**A Turn has a deadline, and it is enforced through the protocol.** After
+`AGENT_CONNECT_TURN_TIMEOUT` seconds the Turn is ended with `session/cancel`,
+which makes the ACP Agent stop and hand back everything it had produced —
+`prompt()` returns normally, with a `cancelled` stop reason and the chunks so
+far. That partial answer goes to the room *with the interruption stated*: work
+that nearly finished is not thrown away, and an answer cut off mid-sentence
+without a word about it reads as a complete one. Killing the process instead
+would do neither, and under a Local Agent shared between rooms it would end
+every other room's conversation; ending the child is the last resort after a
+cancellation the agent ignored, and it takes only this Turn's own process with
+it. A permission request outstanding when a Turn is cancelled is answered
+`cancelled`, as the protocol requires — see `on_permission`.
+
+**A Turn that produced nothing produces no reply.** A refusal, a deadline that
+came before any output, a bridge that died: each ends the Turn with an empty
+answer, and the `TurnReporter` turns that into a structured rejection so the
+broker posts the failure notice. This Adapter's part is only to end honestly —
+the reason and a sentence saying what happened.
+
 **No interactive terminal, on any path.** ACP lets a Client offer terminal
 provisioning so the Agent can ask for a shell. The Worker does not implement it
 and does not advertise it (`CLIENT_CAPABILITIES` in `acp/core.py` is where that
@@ -81,13 +100,21 @@ import shutil
 from dataclasses import dataclass
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
-from ..acp.core import AcpClient, AcpError, SessionResumeRefused, Update
+from ..acp.core import (
+    AcpAgentGone,
+    AcpClient,
+    AcpError,
+    SessionResumeRefused,
+    TurnResult,
+    Update,
+)
 from ..acp.policy import WorkingDirectoryPolicy
 from ..events import (
     CANCELLED,
     COMPLETED,
     FAILED,
     REFUSED,
+    TIMEOUT,
     TOKEN_LIMIT,
     Done,
     MessageChunk,
@@ -110,6 +137,20 @@ COMMAND_ENV = "AGENT_CONNECT_ACP_COMMAND"
 MODE_ENV = "AGENT_CONNECT_ACP_MODE"
 AGENT_ENV = "AGENT_CONNECT_ACP_AGENT"
 SKIP_AUTH_ENV = "AGENT_CONNECT_ACP_SKIP_AUTH_CHECK"
+TIMEOUT_ENV = "AGENT_CONNECT_TURN_TIMEOUT"
+
+#: How long one Turn may run before it is cancelled through the protocol. Ten
+#: minutes: long enough for the kind of work a person waits for in a chat room,
+#: short enough that a wedged Local Agent does not hold a room's Session all
+#: afternoon. `0` disables the deadline, for an operator who would rather wait
+#: than lose the work.
+DEFAULT_TIMEOUT = 600.0
+
+#: How long the ACP Agent is given to end its Turn *after* `session/cancel`.
+#: Not a setting: it is not a policy, it is the allowance for one round trip
+#: through an agent that is already misbehaving. When it runs out the Turn's own
+#: child process is reaped — see `_deadline`.
+CANCEL_GRACE = 15.0
 
 #: The bridge that makes Claude Code an ACP Agent, pinned.
 #:
@@ -192,6 +233,33 @@ REFUSAL = (
 #: the room's own terms — a person needs to know that the agent no longer
 #: remembers, and why, at the moment it becomes true.
 RESET = "🧠 agent-connect: starting a fresh conversation — {why}. I no longer have the earlier context in this room."
+
+#: What the room is told about a Turn that ran past its deadline. Said plainly,
+#: and said *whether or not* there is anything to show: an answer cut off
+#: mid-sentence with no note reads as a finished answer.
+INTERRUPTED = (
+    "⏱ agent-connect: this turn ran past its {seconds:.0f}-second deadline and was "
+    "cancelled. {what}"
+)
+INTERRUPTED_PARTIAL = "What the agent had produced by then is above; it is not the whole answer."
+INTERRUPTED_EMPTY = "It had produced nothing by then."
+
+#: And when the agent would not stop being asked nicely. The process reaped is
+#: this Turn's own — every Session under this Adapter has its own — but it is
+#: still a failure of cancellation and is worth saying in those words.
+UNSTOPPABLE = (
+    " The agent did not answer the cancellation within {grace:.0f}s, so its "
+    "process was ended."
+)
+
+#: A dead Local Agent, and what happens to the conversation it was holding.
+#: The Session identifier survives in the Session map, so the next message in
+#: the room resumes the conversation rather than starting over — which is the
+#: difference between one crash and one lost conversation.
+RESUMABLE = (
+    "The conversation itself is kept: the next message in this room will try to "
+    "resume it."
+)
 
 #: Why the previous conversation ended, in the four ways it can.
 WHY_REFUSED = "the agent could not restore our previous one ({detail})"
@@ -411,12 +479,14 @@ class AcpAdapter:
         mode: Optional[str] = None,
         store: Optional[SessionStore] = None,
         session_settings: Optional[SessionSettings] = None,
+        timeout: Optional[float] = None,
     ):
         # Injectable so a test does not have to set process environment; `None`
         # means "read the environment when the Turn runs", which is what the
         # Worker gets.
         self._command = list(command) if command else None
         self._mode = mode
+        self._timeout = timeout
         # The Session map is per-Adapter, and the Adapter is per-Worker: the
         # whole point is that two Turns in one room find the same Session.
         self._store = store
@@ -432,6 +502,22 @@ class AcpAdapter:
 
     def mode(self) -> str:
         return self._mode if self._mode is not None else os.environ.get(MODE_ENV, "").strip()
+
+    def timeout(self) -> float:
+        """Seconds one Turn may run before it is cancelled. `0` is no deadline.
+
+        A value typed wrong is the default rather than a Worker that will not
+        start: the operator finds out about a bad setting from a Turn that runs
+        for the usual ten minutes, not from a machine that never serves.
+        """
+        if self._timeout is not None:
+            return max(0.0, float(self._timeout))
+        raw = (os.environ.get(TIMEOUT_ENV) or "").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return DEFAULT_TIMEOUT
+        return value if value >= 0 else DEFAULT_TIMEOUT
 
     def session_settings(self) -> SessionSettings:
         if self._session_settings is None:
@@ -526,6 +612,7 @@ class AcpAdapter:
         # Per-Turn, not per-Adapter: two rooms run their Turns concurrently and
         # one of them resuming must not silence the other's live progress.
         muted = _Suppression()
+        live = _LiveTurn()
 
         def on_update(update: Update) -> None:
             # Replayed history arrives here exactly like live progress — the
@@ -544,6 +631,16 @@ class AcpAdapter:
             rejected request is the interesting one: without it a blocked agent
             is indistinguishable from a lazy one.
             """
+            if live.cancelled:
+                # The protocol requires an outstanding permission request to be
+                # answered `cancelled` once the Turn has been cancelled — an
+                # unanswered one leaves the Local Agent waiting on a Client that
+                # has stopped listening. `None` is how the core spells that
+                # outcome. Deliberately no `PermissionAsked`: this is not the
+                # Policy refusing anything, and reporting it as a refusal would
+                # put "agent-connect refused 1 operation" in a reply whose real
+                # story is that the turn ran out of time.
+                return None
             decision = policy.decide(request)
             queue.put_nowait(
                 PermissionAsked(
@@ -571,6 +668,7 @@ class AcpAdapter:
                 command, cwd=cwd, on_update=on_update, permission_handler=on_permission
             ) as client:
                 await client.initialize()
+                live.client = client
                 # Muted from before the Session is touched until the prompt is
                 # sent. Not merely "during `load_session`": the boundary that
                 # actually holds is the prompt, because *nothing* arriving
@@ -606,9 +704,19 @@ class AcpAdapter:
                         store.remember(key, session_id, cwd, turns + 1)
                 finally:
                     muted.on = False
+                # The deadline may have passed while the Session was being
+                # opened or resumed. Prompting anyway would start work that is
+                # already over its time; the Turn ends here with what it has,
+                # which is nothing.
+                if not live.begin(session_id):
+                    return TurnResult(stop_reason="cancelled", text="")
                 return await client.prompt(session_id, preamble(ctx) + ctx.prompt)
 
+        seconds = self.timeout()
         work = asyncio.ensure_future(run())
+        watchdog = (
+            asyncio.ensure_future(_deadline(seconds, live, work)) if seconds else None
+        )
         chunks: List[str] = []
         try:
             async for event in _drain(queue, work):
@@ -617,7 +725,22 @@ class AcpAdapter:
                 yield event
             result = work.result()
         except asyncio.CancelledError:
-            raise
+            if not live.reaped:
+                raise
+            # Our own last resort, not the caller's cancellation: the Turn was
+            # cancelled through the protocol, the agent ignored it, and its
+            # process was ended. Whatever it had said still stands.
+            yield Done(reason=TIMEOUT, text="".join(chunks),
+                       note=_interrupted(seconds, chunks, unstoppable=True))
+            return
+        except AcpAgentGone as exc:
+            # The Local Agent died. The Worker does not: this is one Turn's
+            # failure, and the Session identifier stays in the map so the next
+            # message in this room resumes the conversation instead of losing
+            # it.
+            yield Done(reason=FAILED, text="".join(chunks),
+                       note=_gone_note(exc, store, key))
+            return
         except AcpError as exc:
             # A missing bridge mid-Turn gets the same install advice the startup
             # check gives, rather than a bare "command not found".
@@ -630,14 +753,123 @@ class AcpAdapter:
                        note=f"agent-connect: the ACP Turn failed: {exc}")
             return
         finally:
+            if watchdog is not None and not watchdog.done():
+                watchdog.cancel()
             if not work.done():
                 work.cancel()
+
+        if live.cancelled and result.stop_reason == "cancelled":
+            # It stopped because we said so, and we said so because it ran out
+            # of time — a `cancelled` stop reason here means the deadline, not
+            # a person changing their mind, and the room is told which. An agent
+            # that finished anyway in the moment between the two is reported as
+            # having finished: what it said is a real answer.
+            yield Done(reason=TIMEOUT, text="".join(chunks),
+                       note=_interrupted(seconds, chunks))
+            return
 
         yield Done(
             reason=STOP_REASONS.get(result.stop_reason, FAILED),
             text="".join(chunks),
             note=_note(result.stop_reason),
         )
+
+
+class _LiveTurn:
+    """The running Turn, as much of it as cancellation needs to reach.
+
+    Cancellation has to happen from outside the coroutine doing the work — a
+    watchdog that fires while `prompt()` is still awaited — and it needs two
+    things the coroutine owns: the connection and the Session identifier. This
+    is that handover, and it is per Turn, never per Adapter: cancelling one
+    room's Turn must not touch another's.
+    """
+
+    __slots__ = ("client", "session_id", "cancelled", "reaped")
+
+    def __init__(self) -> None:
+        self.client = None
+        self.session_id = ""
+        #: True once this Turn has been cancelled. Read by the permission
+        #: handler as well as by the ending: a request arriving after this must
+        #: be answered `cancelled`, which the protocol requires.
+        self.cancelled = False
+        #: True only if cancelling through the protocol did not work and the
+        #: child process had to be ended. Distinguishes our own last resort from
+        #: the caller cancelling us, which must propagate untouched.
+        self.reaped = False
+
+    def begin(self, session_id: str) -> bool:
+        """The Session is open and the prompt is about to go out — unless the
+        deadline beat it here."""
+        self.session_id = session_id
+        return not self.cancelled
+
+    async def interrupt(self) -> None:
+        """End this Turn **through the protocol**, not by killing anything.
+
+        `session/cancel` makes the ACP Agent stop and the outstanding `prompt`
+        return normally, with a `cancelled` stop reason and everything it
+        produced up to that point. Killing the process would do neither, and
+        under a Local Agent shared by several rooms it would end every other
+        room's conversation as well — which is the whole reason this method
+        exists rather than a `terminate()`.
+
+        A Turn cancelled before its Session was open has nothing to cancel: the
+        flag alone stops the prompt from ever being sent.
+        """
+        self.cancelled = True
+        client, session_id = self.client, self.session_id
+        if client is None or not session_id or not getattr(client, "alive", False):
+            return
+        try:
+            await client.cancel(session_id)
+        except AcpError:
+            # It was already gone, or it will not answer. Either way the Turn is
+            # over and the ending is reported from what we have.
+            pass
+
+
+async def _deadline(seconds: float, live: _LiveTurn, work: asyncio.Future) -> None:
+    """Cancel the Turn when it runs too long, and reap it only if it will not go.
+
+    Two steps, in this order and never the other way round: `session/cancel`
+    first, so a well-behaved ACP Agent ends its Turn itself and hands back what
+    it had; and only if that is ignored for `CANCEL_GRACE` seconds, cancel the
+    coroutine — which unwinds `AcpClient.spawn` and ends **this Turn's own**
+    child process. Every Turn under this Adapter has its own, so no other
+    room's Session is touched even by the last resort.
+    """
+    await asyncio.sleep(seconds)
+    if work.done():
+        return
+    await live.interrupt()
+    await asyncio.sleep(CANCEL_GRACE)
+    if not work.done():
+        live.reaped = True
+        work.cancel()
+
+
+def _interrupted(seconds: float, chunks, unstoppable: bool = False) -> str:
+    """What the room is told about a Turn that hit its deadline."""
+    note = INTERRUPTED.format(
+        seconds=seconds,
+        what=INTERRUPTED_PARTIAL if "".join(chunks).strip() else INTERRUPTED_EMPTY,
+    )
+    return note + (UNSTOPPABLE.format(grace=CANCEL_GRACE) if unstoppable else "")
+
+
+def _gone_note(exc: Exception, store, key) -> str:
+    """What the room is told when the Local Agent's process died under it.
+
+    The sentence says what happened and, when there is a conversation left to
+    continue, that it is not lost. The Session record is still in the map — it
+    is written before the prompt — so the next Task in this room resumes it.
+    """
+    lines = [f"agent-connect: {exc}"]
+    if store is not None and store.get(key) is not None:
+        lines.append(RESUMABLE)
+    return " ".join(lines)
 
 
 class _Suppression:

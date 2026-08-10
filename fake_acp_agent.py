@@ -35,6 +35,9 @@ answers every prompt with one message and stops with `end_turn`.
       "sessionPrefix": "roomA",       # how session ids are named (default
                                       # "fake-session"), so several processes'
                                       # Sessions are distinguishable
+      "ignoreCancel": true,           # keep working after session/cancel —
+                                      # an agent that does NOT honour the
+                                      # protocol's cancellation
       "turns": [ <turn>, ... ],       # consumed one per session/prompt
       "defaultTurn": <turn>           # used once "turns" is exhausted
     }
@@ -58,8 +61,17 @@ An `<action>` is one of:
     {"type": "request",   "method": "terminal/create", "params": {...}}
                                                   ask the Client for anything at
                                                   all, and record its answer
-    {"type": "sleep",     "seconds": 2.0}         delay past a deadline
+    {"type": "sleep",     "seconds": 2.0}         delay past a deadline —
+                                                  interrupted by session/cancel
     {"type": "exit",      "code": 1}              die mid-Turn
+
+**Cancellation.** `session/cancel` is honoured the way the protocol says an
+Agent should honour it: the running Turn stops between actions (a `sleep` stops
+at once), and `session/prompt` returns `{"stopReason": "cancelled"}` — whatever
+the script said the stop reason would be. Everything already sent stands, which
+is what makes partial output on a deadline observable. `"ignoreCancel": true`
+models the other kind of agent: one that records the cancel and keeps working
+regardless, so a Client's last resort can be tested.
 
 An `<update>` is a raw ACP `session/update` payload — i.e. the object that goes
 under `update`, i.e. `{"sessionUpdate": "agent_message_chunk", "content": {...}}`.
@@ -126,6 +138,9 @@ class FakeAcpAgent:
         self._next_id = 1
         self._pending: dict = {}
         self._out_lock = asyncio.Lock()
+        #: Sessions whose running Turn has been cancelled, one Event each, so a
+        #: `sleep` ends the moment the cancel arrives rather than running out.
+        self._cancels: dict = {}
 
     # -- report -----------------------------------------------------------
 
@@ -236,6 +251,7 @@ class FakeAcpAgent:
             return await self._prompt(params)
         if method == "session/cancel":
             self.report["cancelled"].append(params.get("sessionId"))
+            self._cancel_event(params.get("sessionId")).set()
             return None
         if method == "authenticate":
             return {}
@@ -303,8 +319,20 @@ class FakeAcpAgent:
             await self._update(session_id, update)
         return {}
 
+    def _cancel_event(self, session_id) -> asyncio.Event:
+        event = self._cancels.get(session_id)
+        if event is None:
+            event = self._cancels[session_id] = asyncio.Event()
+        return event
+
+    def _cancelled(self, session_id) -> bool:
+        if self.script.get("ignoreCancel"):
+            return False
+        return self._cancel_event(session_id).is_set()
+
     async def _prompt(self, params: dict) -> dict:
         session_id = params.get("sessionId")
+        self._cancel_event(session_id).clear()
         self.report["prompts"].append(
             {"sessionId": session_id, "prompt": params.get("prompt")}
         )
@@ -316,7 +344,14 @@ class FakeAcpAgent:
             or {"actions": [{"type": "message", "text": "ok"}]}
         )
         for action in turn.get("actions") or []:
+            if self._cancelled(session_id):
+                break
             await self._act(session_id, action)
+        if self._cancelled(session_id):
+            # What a cancelled Turn returns is fixed by the protocol, not by
+            # the script: the prompt call ends normally, with `cancelled` and
+            # whatever was produced before it. Everything already sent stands.
+            return {"stopReason": "cancelled"}
         return {"stopReason": turn.get("stopReason", "end_turn")}
 
     async def _act(self, session_id: str, action: dict) -> None:
@@ -375,7 +410,19 @@ class FakeAcpAgent:
             )
             self._flush_report()
         elif kind == "sleep":
-            await asyncio.sleep(float(action.get("seconds", 1)))
+            # Interruptible: a Turn cancelled through the protocol stops when
+            # the cancel arrives, not when the script's clock runs out. An
+            # agent scripted to ignore cancellation sleeps it out instead.
+            seconds = float(action.get("seconds", 1))
+            if self.script.get("ignoreCancel"):
+                await asyncio.sleep(seconds)
+            else:
+                try:
+                    await asyncio.wait_for(
+                        self._cancel_event(session_id).wait(), timeout=seconds
+                    )
+                except asyncio.TimeoutError:
+                    pass
         elif kind == "exit":
             self._flush_report()
             os._exit(int(action.get("code", 0)))
