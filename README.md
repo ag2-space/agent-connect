@@ -231,6 +231,36 @@ file's path to the agent instead: that would tell it to go and read a file from
 a directory the relay owns, which is not what someone attaching a picture asked
 for.
 
+## A file the agent produced arrives in the room
+
+Ask for a report, a diff or a chart and the file itself lands in the room —
+openable, not pasted into a code block. The agent writes the file in its working
+directory and names it in its reply (`[file: report.md]` on a line of its own);
+the worker takes the marker out of the text, so the room reads prose and receives
+the file beside it, as one reply. Several files from one turn all arrive, in the
+order the agent named them.
+
+**The route matters more than the feature.** A file goes out by being placed in
+the **outgoing result directory** — the same `results/` the worker already writes
+into, and the only directory the relay client's send allowlist trusts. The worker
+posts no media itself, and that is deliberate: the allowlist is what stops an
+agent from being talked into attaching a private key or somebody's tax return to
+a chat message, and a worker that uploaded files directly would turn any message
+into an exfiltration trigger. Restricting the ACP adapter to the owner narrows
+who can try; it does not close it, because the owner in a room is not necessarily
+the person sitting at the machine.
+
+**A file outside the working directory is not sent, and the room is told so** —
+by name and with the reason, in the same reply. A file that silently fails to
+arrive is indistinguishable from an agent that ignored the request. The same line
+appears for a file that has gone missing, one that is not a regular file, and one
+over `AGENT_CONNECT_OUTGOING_MAX_BYTES`.
+
+What this does not prevent: an agent talked into *copying* a private file into
+its working directory can then send the copy. The permitted area is a boundary on
+paths, not a proof about contents — closing that needs a sandbox that refuses the
+first copy.
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**
@@ -246,6 +276,7 @@ table.
 | `AGENT_CONNECT_WORKSPACE` | workspace dir holding `tasks/` + `results/` | `~/.agent-connect/workspace` |
 | `AGENT_CONNECT_POLL` | seconds between scans for new tasks | `1.0` |
 | `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` | how much of one attached file is read into a prompt. An attachment over this is reported in the room, never shrunk to fit. `0` means no limit | `10485760` (10 MB) |
+| `AGENT_CONNECT_OUTGOING_MAX_BYTES` | how large a file the agent produced may be and still be sent to the room. The relay refuses more than this anyway; refusing it here means a sentence in the room instead of a log line. `0` means no limit | `26214400` (25 MB) |
 
 The ladder (see the section above):
 

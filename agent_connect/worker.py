@@ -28,6 +28,7 @@ from pathlib import Path
 from .adapters import get as get_adapter
 from .attachments import parse as parse_attachments
 from .events import TurnContext
+from .outgoing import Outbox
 from .pending import queue_for
 from .reporter import LadderSettings, TurnReporter
 from .roomops import room_ops_from_env
@@ -189,7 +190,11 @@ async def process_one(
     if not ctx.prompt:
         result_path.write_text("[no-send] empty task\n")
         return
-    reporter = TurnReporter(ops, settings)
+    # The results directory is also the *outgoing* directory: it is the one place
+    # the transport's send allowlist trusts, so a file the agent produced leaves
+    # this machine by being staged there and named in the result body. The Worker
+    # uploads nothing itself — see `agent_connect.outgoing`.
+    reporter = TurnReporter(ops, settings, outbox=Outbox(results_dir))
 
     async def announce(turn) -> None:
         # Said before the wait rather than after it, and as its own message:

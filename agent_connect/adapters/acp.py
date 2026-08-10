@@ -115,6 +115,7 @@ from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 from .. import attachments as att
+from .. import outgoing
 from ..acp.core import (
     AcpAgentGone,
     AcpClient,
@@ -455,6 +456,10 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = ()) -> str:
     tell which block is which when someone says "the second screenshot". It is
     part of the framing and never part of the message: what the person typed is
     appended after this, unchanged, whatever they attached to it.
+
+    The outgoing rule is stated here too, in `agent_connect.outgoing`'s own
+    words: an agent that is never told how to hand a file to the room pastes it
+    into a code block instead, which is the thing this framing exists to avoid.
     """
     who = ctx.sender_name or "the owner"
     where = f" in {ctx.room_name}" if ctx.room_name else ""
@@ -462,7 +467,8 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = ()) -> str:
         f"[agent-connect] {who} is asking you this{where}, through a chat room. "
         "Answer in chat: prose, no more than a few short paragraphs unless asked "
         "for more. You are working in the directory this session was opened in; "
-        "file operations outside it will be refused when you ask for them.\n\n"
+        f"file operations outside it will be refused when you ask for them.\n"
+        f"{outgoing.INSTRUCTION}\n\n"
     )
     if attached:
         framing += ATTACHED.format(names=", ".join(attached))

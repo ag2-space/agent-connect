@@ -74,6 +74,7 @@ from .events import (
     TurnContext,
     final_text,
 )
+from .outgoing import Delivery, Outbox, carries_files, not_sent_notice, only_files_line
 from .roomops import RoomOpError
 
 #: The fleet-wide placeholder copy. Not ours to reword: every agent on the
@@ -88,6 +89,13 @@ REPLIED = "[REPLIED]"
 #: answer follows as its own message, through the result path, which the relay
 #: client already knows how to chunk.
 POINTER = "✅ Done — the answer was too long for this message, so it follows below."
+
+#: What the placeholder becomes when the reply carries a file. Same branch, same
+#: reason: the body has to travel the delivery path, because that is the only
+#: path with the send allowlist on it — see `agent_connect.outgoing`. The reply
+#: and its files arrive together, just below.
+FILE_POINTER = "✅ Done — the reply and its file follow below."
+FILE_POINTER_MANY = "✅ Done — the reply and its {count} files follow below."
 
 #: What a person is told when their message arrives while the Session is busy.
 #: Only one Turn at a time may be open on a Session, so the message waits — and
@@ -174,13 +182,19 @@ class TurnReporter:
         ops=None,
         settings: Optional[LadderSettings] = None,
         clock=time.monotonic,
+        outbox: Optional[Outbox] = None,
     ):
         self.ops = ops
         self.settings = settings or LadderSettings()
         self._clock = clock
+        #: Where a file the agent produced is staged so the transport's send
+        #: allowlist can see it. Built on demand, because a Turn that names no
+        #: file must not touch the filesystem to find that out.
+        self.outbox = outbox
         #: The placeholder's event identifier; falsy means nothing was posted.
         self.event_id = ""
         self._room = ""
+        self._ctx: Optional[TurnContext] = None
         self._last_edit = 0.0
         self._steps: List[str] = []      # tool titles, in the order they started
         self._failed: set = set()        # titles of tool calls that failed
@@ -193,12 +207,17 @@ class TurnReporter:
         #: True when the Turn ended as a structured rejection — observable so a
         #: caller can tell "nothing was delivered" from "nothing happened".
         self.rejected = False
+        #: The files this Turn put on their way to the room, by the name the room
+        #: will see, and the ones it refused to send.
+        self.delivered: tuple = ()
+        self.not_sent: tuple = ()
 
     # -- the Ladder ---------------------------------------------------------
 
     async def start(self, ctx: TurnContext) -> None:
         """Post the placeholder. Silence is what this is here to end."""
         self._room = ctx.room
+        self._ctx = ctx
         if self.ops is None or not self._room or not getattr(self.ops, "available", True):
             return
         try:
@@ -223,6 +242,7 @@ class TurnReporter:
         Turn is waiting must not resurface stapled to the answer.
         """
         self._room = ctx.room
+        self._ctx = ctx
         others = "" if ahead <= 1 else f" ({ahead} messages are ahead of it)"
         return await self.notice(QUEUED.format(others=others), keep=False)
 
@@ -270,29 +290,59 @@ class TurnReporter:
     async def finish(self, answer: str, note: str = "", reason: str = COMPLETED) -> str:
         """Edit the placeholder into the answer; return what to write as result.
 
-        Three endings, and which one happened is visible in the return value.
+        Four endings, and which one happened is visible in the return value.
         The answer fits an edit: the placeholder becomes it, and the result body
         is the terminal marker, so the delivery path posts nothing. The answer
         does not fit: the placeholder becomes a short pointer and the answer
         itself is the result body, which the relay client chunks as it always
-        has. There is no answer at all: nothing is edited and the result is a
+        has. **The reply carries a file**: the same pointer branch, for a
+        different reason — the body has to reach the delivery path, because the
+        send allowlist lives there and a `[REPLIED]` body is archived unread. And
+        there is no answer at all: nothing is edited and the result is a
         structured rejection — see `reject`.
         """
         ending = _ending(reason, note)
-        if not answer.strip():
+        files = self._outgoing(answer)
+        answer = files.text or only_files_line(files.sent)
+        # A reply whose whole content was a file marker still has something to
+        # deliver, and one that names a file it may not send still has something
+        # to say. Only a Turn with none of the three produced nothing.
+        if not answer.strip() and not files.asked:
             return self.reject(reason, ending)
         body = _assemble(
-            answer, ending, self._steps, self._failed, self._refused, self._unposted
+            answer, ending, self._steps, self._failed, self._refused, self._unposted,
+            not_sent_notice(files.refused),
         )
+        if files.markers:
+            # Invisible to the room — the delivery path strips them and uploads
+            # what they name. Last, so the prose above is what a person reads.
+            body = body + "\n\n" + "\n".join(files.markers)
         if not self.event_id:
             return body
-        if len(body) > self.settings.ceiling:
-            await self._edit(POINTER)
+        if files.markers or len(body) > self.settings.ceiling:
+            await self._edit(_pointer(files.markers))
             return body
         if not await self._edit(body):
             # The final edit is the one failure that must not lose the answer.
             return body
         return f"{REPLIED}\n\n{body}"
+
+    def _outgoing(self, answer: str) -> Delivery:
+        """Stage whatever files this answer named, and take the markers out of it.
+
+        The Worker never uploads anything itself: a file leaves this machine by
+        being placed in the outgoing result directory, which is the one place the
+        transport's send allowlist trusts. See `agent_connect.outgoing` for why
+        the route matters more than the feature.
+        """
+        if not carries_files(answer):
+            return Delivery(text=answer or "")
+        if self.outbox is None:
+            self.outbox = Outbox()
+        delivery = self.outbox.stage(answer, self._ctx)
+        self.delivered = delivery.sent
+        self.not_sent = delivery.refused
+        return delivery
 
     def reject(self, reason: str, ending: str = "") -> str:
         """A Turn that produced nothing: say so to the archive, not to the room.
@@ -385,7 +435,16 @@ class TurnReporter:
         return True
 
 
-def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str:
+def _pointer(markers) -> str:
+    """What the placeholder becomes when the reply travels below it."""
+    if not markers:
+        return POINTER
+    if len(markers) == 1:
+        return FILE_POINTER
+    return FILE_POINTER_MANY.format(count=len(markers))
+
+
+def _assemble(answer: str, note: str, steps, failed, refused, notices=(), files="") -> str:
     """The answer, its ending, and a compact summary of what was done.
 
     The summary is not a log. It is the two or three lines that let a person see
@@ -399,12 +458,18 @@ def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str
     dropped: a Worker with no room ops must still be able to say that the
     conversation started over.
 
-    Only ever called with an answer: a Turn that produced nothing goes to
+    `files` is what could not be sent, and it goes directly after the answer
+    rather than as its own message: someone who asked for a report *and* did not
+    get it is owed both facts in the same breath.
+
+    Only ever called with something to say: a Turn that produced nothing goes to
     `TurnReporter.reject` instead, and does not travel this path at all.
     """
     parts = [n.strip() for n in notices if n and n.strip()]
     if answer.strip():
         parts.append(answer.strip())
+    if files.strip():
+        parts.append(files.strip())
     if note.strip():
         parts.append(note.strip())
     summary = _summary(steps, failed, refused)
