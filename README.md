@@ -173,6 +173,37 @@ before.
 Only the ACP adapter has this. The other five run a one-shot CLI per task and
 have no session to continue.
 
+## Nothing is lost, and endings tell the truth
+
+**A message that arrives while the agent is busy is queued, and you are told
+so.** Only one turn at a time may be open on a session — the protocol's rule,
+not a choice — so a second message in the same room waits for the first. It
+waits *out loud*: a short "this one is queued and will be answered next" lands
+before the placeholder, and the answer follows when the earlier turn is done.
+Queueing is per session, so a room that is busy blocks nothing but itself and
+every other room keeps running.
+
+**A turn that runs too long is cancelled through the protocol, never by killing
+the agent.** After `AGENT_CONNECT_TURN_TIMEOUT` seconds the worker sends
+`session/cancel`; the local agent stops and hands back everything it had
+produced. That partial answer goes to the room **with the interruption stated
+plainly** — long work that nearly finished is not thrown away, and an answer cut
+off mid-sentence with no note reads as a complete one. Ending the process is
+the last resort, only after a cancellation the agent ignored, and it takes that
+one turn's process with it and no other room's conversation.
+
+**A turn that produced nothing produces no reply from the worker.** A refusal,
+a deadline that arrived before any output, a bridge that died: each is written
+as a `[no-send]` result, which the relay client archives and delivers nowhere.
+The failure notice in the room is the broker's to post, and two apologies for
+one failure is worse than one. Nothing about it is silent, though: the reason is
+in the archived result, and any stop reason other than a finished answer always
+appears as its own line rather than as silence.
+
+**The local agent's process dying does not end the worker.** One crash is one
+turn's failure. The session identifier is kept, so the next message in that room
+resumes the conversation rather than starting over.
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**
@@ -214,6 +245,7 @@ ACP adapter (see the section above):
 | `AGENT_CONNECT_ACP_COMMAND` | the ACP agent's command line, split as a shell would. **Overrides any preset** | *(unset)* |
 | `AGENT_CONNECT_ACP_MODE` | session mode id to request. Left alone by default: every bridge's own default already routes permission requests to the worker, and mode ids are the agent's to name | *(unset)* |
 | `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK` | `1` to start even when the agent advertises authentication methods. The escape hatch for an agent whose `authMethods` mean something else | *(unset)* |
+| `AGENT_CONNECT_TURN_TIMEOUT` | seconds one turn may run before it is cancelled **through the protocol**, keeping whatever it produced. `0` waits forever | `600` |
 | `AGENT_CONNECT_ACP_BRIDGE_SPEC` | *(installer only)* override the pinned bridge npm spec | the pin above |
 
 Other adapters:
