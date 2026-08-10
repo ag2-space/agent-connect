@@ -126,6 +126,11 @@ STOP_LINES = {
     FAILED: "⚠️ agent-connect: the turn did not finish.",
 }
 
+#: What the room is told when the agent finished without saying anything. Not a
+#: failure — nothing went wrong, so no broker notice is coming, and the room
+#: would otherwise be left watching the placeholder for ever.
+SILENT = "✅ agent-connect: the agent finished without an answer to give."
+
 DEFAULT_THROTTLE = 3.0
 DEFAULT_CEILING = 4000
 
@@ -308,7 +313,15 @@ class TurnReporter:
         # deliver, and one that names a file it may not send still has something
         # to say. Only a Turn with none of the three produced nothing.
         if not answer.strip() and not files.asked:
-            return self.reject(reason, ending)
+            if reason not in NORMAL_REASONS or not self.event_id:
+                return self.reject(reason, ending)
+            # A Turn that ended *normally* with nothing to say is not a failure,
+            # so no broker notice is coming — and a placeholder is already in the
+            # room promising one. Rejecting here would leave it reading "on it"
+            # for ever, so the Ladder is finished by the only party that knows
+            # what happened. With no placeholder there is nothing to finish, and
+            # the rejection above is right: an empty answer must not be posted.
+            answer = SILENT
         body = _assemble(
             answer, ending, self._steps, self._failed, self._refused, self._unposted,
             not_sent_notice(files.refused),

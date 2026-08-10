@@ -458,12 +458,16 @@ check(outgoing.DEFAULT_MAX_BYTES == 25 * 1024 * 1024,
       "defaulting to the relay's own upload cap, so the refusal arrives with words")
 
 # A file the agent wrote straight into the outgoing directory is already sendable.
-(results / "already.txt").write_text("there")
-delivery = Outbox(results).stage(f"[file: {results / 'already.txt'}]", ctx_for(repo))
+# The outgoing directory is the staging subdirectory, not the results directory
+# around it — that one holds every other Task's archived reply.
+(results / "outgoing").mkdir(exist_ok=True)
+(results / "outgoing" / "already.txt").write_text("there")
+delivery = Outbox(results).stage(
+    f"[file: {results / 'outgoing' / 'already.txt'}]", ctx_for(repo))
 named = [Path(m[len("[file: "):-1]) for m in delivery.markers]
-check(named == [(results / "already.txt").resolve()],
+check(named == [(results / "outgoing" / "already.txt").resolve()],
       "a file already in the outgoing directory is left where it is, not copied")
-check(len(list(results.glob("already*.txt"))) == 1, "so there is one of it, not two")
+check(len(list(results.rglob("already*.txt"))) == 1, "so there is one of it, not two")
 
 # Markers, recognised the way the transport recognises them.
 check(carries_files("see [send: /x] here") and carries_files("[attach: /x]")
@@ -537,6 +541,49 @@ check("/etc/hosts" in sent.posted and "not be sent" in sent.posted,
       "and the room is told, by name, in the reply it did get")
 check("[attachment not sent" not in sent.posted,
       "the transport never has to refuse it: the Worker did not offer it one")
+
+print("\n-- another Task's archived reply is not a file this Task may send --")
+
+# The results directory is the transport's own sendable root, and it holds every
+# other Task's archived answer. Only the *staging* subdirectory inside it is the
+# permitted area, or one room could ask for another room's reply by name and the
+# allowlist — which trusts that directory — could not tell the difference.
+tmp, repo, results, tasks = workspace()
+victim = results / "task-other.txt"
+victim.write_text("the other room's private answer\n")
+box = Outbox(results)
+delivery = box.stage(f"Here.\n\n[file: {victim}]", ctx_for(repo))
+check(not delivery.markers, "another Task's result is not staged")
+check(not delivery.sent, "and nothing is reported as sent")
+check(any("task-other" in line for line in delivery.refused),
+      "the room is told, by name, that it was not sent")
+check(victim.read_text() == "the other room's private answer\n",
+      "and the file it named is left untouched")
+
+staged = results / "outgoing" / "task-1"
+staged.mkdir(parents=True)
+already = staged / "report.md"
+already.write_text("# staged already\n")
+delivery = box.stage(f"Here.\n\n[file: {already}]", ctx_for(repo))
+check(len(delivery.sent) == 1, "a file already in the staging area is still sendable")
+check(str(already) in delivery.markers[0], "and is delivered where it lies, uncopied")
+
+print("\n-- a Turn that ends normally with nothing to say still finishes the ladder --")
+
+# Not a failure: nothing went wrong, so the broker posts no notice, and a
+# rejection here would leave the placeholder reading "on it" for ever.
+relay, ops = relay_ops()
+try:
+    reporter = TurnReporter(ops, LadderSettings(live=False), outbox=Outbox(results))
+    body = report(reporter, Scripted(Done(reason=COMPLETED, text="")), ctx_for(repo))
+    check(not reporter.rejected, "a silent completion is not a structured rejection")
+    check(not body.startswith("[no-send]"), "so the result is not marked unsendable")
+    edits = relay.ops_of("edit")
+    check(len(edits) == 1, "the placeholder is edited exactly once")
+    check("without an answer" in edits[0]["body"],
+          "into an honest line rather than being left on the placeholder")
+finally:
+    relay.stop()
 
 print("\n" + ("PASS — outgoing files green" if fails == 0
               else f"FAIL — {fails} failing"))

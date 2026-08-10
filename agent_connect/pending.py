@@ -132,7 +132,10 @@ class SessionQueue:
         self.outstanding: List[PendingTurn] = []
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
-        return f"<SessionQueue {self.key} running={self.running is not None} waiting={len(self.waiting)}>"
+        return (
+            f"<SessionQueue {self.key} running={self.running is not None} "
+            f"outstanding={len(self.outstanding)}>"
+        )
 
     @property
     def busy(self) -> bool:

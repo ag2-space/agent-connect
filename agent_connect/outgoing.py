@@ -224,6 +224,13 @@ class Outbox:
 
     def __init__(self, results_dir=None, limit: Optional[int] = None, clock=time.time):
         self.dir = Path(results_dir).expanduser() if results_dir else result_dir()
+        # The staging area is a *subdirectory* of the results directory, and the
+        # distinction is load-bearing: the results directory also holds every
+        # other Task's archived reply, so treating it as the permitted area
+        # would let one room ask for `[file: …/results/task-<other>.txt]` and be
+        # handed another room's answer — through the allowlist, which trusts
+        # that directory and so cannot catch it.
+        self.staging = self.dir / STAGING
         self.limit = max_bytes() if limit is None else limit
         self._clock = clock
 
@@ -285,7 +292,7 @@ class Outbox:
         different question than the agent asked.
         """
         cwd = _resolved(getattr(ctx, "cwd", "") or "")
-        here = _resolved(self.dir)
+        here = _resolved(self.staging)
         return cwd, tuple(p for p in (cwd, here) if p is not None)
 
     def _open(self, raw: str, cwd: Optional[Path], area: Tuple[Path, ...]):
@@ -338,10 +345,10 @@ class Outbox:
         it is — it is already sendable, and copying it would only make a second
         one. Everything else is copied *from the descriptor that was judged*.
         """
-        here = _resolved(self.dir)
+        here = _resolved(self.staging)
         if here is not None and _inside(real, (here,)):
             return real
-        root = self.dir / STAGING
+        root = self.staging
         self._sweep(root)
         folder = root / _safe(getattr(ctx, "task_id", "") or "turn")
         folder.mkdir(parents=True, exist_ok=True)
