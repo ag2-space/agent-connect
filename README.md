@@ -204,6 +204,33 @@ appears as its own line rather than as silence.
 turn's failure. The session identifier is kept, so the next message in that room
 resumes the conversation rather than starting over.
 
+## A screenshot you drop in the room is a screenshot the agent sees
+
+Attach an image to a message and ask what is wrong with it, and the local agent
+is shown the image — as **content of the prompt**, beside your text, not as a
+filename it is told to go and open. The relay client has already downloaded the
+file by the time the worker sees the task, so nothing is fetched from the room.
+Several attachments on one message are all passed, in the order you sent them,
+and your own text goes through untouched.
+
+**Nothing is converted, resized or transcoded.** The bytes the agent receives
+are the bytes on disk. `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` bounds how much of
+one file is read, and a file over it is *reported*, never shrunk to fit — a
+resized screenshot is a different screenshot.
+
+**An attachment the agent cannot take is said out loud.** What it accepts is
+what it advertised when the worker connected to it (ACP's `promptCapabilities`);
+a kind it did not advertise, a file that has gone missing, a file over the
+limit — each is named in the room, with the reason, and with the suggestion to
+paste the content instead. The failure a person can act on is better than the
+one they find out about by reading an answer that ignored their screenshot.
+
+The other adapters run through a plain command line that takes text and nothing
+else. They say exactly that, for the same reason — and they do **not** pass the
+file's path to the agent instead: that would tell it to go and read a file from
+a directory the relay owns, which is not what someone attaching a picture asked
+for.
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**

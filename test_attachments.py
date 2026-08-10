@@ -13,14 +13,16 @@ Run: python3 test_attachments.py
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 from pathlib import Path
 
 from agent_connect import attachments
+from agent_connect.adapters.shim import ShimAdapter
 from agent_connect.attachments import Attachment
-from agent_connect.worker import parse_task, turn_context
+from agent_connect.worker import handle_one, parse_task, turn_context
 
 fails = 0
 
@@ -215,6 +217,54 @@ check(broken_ctx.attachments == () and broken_ctx.prompt == "hello",
 
 check(turn_context(parse_task("id: t12\ntask: hi\n"), "task-t12", "/repo").attachments == (),
       "a Task with no attachments header has no attachments")
+
+# --- an Adapter that cannot take attachments at all says so -----------------
+# The shim is every synchronous Adapter: `run(task, sandbox, cwd)` has nowhere
+# for a file to go. Asserted at the Worker's seam, where a room would hear it.
+
+
+class OnlyText:
+    """A synchronous Adapter that records the one string it was given."""
+
+    def __init__(self):
+        self.seen = None
+
+    def run(self, task, sandbox, cwd):
+        self.seen = task
+        return "I answered the text."
+
+
+impl = OnlyText()
+shimmed = ShimAdapter("codex", impl)
+shim_ws = base / "shim"
+(shim_ws / "tasks").mkdir(parents=True)
+(shim_ws / "results").mkdir(parents=True)
+shim_task = shim_ws / "tasks" / "task-s1.txt"
+shim_task.write_text(
+    "id: s1\n"
+    "channel_id: !room:ag2.space\n"
+    "task: what is wrong with this?\n"
+    "attachments: " + json.dumps([
+        {"locator": str(real), "mime": "image/png", "filename": "shot.png"},
+        {"locator": str(real), "mime": "application/pdf", "filename": "notes.pdf"},
+    ], separators=(",", ":")) + "\n"
+    "access_tier: owner\n"
+)
+asyncio.run(handle_one(shim_task, shimmed, str(base), shim_ws / "results"))
+shim_out = (shim_ws / "results" / "task-s1.txt").read_text()
+
+check("I can't read that kind of attachment" in shim_out,
+      "an Adapter that cannot take attachments reports it honestly")
+check("shot.png" in shim_out and "notes.pdf" in shim_out,
+      "naming every file that did not reach it")
+check("Paste the content" in shim_out,
+      "and saying what to do instead")
+check("I answered the text." in shim_out,
+      "while the question itself is still answered")
+check(impl.seen is not None and impl.seen.endswith("what is wrong with this?"),
+      "the person's own text reaches the Adapter unchanged")
+check(str(real) not in (impl.seen or ""),
+      "and no attachment path is smuggled into the prompt for it to go and read")
 
 tmp.cleanup()
 print("\n" + ("PASS — attachments green" if fails == 0 else f"FAIL — {fails} failing"))

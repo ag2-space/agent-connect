@@ -85,6 +85,18 @@ answer, and the `TurnReporter` turns that into a structured rejection so the
 broker posts the failure notice. This Adapter's part is only to end honestly —
 the reason and a sentence saying what happened.
 
+**An attached file is content of the prompt, or it is said out loud.** A
+screenshot dropped into a room is base64'd into an `image` content block beside
+the text — not mentioned by filename and not summarised, so the Local Agent can
+actually be asked what is wrong with it. What it can be sent is bounded by what
+it advertised at `initialize` (`promptCapabilities`), and an attachment it did
+not advertise, or one that could not be read, is **named in the room** as one it
+cannot read, so the person knows to paste the content instead of waiting for an
+answer about a file that never arrived. Nothing is converted, resized or
+transcoded on the way: base64 is the protocol's own transport encoding for
+bytes, exactly reversible, and the bytes inside it are the ones on disk. See
+`agent_connect.attachments` for how a sender-adjacent path is opened.
+
 **No interactive terminal, on any path.** ACP lets a Client offer terminal
 provisioning so the Agent can ask for a shell. The Worker does not implement it
 and does not advertise it (`CLIENT_CAPABILITIES` in `acp/core.py` is where that
@@ -94,12 +106,15 @@ A remotely-triggered process does not get a terminal on the operator's machine.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import shlex
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
+from .. import attachments as att
 from ..acp.core import (
     AcpAgentGone,
     AcpClient,
@@ -261,6 +276,34 @@ RESUMABLE = (
     "resume it."
 )
 
+#: What the room is told about files that did not reach the Local Agent. Said
+#: as the ticket says it: the person is told they were not read, told which, and
+#: told what to do instead — pasting the content is the thing that works, and
+#: silence is what leaves them waiting for an answer about a file nobody saw.
+UNREAD = (
+    "📎 agent-connect: I can't read that kind of attachment. Your message reached "
+    "the agent; {what} did not:\n{lines}\n"
+    "Paste the content into the room instead and I can work with that."
+)
+UNREAD_ONE = "one attachment"
+UNREAD_MANY = "{count} of its attachments"
+UNREAD_LINE = "• {label} ({mime}) — {why}"
+
+#: Why an attachment of that kind cannot be sent at all. `promptCapabilities` is
+#: the ACP Agent's own statement of what it takes; sending it something it never
+#: advertised is how a Turn fails for a reason nobody can see.
+NOT_ADVERTISED = "this agent did not say it can take {word} attachments"
+
+#: Which kinds it *did* say it takes, appended to the lines above so the answer
+#: to "why not?" is followed by "what would work".
+ACCEPTS = "\nThis agent accepts: {kinds}."
+ACCEPTS_NOTHING = "\nThis agent accepts no attachments at all — only text."
+
+#: How the prompt's text block introduces the blocks that follow it. Framing,
+#: like the rest of the preamble, and the *only* thing attachment handling is
+#: allowed to add: what the person typed is repeated verbatim after it.
+ATTACHED = "Attached to this message, and included below as content: {names}.\n\n"
+
 #: Why the previous conversation ended, in the four ways it can.
 WHY_REFUSED = "the agent could not restore our previous one ({detail})"
 WHY_RETIRED = "the previous one was retired because {reason}"
@@ -400,22 +443,123 @@ def _truthy(value: Optional[str]) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def preamble(ctx: TurnContext) -> str:
+def preamble(ctx: TurnContext, attached: Sequence[str] = ()) -> str:
     """What the Local Agent is told about the situation it is answering in.
 
     Written here rather than inherited from the shim's sandbox preamble, which
     describes an operating-system Sandbox this Adapter does not have. Saying
     "this run's sandbox is workspace-write" over ACP would be stating a
     confinement that is not there.
+
+    `attached` names the files that follow as content blocks, so the agent can
+    tell which block is which when someone says "the second screenshot". It is
+    part of the framing and never part of the message: what the person typed is
+    appended after this, unchanged, whatever they attached to it.
     """
     who = ctx.sender_name or "the owner"
     where = f" in {ctx.room_name}" if ctx.room_name else ""
-    return (
+    framing = (
         f"[agent-connect] {who} is asking you this{where}, through a chat room. "
         "Answer in chat: prose, no more than a few short paragraphs unless asked "
         "for more. You are working in the directory this session was opened in; "
         "file operations outside it will be refused when you ask for them.\n\n"
     )
+    if attached:
+        framing += ATTACHED.format(names=", ".join(attached))
+    return framing
+
+
+def accepted_kinds(agent) -> List[str]:
+    """The attachment kinds this ACP Agent advertised, in a person's words."""
+    if agent is None:
+        return []
+    kinds = []
+    if agent.accepts_prompt_content("image"):
+        kinds.append("images")
+    if agent.accepts_prompt_content("audio"):
+        kinds.append("audio")
+    if agent.accepts_prompt_content("embeddedContext"):
+        kinds.append("other files")
+    return kinds
+
+
+def _capability(modality: str) -> str:
+    """Which `promptCapabilities` flag carrying this modality depends on.
+
+    ACP's baseline is text and a resource *link*; images, audio and embedded
+    resources are each optional and each advertised separately. A video, and
+    anything that is not image or audio, rides as an embedded resource — the
+    only block that carries arbitrary bytes — so it needs `embeddedContext`.
+    Sending a link instead would be handing over a filename, which is the thing
+    this Adapter exists to stop doing.
+    """
+    return {att.IMAGE: "image", att.AUDIO: "audio"}.get(modality, "embeddedContext")
+
+
+def _content_block(modality: str, mime: str, opened: att.Opened) -> dict:
+    """One attachment as an ACP content block, byte for byte.
+
+    Base64 is the protocol's transport encoding for bytes and nothing else: it
+    is exactly reversible, and what goes into it is what `os.read` returned. No
+    decoding to text, no re-encoding, no thumbnail — a resized screenshot is a
+    different screenshot.
+    """
+    payload = base64.b64encode(opened.data).decode("ascii")
+    if modality in (att.IMAGE, att.AUDIO):
+        return {"type": modality, "mimeType": mime, "data": payload}
+    return {
+        "type": "resource",
+        "resource": {"uri": Path(opened.path).as_uri(), "mimeType": mime,
+                     "blob": payload},
+    }
+
+
+def prompt_blocks(
+    ctx: TurnContext, agent, limit: int
+) -> Tuple[List[dict], List[str]]:
+    """The prompt as content blocks, and the attachments that could not be one.
+
+    Returns `(blocks, problems)`. The first block is always the text — the
+    framing followed by exactly what the person typed — so a Turn whose every
+    attachment failed still asks the question. `problems` are room-facing lines,
+    one per attachment that did not make it, which the caller turns into a
+    single `Notice`: several files failing is one fact about the run, not
+    several messages about it.
+    """
+    passed: List[str] = []
+    blocks: List[dict] = []
+    problems: List[str] = []
+    for attachment in ctx.attachments:
+        name = att.label(attachment)
+        mime = att.mime_of(attachment)
+        modality = att.modality(attachment)
+        capability = _capability(modality)
+        if agent is None or not agent.accepts_prompt_content(capability):
+            problems.append(UNREAD_LINE.format(
+                label=name, mime=mime,
+                why=NOT_ADVERTISED.format(word=att.MODALITY_WORDS[modality])))
+            continue
+        opened = att.read(attachment, limit)
+        if not opened.ok:
+            problems.append(
+                UNREAD_LINE.format(label=name, mime=mime, why=opened.problem))
+            continue
+        blocks.append(_content_block(modality, mime, opened))
+        passed.append(name)
+    # The text block is built last and put first: it names what follows it, and
+    # what follows it is only known once every attachment has been tried.
+    return [{"type": "text", "text": preamble(ctx, passed) + ctx.prompt}] + blocks, problems
+
+
+def unread_notice(problems: Sequence[str], agent) -> str:
+    """The one message a room gets about attachments that did not arrive."""
+    if not problems:
+        return ""
+    what = (UNREAD_ONE if len(problems) == 1
+            else UNREAD_MANY.format(count=len(problems)))
+    kinds = accepted_kinds(agent)
+    tail = ACCEPTS.format(kinds=", ".join(kinds)) if kinds else ACCEPTS_NOTHING
+    return UNREAD.format(what=what, lines="\n".join(problems)) + tail
 
 
 def events_for(update: Update) -> List[TurnEvent]:
@@ -667,7 +811,7 @@ class AcpAdapter:
             async with AcpClient.spawn(
                 command, cwd=cwd, on_update=on_update, permission_handler=on_permission
             ) as client:
-                await client.initialize()
+                agent = await client.initialize()
                 live.client = client
                 # Muted from before the Session is touched until the prompt is
                 # sent. Not merely "during `load_session`": the boundary that
@@ -710,7 +854,15 @@ class AcpAdapter:
                 # which is nothing.
                 if not live.begin(session_id):
                     return TurnResult(stop_reason="cancelled", text="")
-                return await client.prompt(session_id, preamble(ctx) + ctx.prompt)
+                # Read here, not at the top of the Turn: what may be sent is
+                # what *this* agent advertised, and that is not known until it
+                # has answered `initialize`. An attachment that cannot be sent
+                # is said out loud before the prompt goes, so the room learns it
+                # while the agent is still working rather than afterwards.
+                blocks, problems = prompt_blocks(ctx, agent, att.max_bytes())
+                if problems:
+                    queue.put_nowait(Notice(text=unread_notice(problems, agent)))
+                return await client.prompt(session_id, blocks)
 
         seconds = self.timeout()
         work = asyncio.ensure_future(run())
