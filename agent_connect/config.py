@@ -35,15 +35,33 @@ writes it 0600. A file readable by anyone else is loaded — refusing would bric
 a working install over a warning's worth of problem — and complained about
 loudly, once, at startup.
 
-The format is deliberately not a shell script, so that `launch.sh` reading the
-same file and this module reading it agree: `KEY=value`, one per line, `#`
-comments, no substitution, no quoting rules, the value taken verbatim to the end
-of the line (surrounding whitespace and one matching pair of quotes removed, and
-that is the whole of it).
+**There is exactly one parser, and it is this module.** The launchers need the
+same settings — the relay client gets its token from this file too — and the
+obvious way to give them one was a small `KEY=value` loop in shell. That is what
+was written first, and within a day it had drifted from this module in three
+ways, one of which handed the relay and the Worker *different tokens* from the
+same duplicated line. Two readers of one file is two answers to "what does this
+file say", and the second one is always found in production. So the shell asks
+this module instead:
+
+    _cfg="$(agent-connect --export-config)" || exit 1
+    eval "$_cfg"
+
+`--export-config` prints `export KEY='value'` for every setting the environment
+has not already decided, shell-quoted, and nothing else on stdout. Warnings go
+to stderr, where `eval` cannot eat them.
+
+The format: `KEY=value`, one per line, `#` comments, no substitution, the value
+taken verbatim to the end of the line (surrounding whitespace and one matching
+pair of quotes removed, and that is the whole of it). A key repeated in one file
+is ambiguous; the last line wins, as it does in every other file of this shape,
+and the repetition is named on stderr — a duplicated `AGENT_CONNECT_TOKEN` is
+the one mistake here with a genuinely confusing failure mode.
 """
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import sys
 from dataclasses import dataclass, field
@@ -87,8 +105,34 @@ class Config:
     values: Dict[str, str] = field(default_factory=dict)
     #: Keys the file set that are not settings. Named, never silently dropped.
     ignored: Tuple[str, ...] = ()
+    #: Keys the file set more than once. The last line won; the operator is told,
+    #: because a file that quietly disagrees with itself about a bearer token is
+    #: a bad afternoon.
+    duplicated: Tuple[str, ...] = ()
     #: True when someone other than the owner can read a file holding a token.
     exposed: bool = False
+
+    def complaints(self) -> List[str]:
+        """Everything about this file an operator needs to hear, once each."""
+        said: List[str] = []
+        if self.duplicated:
+            said.append(
+                f"{self.path} sets {', '.join(sorted(set(self.duplicated)))} more than "
+                "once. The last line wins — which is not obvious, and is worth being "
+                "sure about when the setting is a token."
+            )
+        if self.ignored:
+            said.append(
+                f"{self.path} sets {', '.join(sorted(set(self.ignored)))}, which "
+                "agent-connect does not read. See README.md § Settings for the "
+                "keys this file may carry."
+            )
+        if self.exposed:
+            said.append(
+                f"{self.path} is readable by other users and it holds your agent's "
+                f"token. Fix it with: chmod 600 {self.path}"
+            )
+        return said
 
     def apply(self, env: Optional[MutableMapping[str, str]] = None) -> Tuple[List[str], List[str]]:
         """Put the file's settings into the environment, where the env is silent.
@@ -109,6 +153,20 @@ class Config:
             applied.append(key)
         return applied, overridden
 
+    def exports(self, env: Optional[Mapping[str, str]] = None) -> List[str]:
+        """The same decision as `apply`, written for a shell to `eval`.
+
+        Precedence is settled here rather than in the shell — the caller gets
+        lines only for what it should set — so there is nothing left for a
+        second implementation to get wrong.
+        """
+        env = os.environ if env is None else env
+        return [
+            f"export {key}={shlex.quote(value)}"
+            for key, value in self.values.items()
+            if not (env.get(key) or "").strip()
+        ]
+
 
 def parse(text: str, path: Optional[Path] = None) -> Config:
     """Read `KEY=value` lines. Not a shell: nothing here is evaluated.
@@ -120,6 +178,7 @@ def parse(text: str, path: Optional[Path] = None) -> Config:
     """
     values: Dict[str, str] = {}
     ignored: List[str] = []
+    duplicated: List[str] = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -131,8 +190,11 @@ def parse(text: str, path: Optional[Path] = None) -> Config:
         if not accepts(key):
             ignored.append(key)
             continue
+        if key in values:
+            duplicated.append(key)
         values[key] = _unquote(value.strip())
-    return Config(path=path, values=values, ignored=tuple(ignored))
+    return Config(path=path, values=values, ignored=tuple(ignored),
+                  duplicated=tuple(duplicated))
 
 
 def read(path: Path) -> Config:
@@ -142,7 +204,8 @@ def read(path: Path) -> Config:
     except OSError as exc:
         raise ConfigError(f"cannot read the config file {path}: {exc}") from exc
     config = parse(text, path)
-    return Config(config.path, config.values, config.ignored, _exposed(path))
+    return Config(config.path, config.values, config.ignored, config.duplicated,
+                  _exposed(path))
 
 
 def locate(
@@ -168,15 +231,18 @@ def locate(
     return (default, False) if default.is_file() else (None, False)
 
 
-def load(
+def find(
     explicit: Optional[str] = None,
-    env: Optional[MutableMapping[str, str]] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> Optional[Config]:
-    """Find the config file, apply it, and say out loud what it did.
+    """The config file to act on, read and complained about, or `None`.
 
     A file named explicitly and missing is fatal: it holds the credential, and
     starting without it produces a Worker that runs, pulls nothing, and looks
     healthy. A default location with nothing in it is not an error at all.
+
+    Complaints go to stderr, always — `--export-config` writes shell to stdout
+    and a warning that landed there would be `eval`ed.
     """
     env = os.environ if env is None else env
     path, named = locate(explicit, env)
@@ -185,19 +251,42 @@ def load(
     if named and not path.is_file():
         raise ConfigError(f"no config file at {path}")
     config = read(path)
+    for complaint in config.complaints():
+        print(f"agent-connect: WARNING — {complaint}", file=sys.stderr, flush=True)
+    return config
+
+
+def load(
+    explicit: Optional[str] = None,
+    env: Optional[MutableMapping[str, str]] = None,
+) -> Optional[Config]:
+    """Find the config file, apply it, and say out loud what it did."""
+    env = os.environ if env is None else env
+    config = find(explicit, env)
+    if config is None:
+        return None
     applied, overridden = config.apply(env)
-    print(f"agent-connect: config {path} — {len(applied)} setting(s) applied"
+    print(f"agent-connect: config {config.path} — {len(applied)} setting(s) applied"
           + (f", {len(overridden)} already set in the environment "
              f"({', '.join(sorted(overridden))}) and left alone" if overridden else ""))
-    if config.ignored:
-        print(f"agent-connect: WARNING — {path} sets {', '.join(sorted(set(config.ignored)))}, "
-              "which agent-connect does not read. See README.md § Settings for the "
-              "keys this file may carry.", file=sys.stderr, flush=True)
-    if config.exposed:
-        print(f"agent-connect: WARNING — {path} is readable by other users and it "
-              "holds your agent's token. Fix it with: chmod 600 "
-              f"{path}", file=sys.stderr, flush=True)
     return config
+
+
+def export(
+    explicit: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Print the config file as shell, for the launchers to `eval`.
+
+    The one thing on stdout is `export` lines, so that a launcher needs no
+    parser of its own — see the module docstring for what happened when it had
+    one. Nothing is applied to this process's environment: it is about to exit.
+    """
+    config = find(explicit, env)
+    if config is None:
+        return
+    for line in config.exports(env):
+        print(line)
 
 
 def _unquote(value: str) -> str:

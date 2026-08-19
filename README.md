@@ -310,7 +310,24 @@ an authority that overrules the shell you are standing in.
 `REMOTE_TASK_*` and `OLLAMA_HOST` are applied; any other key is named on stderr
 and ignored, because a file that could set `PATH` would be deciding which
 `codex` binary runs. A misspelt setting is named for the same reason: it looks
-exactly like a setting that did not work.
+exactly like a setting that did not work. A key written **twice** takes the last
+line, as it would in any file of this shape, and the repetition is named too —
+that one is worth being sure about when the setting is a token.
+
+**There is exactly one parser, and the launchers ask it.** The relay client
+needs the same settings the worker does, so `launch.sh` and `run-agent.sh` run
+
+```bash
+_cfg="$(agent-connect --export-config)" || exit 1
+eval "$_cfg"
+```
+
+which prints the config file as `export` lines — with the environment's own
+values already deferred to — and nothing else on stdout. The shell loop that
+used to do this instead disagreed with the worker about duplicated keys, CRLF
+line endings and whitespace-only variables; the first of those handed the relay
+client and the worker *different tokens* out of one file. Two readers of one
+file is two answers to "what does this file say".
 
 **It holds your agent's token, so keep it to yourself.** The installer writes it
 `0600`. A file others can read is still loaded — refusing would break a working
@@ -322,7 +339,48 @@ and working directory into that file and points the launchd plist (or systemd
 unit) at it with `AGENT_CONNECT_CONFIG`, so **the service definition carries no
 bearer token** — it used to sit in plaintext in
 `~/Library/LaunchAgents/space.ag2.agent-connect.plist`, which is world-readable
-by default.
+by default. Re-running the installer keeps the previous file as
+`config.env.bak` and carries across every key it does not manage itself, so a
+setting you added by hand survives a re-run of the one-liner.
+
+(`--sutando-workspace` relay-only mode writes no config file: agent-connect is
+not installed there, so nothing could read one. Its launcher holds the token
+and is written mode 0700 instead — one private file either way, and still
+nothing in the plist.)
+
+## Running more than one agent on one machine
+
+**The launch unit is one worker plus one relay client, pointed at one config
+file.** That is the contract a supervisor builds on, and it is deliberately not
+a process count or a transport: today the installer's `launch.sh` starts both
+halves, and what a supervisor should depend on is the pair, named by the config
+file it was given.
+
+```bash
+agent-connect --config ~/.agent-connect/instances/scratch/config.env
+```
+
+**An instance is a config file and a workspace, and they come together.** Give
+each instance its own config file, and in it its own `AGENT_CONNECT_WORKSPACE`
+— everything per-instance hangs off that one setting:
+
+```bash
+# ~/.agent-connect/instances/scratch/config.env   (mode 0600)
+AGENT_CONNECT_TOKEN=<this instance's own agent token>
+AGENT_CONNECT_ADAPTER=acp
+AGENT_CONNECT_ACP_AGENT=claude
+AGENT_CONNECT_REPO=/Users/me/agents/scratch
+AGENT_CONNECT_WORKSPACE=/Users/me/.agent-connect/instances/scratch/workspace
+```
+
+**Two instances must never share a workspace.** `tasks/`, `results/`, the
+session map and the status file all live in it, and two workers watching one
+`tasks/` directory will each pick up every task and run it twice. Two instances
+sharing an *agent token* is the same bug one layer up: one queue, two pullers.
+A new instance means a new Agent Identity.
+
+Each instance also owns a **status file** under its own workspace, which is how
+a supervisor watching several of them tells one worker's state from another's.
 
 ## Settings
 

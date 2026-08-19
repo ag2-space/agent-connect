@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
+import json
 import os
 import re
 import subprocess
@@ -159,6 +160,104 @@ code, said = start("--help")
 check(code == 0 and "--config PATH" in said, "--help says what the one flag is")
 code, said = start("--nope")
 check(code != 0 and "unknown argument" in said, "and an unknown argument is refused")
+
+
+print("\n-- one file, one answer: the shell reads it through the same parser --")
+
+# The launchers used to carry a `KEY=value` loop of their own. Within a day it
+# had drifted from this module in three ways, the worst of which handed the
+# relay client and the Worker *different tokens* out of one duplicated line.
+# There is now one parser and the shell asks it (`--export-config`), so the only
+# thing left that could go wrong is the shell quoting of the answer. These
+# fixtures are the three divergences plus every shape that quoting can break,
+# and each one is put through BOTH paths and compared.
+
+WATCHED = ("AGENT_CONNECT_", "REMOTE_TASK_")
+READ_BACK = (
+    "import os, json; "
+    "print(json.dumps({k: v for k, v in os.environ.items() "
+    "if (k.startswith(('AGENT_CONNECT_', 'REMOTE_TASK_')) or k == 'OLLAMA_HOST') "
+    "and k != 'AGENT_CONNECT_CONFIG'}))"
+)
+
+
+def through_the_shell(path, base):
+    """What a launcher's environment holds after `eval $(--export-config)`."""
+    child = {"PATH": os.environ.get("PATH", ""), "PYTHONUNBUFFERED": "1"}
+    child.update(base)
+    script = (
+        '_cfg="$(python3 -m agent_connect --config "$1" --export-config)" || exit 1\n'
+        'eval "$_cfg"\n'
+        'exec python3 -c "$2"\n'
+    )
+    out = subprocess.run(
+        ["sh", "-c", script, "sh", str(path), READ_BACK],
+        cwd=str(ROOT), env=child, capture_output=True, text=True, timeout=60,
+    )
+    return json.loads(out.stdout or "{}")
+
+
+def through_python(path, base):
+    """What `main()` would leave in the environment, for the same file."""
+    env = dict(base)
+    parse(Path(path).read_text(), Path(path)).apply(env)
+    return {k: v for k, v in env.items()
+            if (k.startswith(WATCHED) or k == "OLLAMA_HOST")
+            and k != "AGENT_CONNECT_CONFIG"}
+
+
+FIXTURES = {
+    "a key written twice": (
+        b"AGENT_CONNECT_TOKEN=first\nAGENT_CONNECT_TOKEN=second\n", {}),
+    "CRLF line endings": (
+        b"AGENT_CONNECT_TOKEN=tok\r\nAGENT_CONNECT_REPO=/repo\r\n", {}),
+    "an environment variable set to whitespace": (
+        b"AGENT_CONNECT_REPO=/from-the-file\n", {"AGENT_CONNECT_REPO": "   "}),
+    "an environment variable genuinely set": (
+        b"AGENT_CONNECT_REPO=/from-the-file\n", {"AGENT_CONNECT_REPO": "/exported"}),
+    "spaces around the equals sign": (
+        b"  AGENT_CONNECT_REPO = /a/repo  \n", {}),
+    "a quoted value with spaces": (
+        b'AGENT_CONNECT_REPO="/a path/with spaces"\n', {}),
+    "a value containing more equals signs": (
+        b"AGENT_CONNECT_ACP_COMMAND=my-agent --acp --flag=1\n", {}),
+    "a value containing a single quote": (
+        b"AGENT_CONNECT_REPO=/tmp/o'brien\n", {}),
+    "a value containing a dollar sign and a backtick": (
+        b"AGENT_CONNECT_TOKEN=$(whoami)`id`\n", {}),
+    "a key that is not a setting": (
+        b"AGENT_CONNECT_TOKEN=tok\nLD_PRELOAD=/tmp/evil.so\nPATH=/tmp/evil\n", {}),
+    "an empty file": (b"", {}),
+    "comments and prose only": (b"# nothing here\n\nnot a setting line\n", {}),
+}
+
+for name, (raw, base) in FIXTURES.items():
+    fixture = tmp / ("fixture-" + name.replace(" ", "-") + ".env")
+    fixture.write_bytes(raw)
+    fixture.chmod(0o600)
+    shell = through_the_shell(fixture, base)
+    python = through_python(fixture, base)
+    check(shell == python,
+          f"both readers agree on {name}"
+          + ("" if shell == python else f" — shell {shell!r} vs python {python!r}"))
+
+# The three that actually bit, asserted by value as well as by agreement, so a
+# future regression cannot make both readers wrong in the same direction.
+fixture = tmp / "fixture-a-key-written-twice.env"
+check(through_python(fixture, {})["AGENT_CONNECT_TOKEN"] == "second",
+      "a key written twice takes the last line — one token, not two")
+fixture = tmp / "fixture-CRLF-line-endings.env"
+check(through_python(fixture, {})["AGENT_CONNECT_TOKEN"] == "tok",
+      "a file saved with CRLF endings does not smuggle a carriage return into "
+      "the bearer token")
+fixture = tmp / "fixture-an-environment-variable-set-to-whitespace.env"
+check(through_python(fixture, {"AGENT_CONNECT_REPO": "   "})["AGENT_CONNECT_REPO"]
+      == "/from-the-file",
+      "a variable set to whitespace is not a decision, so the file fills it")
+check(parse(b"AGENT_CONNECT_TOKEN=a\nAGENT_CONNECT_TOKEN=b\n".decode()).duplicated
+      == ("AGENT_CONNECT_TOKEN",),
+      "and the repetition is named, because last-wins is not obvious and the "
+      "setting is a credential")
 
 
 print("\n-- a config file is a settings file, not an environment --")

@@ -58,9 +58,9 @@ if [ -f "$CONFIG" ]; then
     -rw-------) ok "config.env is 0600 (it holds the bearer token)" ;;
     *) bad "config.env is $MODE, want -rw------- : the token would be world-readable" ;;
   esac
-  grep -q "^AGENT_CONNECT_TOKEN=TESTTOK$" "$CONFIG" && ok "config.env carries the token" \
+  grep -q '^AGENT_CONNECT_TOKEN="TESTTOK"$' "$CONFIG" && ok "config.env carries the token" \
     || bad "config.env missing the token"
-  grep -q "^AGENT_CONNECT_ADAPTER=omnigent$" "$CONFIG" && ok "config.env carries the adapter" \
+  grep -q '^AGENT_CONNECT_ADAPTER="omnigent"$' "$CONFIG" && ok "config.env carries the adapter" \
     || bad "config.env missing the adapter"
   grep -q "^AGENT_CONNECT_REPO=" "$CONFIG" && ok "config.env carries the working directory" \
     || bad "config.env missing the working directory"
@@ -94,36 +94,20 @@ if [ -f "$LAUNCHER" ]; then
     || ok "and holds no token of its own"
 fi
 
-# 5a) the launcher's config reader, run: it must agree with the worker's own
-#     parser about one file, or the relay and the worker disagree about the token.
-LOADER="$TMP/loader.sh"
-sed -n '/^export AGENT_CONNECT_CONFIG$/,/^fi$/p' "$LAUNCHER" > "$LOADER"
-cat > "$TMP/loader.env" <<'CFG'
-# a comment
-AGENT_CONNECT_TOKEN=tok-from-the-file
-  AGENT_CONNECT_REPO = "/a path/with spaces"
-AGENT_CONNECT_ACP_COMMAND=my-agent --acp --flag=1
-LD_PRELOAD=/tmp/evil.so
-prose that is not a setting
-CFG
-LOADED="$(AGENT_CONNECT_CONFIG="$TMP/loader.env" AGENT_CONNECT_TOKEN=from-the-env sh -c '
-  . "$1"
-  echo "TOKEN=$AGENT_CONNECT_TOKEN"
-  echo "REPO=$AGENT_CONNECT_REPO"
-  echo "CMD=$AGENT_CONNECT_ACP_COMMAND"
-  echo "PRELOAD=${LD_PRELOAD:-<unset>}"' sh "$LOADER")"
-printf '%s\n' "$LOADED" | grep -q '^TOKEN=from-the-env$' \
-  && ok "launcher: the environment wins over the config file" \
-  || { printf '%s\n' "$LOADED" | sed 's/^/    /'; bad "launcher: the file overrode the environment"; }
-printf '%s\n' "$LOADED" | grep -q '^REPO=/a path/with spaces$' \
-  && ok "launcher: spaces and quotes are read the way the worker reads them" \
-  || bad "launcher: quoted/spaced value not parsed like the worker's parser"
-printf '%s\n' "$LOADED" | grep -q '^CMD=my-agent --acp --flag=1$' \
-  && ok "launcher: everything after the first = is the value" \
-  || bad "launcher: value truncated at a second ="
-printf '%s\n' "$LOADED" | grep -q '^PRELOAD=<unset>$' \
-  && ok "launcher: a config file cannot set a non-setting (LD_PRELOAD)" \
-  || bad "launcher: the config file set a variable that is not a setting"
+# 5a) there is exactly ONE config parser, and the launcher asks it. The shell
+#     loop that used to live here disagreed with agent_connect/config.py about
+#     duplicated keys, CRLF and whitespace-only variables — the first of those
+#     handed the relay client and the worker different tokens. The agreement is
+#     now structural, and `tests/test_worker_config.py` runs both paths over one
+#     fixture set to keep it that way.
+grep -q -- "--export-config" "$LAUNCHER" \
+  && ok "launch.sh gets its settings from the worker's own parser" \
+  || bad "launch.sh does not use --export-config"
+if grep -qE '^\s*while read .*_line|\$\{_line' "$LAUNCHER"; then
+  bad "launch.sh has grown a config parser of its own again"
+else
+  ok "and carries no parser of its own"
+fi
 
 # 5b) the service definitions carry a path, never a bearer token — the whole
 #     point of the config file, since a launchd plist is world-readable. Read
@@ -148,9 +132,30 @@ case "$UNIT_BLOCK" in
   *) ok "and carries no token either" ;;
 esac
 
+# 5c) a re-run must not eat a setting somebody added by hand. This is the
+#     documented `curl … | sh` path and people re-run it.
+printf '\nAGENT_CONNECT_TURN_TIMEOUT=1800\n' >> "$CONFIG"
+out="$(PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token TESTTOK2 --adapter codex --no-start 2>&1)" || \
+  bad "re-run dry-run exited non-zero"
+grep -q "AGENT_CONNECT_TURN_TIMEOUT=1800" "$CONFIG" \
+  && ok "a re-run keeps a hand-added setting" \
+  || { sed 's/^/    /' "$CONFIG"; bad "a re-run discarded a hand-added setting"; }
+grep -q '^AGENT_CONNECT_TOKEN="TESTTOK2"$' "$CONFIG" \
+  && ok "while the settings the installer manages are updated" \
+  || bad "re-run did not update the managed settings"
+[ -f "$CONFIG.bak" ] && ok "and the previous config is kept beside it" \
+  || bad "no backup of the previous config"
+case "$(ls -l "$CONFIG.bak" | cut -c1-10)" in
+  -rw-------) ok "the backup is 0600 too — it holds the old token" ;;
+  *) bad "the config backup is world-readable" ;;
+esac
+
 # 6) --sutando-workspace relay-only mode: launcher wired to the given
 #    workspace, NO worker exec, worker install skipped
 SWS="$TMP/sutando-ws"; mkdir -p "$SWS/tasks"
+# Clear what the worker-mode runs above left behind, so "relay-only writes no
+# config file" is a statement about this run rather than about the whole $HOME.
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
 out=$(PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token TESTTOK --sutando-workspace "$SWS" --no-start 2>&1) || {
   printf '%s\n' "$out" | sed 's/^/    /'; bad "sutando-mode dry-run exited non-zero"; }
 printf '%s\n' "$out" | grep -q "relay-only" && ok "sutando mode announces relay-only" || bad "sutando mode missing relay-only notice"
@@ -160,6 +165,19 @@ grep -q "$SWS/tasks" "$L" && ok "launcher wired to sutando tasks/" || bad "launc
 grep -q "$SWS/results" "$L" && ok "launcher wired to sutando results/" || bad "launcher missing sutando results dir"
 grep -q 'exec "'"$TMP"'/ag2-sparrow"' "$L" && ok "launcher execs the relay" || bad "launcher missing relay exec"
 if grep -q "agent-connect\"$" "$L"; then bad "sutando launcher must NOT exec a worker (double-processing)"; else ok "no worker exec in sutando launcher"; fi
+# Relay-only mode installs no worker, so nothing there could read a config file
+# and nothing writes a second parser to make one readable. The token lives in
+# the launcher, which is therefore private.
+[ -f "$TMP/.agent-connect/config.env" ] \
+  && bad "relay-only mode wrote a config file nothing can read" \
+  || ok "relay-only mode writes no config file"
+case "$(ls -l "$L" | cut -c1-10)" in
+  -rwx------) ok "and its launcher is 0700, because the token is in it" ;;
+  *) bad "relay-only launcher is $(ls -l "$L" | cut -c1-10), want -rwx------" ;;
+esac
+grep -q -- "--export-config" "$L" \
+  && bad "relay-only launcher calls a worker that is not installed" \
+  || ok "and does not call a worker that was never installed"
 # bogus workspace path is refused early
 if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --sutando-workspace "$TMP/nope" --no-start >/dev/null 2>&1; then
   bad "nonexistent --sutando-workspace should fail"; else ok "nonexistent --sutando-workspace → refused"; fi
@@ -229,7 +247,7 @@ chmod +x "$TMP/npm"
 NPM_LOG="$TMP/npm.log"; : > "$NPM_LOG"
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter acp --no-start 2>&1) || bad "acp dry-run failed"
-grep -q "^AGENT_CONNECT_ACP_AGENT=claude$" "$TMP/.agent-connect/config.env" \
+grep -q '^AGENT_CONNECT_ACP_AGENT="claude"$' "$TMP/.agent-connect/config.env" \
   && ok "the config file names the preset agent" || bad "config.env missing AGENT_CONNECT_ACP_AGENT"
 grep -q "install -g $SPEC" "$NPM_LOG" \
   && ok "installer installs the pinned bridge via npm" || {
@@ -240,7 +258,7 @@ printf '%s\n' "$out" | grep -q "never opens a terminal" \
 : > "$NPM_LOG"
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter acp --acp-agent gemini --no-start 2>&1) || bad "acp gemini dry-run failed"
-grep -q "^AGENT_CONNECT_ACP_AGENT=gemini$" "$TMP/.agent-connect/config.env" \
+grep -q '^AGENT_CONNECT_ACP_AGENT="gemini"$' "$TMP/.agent-connect/config.env" \
   && ok "--acp-agent selects the preset" || bad "--acp-agent not wired through"
 grep -q "claude-agent-acp" "$NPM_LOG" \
   && bad "the Claude bridge was installed for a non-Claude preset" \

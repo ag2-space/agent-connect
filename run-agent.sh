@@ -2,52 +2,35 @@
 # Launch your local agent as an AG2 Space agent: the AG2 relay client (pulls your
 # agent's tasks + posts results) + the agent-connect worker (runs the agent).
 #
-# Each of these may be exported, or written in the config file the worker reads
+# Settings — exported, or written in the config file the worker reads
 # (~/.agent-connect/config.env, or wherever AGENT_CONNECT_CONFIG points). An
-# exported value wins over the file.
+# exported value wins over the file, per setting.
 #
 #   AGENT_CONNECT_TOKEN    your agent's relay token (from the Agent Portal) [required]
 #   AGENT_CONNECT_ADAPTER  adapter, e.g. codex [required]
 #   AGENT_CONNECT_REPO     repo the agent works in [default: ~/agents]
 #   AGENT_CONNECT_WORKSPACE  task/result workspace [default: ~/.agent-connect/workspace]
+#
+# This script's own knobs. NOT settings, and deliberately not readable from the
+# config file: that file may set AGENT_CONNECT_*, REMOTE_TASK_* and OLLAMA_HOST
+# and nothing else, because a config file able to name a binary would be
+# choosing which program runs. Export these if you need them.
+#
 #   RELAY_BIN              ag2-sparrow console script [default: `command -v ag2-sparrow`;
 #                          `pip install ag2-sparrow` if you don't have it]
 #   RELAY_CLIENT           legacy: path to a file-based relay client — only used
 #                          when explicitly set (pre-PyPI installs)
 set -euo pipefail
 
-# Settings may be written down instead of exported: the same config file the
-# worker reads itself (README.md § The config file). Parsed, never sourced, and
-# the environment still wins — so `AGENT_CONNECT_ADAPTER=codex ./run-agent.sh`
-# means what it says. This is what ends the "source this first" ritual: the
-# relay client below gets its token from the same file the worker does.
-AGENT_CONNECT_CONFIG="${AGENT_CONNECT_CONFIG:-$HOME/.agent-connect/config.env}"
-export AGENT_CONNECT_CONFIG
-if [ -f "$AGENT_CONNECT_CONFIG" ]; then
-  while read -r _line || [ -n "$_line" ]; do
-    case "$_line" in ''|'#'*) continue ;; *=*) : ;; *) continue ;; esac
-    _key="${_line%%=*}"
-    _val="${_line#*=}"
-    # `KEY = value` is the same setting as `KEY=value`, exactly as it is to the
-    # worker's own parser; the two readers must not disagree about one file.
-    while :; do case "$_key" in *' '|*'	') _key="${_key%?}" ;; *) break ;; esac; done
-    while :; do case "$_val" in ' '*|'	'*) _val="${_val#?}" ;; *) break ;; esac; done
-    while :; do case "$_val" in *' '|*'	') _val="${_val%?}" ;; *) break ;; esac; done
-    case "$_key" in ''|*[!A-Za-z0-9_]*) continue ;; esac
-    # Settings, and nothing else. A config file able to set PATH would be
-    # choosing which `codex` binary runs; agent_connect/config.py refuses the
-    # same keys, for the same reason.
-    case "$_key" in AGENT_CONNECT_*|REMOTE_TASK_*|OLLAMA_HOST) : ;; *) continue ;; esac
-    case "$_val" in
-      '"'*'"') _val="${_val#?}"; _val="${_val%?}" ;;
-      "'"*"'") _val="${_val#?}"; _val="${_val%?}" ;;
-    esac
-    # The environment wins: only a variable that is unset or empty is filled in.
-    eval "_cur=\${$_key:-}"
-    [ -n "$_cur" ] || export "$_key=$_val"
-  done < "$AGENT_CONNECT_CONFIG"
-fi
-
+# Settings may be written down instead of exported: the config file the worker
+# reads itself (README.md § The config file). This asks the worker for it rather
+# than parsing it here — one parser, so the relay client below and the worker
+# cannot end up disagreeing about what the file says. The environment still
+# wins, per setting, and that decision is made in there too.
+export AGENT_CONNECT_CONFIG="${AGENT_CONNECT_CONFIG:-$HOME/.agent-connect/config.env}"
+_cfg="$(python3 -m agent_connect --export-config)" || exit 1
+eval "$_cfg"
+unset _cfg
 : "${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN — export it, or write it in $AGENT_CONNECT_CONFIG}"
 : "${AGENT_CONNECT_ADAPTER:?set AGENT_CONNECT_ADAPTER (e.g. codex)}"
 export AGENT_CONNECT_WORKSPACE="${AGENT_CONNECT_WORKSPACE:-$HOME/.agent-connect/workspace}"
