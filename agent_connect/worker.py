@@ -23,10 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
+from typing import List, Optional
 
 from .adapters import get as get_adapter
 from .attachments import parse as parse_attachments
+from .config import CONFIG_ENV, DEFAULT_PATH, ConfigError
+from .config import load as load_config
 from .events import TurnContext
 from .outgoing import Outbox
 from .pending import queue_for
@@ -320,10 +324,57 @@ def preflight(adapter) -> None:
         print(f"agent-connect: {describe()}")
 
 
-def main() -> None:
+USAGE = f"""usage: agent-connect [--config PATH]
+
+Runs your local agent against the Tasks the relay client pulls for one Agent
+Identity. Everything it reads is a setting, documented in README.md § Settings,
+and every setting can be given in the environment or in a config file.
+
+  --config PATH   the config file to read. Default: {CONFIG_ENV} if it is set,
+                  otherwise {DEFAULT_PATH} if it exists. Environment variables
+                  win over the file.
+"""
+
+
+def config_flag(argv: List[str]) -> Optional[str]:
+    """The `--config` path from a command line, or `None`.
+
+    The Worker's whole command line, deliberately: a flag per setting would be a
+    third place for a setting to live, and there are already two too many.
+    """
+    args = list(argv)
+    path = None
+    while args:
+        arg = args.pop(0)
+        if arg in ("-h", "--help"):
+            print(USAGE)
+            raise SystemExit(0)
+        if arg == "--config":
+            if not args:
+                raise SystemExit("agent-connect: --config needs a path")
+            path = args.pop(0)
+        elif arg.startswith("--config="):
+            path = arg.partition("=")[2]
+        else:
+            raise SystemExit(f"agent-connect: unknown argument {arg!r}\n\n{USAGE}")
+    return path
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    # The config file first, so that everything below — and every setting an
+    # Adapter reads for itself — sees the same environment whether the operator
+    # exported it or wrote it down. What the environment already says is never
+    # overwritten; see `agent_connect.config`.
+    try:
+        load_config(config_flag(sys.argv[1:] if argv is None else list(argv)))
+    except ConfigError as exc:
+        raise SystemExit(f"agent-connect: {exc}")
     adapter_name = os.environ.get("AGENT_CONNECT_ADAPTER")
     if not adapter_name:
-        raise SystemExit("set AGENT_CONNECT_ADAPTER (e.g. codex)")
+        raise SystemExit(
+            "set AGENT_CONNECT_ADAPTER (e.g. codex) — in the environment, or in "
+            "a config file (--config PATH; see README.md § Settings)"
+        )
     adapter = get_adapter(adapter_name)
     preflight(adapter)
     repo = str(_resolve_repo())

@@ -49,6 +49,29 @@ else
   printf '%s\n' "${out:-}" | sed 's/^/    /'; bad "--no-start missing expected output"
 fi
 
+# 4b) the config file: every setting in one 0600 file, and the launcher reads it
+CONFIG="$TMP/.agent-connect/config.env"
+if [ -f "$CONFIG" ]; then ok "config.env written"; else bad "config.env missing"; fi
+if [ -f "$CONFIG" ]; then
+  MODE="$(ls -l "$CONFIG" | cut -c1-10)"
+  case "$MODE" in
+    -rw-------) ok "config.env is 0600 (it holds the bearer token)" ;;
+    *) bad "config.env is $MODE, want -rw------- : the token would be world-readable" ;;
+  esac
+  grep -q "^AGENT_CONNECT_TOKEN=TESTTOK$" "$CONFIG" && ok "config.env carries the token" \
+    || bad "config.env missing the token"
+  grep -q "^AGENT_CONNECT_ADAPTER=omnigent$" "$CONFIG" && ok "config.env carries the adapter" \
+    || bad "config.env missing the adapter"
+  grep -q "^AGENT_CONNECT_REPO=" "$CONFIG" && ok "config.env carries the working directory" \
+    || bad "config.env missing the working directory"
+fi
+printf '%s\n' "${out:-}" | grep -q "AGENT_CONNECT_CONFIG=$CONFIG" \
+  && ok "the run command names the config file, not a token" \
+  || bad "run command does not point at the config file"
+printf '%s\n' "${out:-}" | grep -q "TESTTOK" \
+  && bad "the run command still prints the bearer token" \
+  || ok "and prints no bearer token at all"
+
 # 5) launcher written, executable, and wired correctly
 LAUNCHER="$TMP/.agent-connect/launch.sh"
 if [ -x "$LAUNCHER" ]; then ok "launch.sh written + executable"; else bad "launch.sh missing"; fi
@@ -63,7 +86,67 @@ if [ -f "$LAUNCHER" ]; then
   grep -q "$TMP/agent-connect" "$LAUNCHER" && ok "worker bin interpolated" || bad "worker bin not interpolated"
   # the launcher must start BOTH processes: relay in background, worker via exec
   grep -q 'exec "' "$LAUNCHER" && ok "launcher execs the worker" || bad "launcher missing worker exec"
+  # it reads the same config file the worker does, so nothing has to be exported
+  grep -q "AGENT_CONNECT_CONFIG:-$CONFIG" "$LAUNCHER" \
+    && ok "launch.sh defaults to the installed config file" \
+    || bad "launch.sh does not read the config file"
+  grep -q "TESTTOK" "$LAUNCHER" && bad "the token was baked into launch.sh" \
+    || ok "and holds no token of its own"
 fi
+
+# 5a) the launcher's config reader, run: it must agree with the worker's own
+#     parser about one file, or the relay and the worker disagree about the token.
+LOADER="$TMP/loader.sh"
+sed -n '/^export AGENT_CONNECT_CONFIG$/,/^fi$/p' "$LAUNCHER" > "$LOADER"
+cat > "$TMP/loader.env" <<'CFG'
+# a comment
+AGENT_CONNECT_TOKEN=tok-from-the-file
+  AGENT_CONNECT_REPO = "/a path/with spaces"
+AGENT_CONNECT_ACP_COMMAND=my-agent --acp --flag=1
+LD_PRELOAD=/tmp/evil.so
+prose that is not a setting
+CFG
+LOADED="$(AGENT_CONNECT_CONFIG="$TMP/loader.env" AGENT_CONNECT_TOKEN=from-the-env sh -c '
+  . "$1"
+  echo "TOKEN=$AGENT_CONNECT_TOKEN"
+  echo "REPO=$AGENT_CONNECT_REPO"
+  echo "CMD=$AGENT_CONNECT_ACP_COMMAND"
+  echo "PRELOAD=${LD_PRELOAD:-<unset>}"' sh "$LOADER")"
+printf '%s\n' "$LOADED" | grep -q '^TOKEN=from-the-env$' \
+  && ok "launcher: the environment wins over the config file" \
+  || { printf '%s\n' "$LOADED" | sed 's/^/    /'; bad "launcher: the file overrode the environment"; }
+printf '%s\n' "$LOADED" | grep -q '^REPO=/a path/with spaces$' \
+  && ok "launcher: spaces and quotes are read the way the worker reads them" \
+  || bad "launcher: quoted/spaced value not parsed like the worker's parser"
+printf '%s\n' "$LOADED" | grep -q '^CMD=my-agent --acp --flag=1$' \
+  && ok "launcher: everything after the first = is the value" \
+  || bad "launcher: value truncated at a second ="
+printf '%s\n' "$LOADED" | grep -q '^PRELOAD=<unset>$' \
+  && ok "launcher: a config file cannot set a non-setting (LD_PRELOAD)" \
+  || bad "launcher: the config file set a variable that is not a setting"
+
+# 5b) the service definitions carry a path, never a bearer token — the whole
+#     point of the config file, since a launchd plist is world-readable. Read
+#     out of install.sh rather than produced: writing a real plist means
+#     `launchctl load`, and these tests do not touch the machine they run on.
+PLIST_BLOCK="$(sed -n '/<key>EnvironmentVariables<\/key>/,/<\/dict>/p' "$SCRIPT")"
+case "$PLIST_BLOCK" in
+  *AGENT_CONNECT_CONFIG*) ok "the launchd plist passes AGENT_CONNECT_CONFIG" ;;
+  *) bad "the launchd plist does not point at the config file" ;;
+esac
+case "$PLIST_BLOCK" in
+  *TOKEN*) bad "the launchd plist still carries the bearer token" ;;
+  *) ok "and carries no token (a plist is world-readable by default)" ;;
+esac
+UNIT_BLOCK="$(sed -n '/^\[Service\]/,/^ExecStart=/p' "$SCRIPT")"
+case "$UNIT_BLOCK" in
+  *AGENT_CONNECT_CONFIG*) ok "the systemd unit passes AGENT_CONNECT_CONFIG" ;;
+  *) bad "the systemd unit does not point at the config file" ;;
+esac
+case "$UNIT_BLOCK" in
+  *TOKEN*) bad "the systemd unit still carries the bearer token" ;;
+  *) ok "and carries no token either" ;;
+esac
 
 # 6) --sutando-workspace relay-only mode: launcher wired to the given
 #    workspace, NO worker exec, worker install skipped
@@ -146,8 +229,8 @@ chmod +x "$TMP/npm"
 NPM_LOG="$TMP/npm.log"; : > "$NPM_LOG"
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter acp --no-start 2>&1) || bad "acp dry-run failed"
-printf '%s\n' "$out" | grep -q "AGENT_CONNECT_ACP_AGENT=claude" \
-  && ok "acp run command names the preset agent" || bad "acp run command missing AGENT_CONNECT_ACP_AGENT"
+grep -q "^AGENT_CONNECT_ACP_AGENT=claude$" "$TMP/.agent-connect/config.env" \
+  && ok "the config file names the preset agent" || bad "config.env missing AGENT_CONNECT_ACP_AGENT"
 grep -q "install -g $SPEC" "$NPM_LOG" \
   && ok "installer installs the pinned bridge via npm" || {
     sed 's/^/    /' "$NPM_LOG"; bad "npm was not asked for the pinned bridge"; }
@@ -157,7 +240,7 @@ printf '%s\n' "$out" | grep -q "never opens a terminal" \
 : > "$NPM_LOG"
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter acp --acp-agent gemini --no-start 2>&1) || bad "acp gemini dry-run failed"
-printf '%s\n' "$out" | grep -q "AGENT_CONNECT_ACP_AGENT=gemini" \
+grep -q "^AGENT_CONNECT_ACP_AGENT=gemini$" "$TMP/.agent-connect/config.env" \
   && ok "--acp-agent selects the preset" || bad "--acp-agent not wired through"
 grep -q "claude-agent-acp" "$NPM_LOG" \
   && bad "the Claude bridge was installed for a non-Claude preset" \

@@ -2,6 +2,10 @@
 # Launch your local agent as an AG2 Space agent: the AG2 relay client (pulls your
 # agent's tasks + posts results) + the agent-connect worker (runs the agent).
 #
+# Each of these may be exported, or written in the config file the worker reads
+# (~/.agent-connect/config.env, or wherever AGENT_CONNECT_CONFIG points). An
+# exported value wins over the file.
+#
 #   AGENT_CONNECT_TOKEN    your agent's relay token (from the Agent Portal) [required]
 #   AGENT_CONNECT_ADAPTER  adapter, e.g. codex [required]
 #   AGENT_CONNECT_REPO     repo the agent works in [default: ~/agents]
@@ -11,7 +15,40 @@
 #   RELAY_CLIENT           legacy: path to a file-based relay client — only used
 #                          when explicitly set (pre-PyPI installs)
 set -euo pipefail
-: "${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN (from the Agent Portal)}"
+
+# Settings may be written down instead of exported: the same config file the
+# worker reads itself (README.md § The config file). Parsed, never sourced, and
+# the environment still wins — so `AGENT_CONNECT_ADAPTER=codex ./run-agent.sh`
+# means what it says. This is what ends the "source this first" ritual: the
+# relay client below gets its token from the same file the worker does.
+AGENT_CONNECT_CONFIG="${AGENT_CONNECT_CONFIG:-$HOME/.agent-connect/config.env}"
+export AGENT_CONNECT_CONFIG
+if [ -f "$AGENT_CONNECT_CONFIG" ]; then
+  while read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|'#'*) continue ;; *=*) : ;; *) continue ;; esac
+    _key="${_line%%=*}"
+    _val="${_line#*=}"
+    # `KEY = value` is the same setting as `KEY=value`, exactly as it is to the
+    # worker's own parser; the two readers must not disagree about one file.
+    while :; do case "$_key" in *' '|*'	') _key="${_key%?}" ;; *) break ;; esac; done
+    while :; do case "$_val" in ' '*|'	'*) _val="${_val#?}" ;; *) break ;; esac; done
+    while :; do case "$_val" in *' '|*'	') _val="${_val%?}" ;; *) break ;; esac; done
+    case "$_key" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    # Settings, and nothing else. A config file able to set PATH would be
+    # choosing which `codex` binary runs; agent_connect/config.py refuses the
+    # same keys, for the same reason.
+    case "$_key" in AGENT_CONNECT_*|REMOTE_TASK_*|OLLAMA_HOST) : ;; *) continue ;; esac
+    case "$_val" in
+      '"'*'"') _val="${_val#?}"; _val="${_val%?}" ;;
+      "'"*"'") _val="${_val#?}"; _val="${_val%?}" ;;
+    esac
+    # The environment wins: only a variable that is unset or empty is filled in.
+    eval "_cur=\${$_key:-}"
+    [ -n "$_cur" ] || export "$_key=$_val"
+  done < "$AGENT_CONNECT_CONFIG"
+fi
+
+: "${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN — export it, or write it in $AGENT_CONNECT_CONFIG}"
 : "${AGENT_CONNECT_ADAPTER:?set AGENT_CONNECT_ADAPTER (e.g. codex)}"
 export AGENT_CONNECT_WORKSPACE="${AGENT_CONNECT_WORKSPACE:-$HOME/.agent-connect/workspace}"
 mkdir -p "$AGENT_CONNECT_WORKSPACE/tasks" "$AGENT_CONNECT_WORKSPACE/results" \

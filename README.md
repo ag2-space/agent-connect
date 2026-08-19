@@ -261,6 +261,69 @@ its working directory can then send the copy. The permitted area is a boundary o
 paths, not a proof about contents — closing that needs a sandbox that refuses the
 first copy.
 
+## The config file: settings written down, not exported
+
+Everything below is an environment variable, which is a fine interface for a
+shell and a poor one for a service. So the same keys can be written in a file
+instead, and the worker reads it itself:
+
+```bash
+install -m 600 /dev/null ~/.agent-connect/config.env
+cat > ~/.agent-connect/config.env <<'EOF'
+AGENT_CONNECT_TOKEN=<token from the portal>
+AGENT_CONNECT_ADAPTER=acp
+AGENT_CONNECT_ACP_AGENT=claude
+AGENT_CONNECT_REPO=/Users/me/agents
+EOF
+agent-connect
+```
+
+**The keys are the ones in the Settings table below** — the same names, no
+translation, nothing to learn twice. `KEY=value`, one per line, `#` comments,
+everything after the first `=` taken verbatim (one matching pair of surrounding
+quotes is removed, and that is the whole of the syntax). It is **not** a shell
+script and is never evaluated as one, so the launcher and the worker read the
+same file and agree about what it says.
+
+**Where it looks**, in order: `--config <path>` on the command line, then
+`AGENT_CONNECT_CONFIG`, then `~/.agent-connect/config.env` if it exists. The
+flag exists so a start needs no environment at all; the variable exists so a
+service unit can point at a file without putting anything else on a command
+line. A file you *named* and that is not there stops the worker — it holds the
+token, and starting without it gives you a worker that runs, pulls nothing and
+looks healthy.
+
+**Environment variables win over the file.** A setting already exported is left
+exactly as it is, per setting, and the worker says which ones the file offered
+and did not get:
+
+```
+agent-connect: config /Users/me/.agent-connect/config.env — 4 setting(s) applied,
+  1 already set in the environment (AGENT_CONNECT_ADAPTER) and left alone
+```
+
+That direction is the only one that makes `AGENT_CONNECT_ADAPTER=codex
+agent-connect` mean what it says. A config file is a default that persists, not
+an authority that overrules the shell you are standing in.
+
+**It may set settings and nothing else.** Only `AGENT_CONNECT_*`,
+`REMOTE_TASK_*` and `OLLAMA_HOST` are applied; any other key is named on stderr
+and ignored, because a file that could set `PATH` would be deciding which
+`codex` binary runs. A misspelt setting is named for the same reason: it looks
+exactly like a setting that did not work.
+
+**It holds your agent's token, so keep it to yourself.** The installer writes it
+`0600`. A file others can read is still loaded — refusing would break a working
+install over a warning's worth of problem — and complained about at every start,
+with the `chmod` that fixes it.
+
+**This is what the installer now does.** `install.sh` writes your token, adapter
+and working directory into that file and points the launchd plist (or systemd
+unit) at it with `AGENT_CONNECT_CONFIG`, so **the service definition carries no
+bearer token** — it used to sit in plaintext in
+`~/Library/LaunchAgents/space.ag2.agent-connect.plist`, which is world-readable
+by default.
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**
@@ -270,6 +333,7 @@ table.
 
 | Setting | What it does | Default |
 | --- | --- | --- |
+| `AGENT_CONNECT_CONFIG` | the config file to read (see the section above). The `--config` flag wins over it | `~/.agent-connect/config.env`, if it exists |
 | `AGENT_CONNECT_TOKEN` | your agent identity's relay token, from the Agent Portal | *(required)* |
 | `AGENT_CONNECT_ADAPTER` | which adapter runs the task: `codex`, `ollama`, `omnigent`, `cline`, `kilo`, `acp` | *(required)* |
 | `AGENT_CONNECT_REPO` | the working directory the agent operates in. Created for you when it is the default; a path under `~/Documents`, `~/Desktop` or `~/Downloads` is warned about, because macOS privacy protection turns agent file operations there into an unexplained "operation not permitted" | `~/agents` |
