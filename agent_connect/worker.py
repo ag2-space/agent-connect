@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
+import sys
 from pathlib import Path
+from typing import Optional
 
 from .adapters import get as get_adapter
 from .attachments import parse as parse_attachments
@@ -34,6 +37,7 @@ from .reporter import LadderSettings, TurnReporter
 from .roomops import room_ops_from_env
 from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
 from .sessions import workspace_dir
+from .status import StatusFile, from_env as status_from_env
 
 
 def _ws() -> Path:
@@ -242,8 +246,16 @@ async def serve(
     poll: float,
     ops=None,
     settings=None,
+    status: Optional[StatusFile] = None,
 ) -> None:
-    """Scan for Tasks forever, starting each one without waiting for the last."""
+    """Scan for Tasks forever, starting each one without waiting for the last.
+
+    `status` — when given — is beaten once per scan. That is the freshness an
+    outside observer reads: this loop turning is the definition of a Worker that
+    is still serving, so it is the thing that has to be visible from outside.
+    The `StatusFile` throttles the writing; this loop does not have to know how
+    often it spins.
+    """
     seen: set = set()
     sessions: dict = {}
     running: set = set()
@@ -257,10 +269,12 @@ async def serve(
             )
             running.add(fut)
             fut.add_done_callback(running.discard)
+        if status is not None:
+            status.beat(tasks_running=len(running))
         await asyncio.sleep(poll)
 
 
-def preflight(adapter) -> None:
+def preflight(adapter) -> str:
     """Stop here, not in a room, if the Adapter cannot serve.
 
     An Adapter may offer `preflight()` — a coroutine returning `None` when it is
@@ -270,40 +284,81 @@ def preflight(adapter) -> None:
     where they expected an answer, hours after the operator walked away.
 
     Adapters without one start as they always did.
+
+    Returns the Adapter's own one-line description of what it found, for the
+    startup log and for the status file — "what is actually running behind this
+    identity" is the first question anyone watching a Worker asks.
     """
     check = getattr(adapter, "preflight", None)
     if check is None:
-        return
+        return ""
     problem = asyncio.run(check())
     if problem:
         raise SystemExit(f"agent-connect: {problem}")
     describe = getattr(adapter, "describe", None)
-    if describe is not None:
-        print(f"agent-connect: {describe()}")
+    if describe is None:
+        return ""
+    found = describe()
+    print(f"agent-connect: {found}")
+    return found
 
 
 def main() -> None:
-    adapter_name = os.environ.get("AGENT_CONNECT_ADAPTER")
-    if not adapter_name:
-        raise SystemExit("set AGENT_CONNECT_ADAPTER (e.g. codex)")
-    adapter = get_adapter(adapter_name)
-    preflight(adapter)
-    repo = os.environ.get("AGENT_CONNECT_REPO") or os.getcwd()
-    poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
-
     ws = _ws()
-    tasks_dir = ws / "tasks"
-    results_dir = ws / "results"
-    tasks_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    # The status file is opened before anything else can fail, so that a Worker
+    # which dies in preflight has still said, at the documented path, that it
+    # tried and why it stopped. See `agent_connect.status`.
+    status = status_from_env()
+    status.starting(workspace=str(ws))
+    # A service manager stops a Worker with SIGTERM, and the default disposition
+    # is death without a word — which an observer could only read as staleness,
+    # a minute later. Turning it into an ordinary exit lets the `finally` below
+    # write "stopped" while the observer is still watching.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        adapter_name = os.environ.get("AGENT_CONNECT_ADAPTER")
+        if not adapter_name:
+            raise SystemExit("set AGENT_CONNECT_ADAPTER (e.g. codex)")
+        try:
+            adapter = get_adapter(adapter_name)
+        except KeyError as exc:
+            raise SystemExit(f"agent-connect: {exc}")
+        status.starting(adapter=adapter_name)
+        agent = preflight(adapter)
+        repo = os.environ.get("AGENT_CONNECT_REPO") or os.getcwd()
+        poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
 
-    # The Ladder, if this Worker holds a relay token: the placeholder and its
-    # edits are Room Ops, and without a token there is nobody to ask for one.
-    ops = room_ops_from_env()
-    settings = LadderSettings.from_env()
+        tasks_dir = ws / "tasks"
+        results_dir = ws / "results"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"agent-connect worker: adapter={adapter_name} repo={repo} ws={ws}")
-    asyncio.run(serve(adapter, repo, results_dir, tasks_dir, poll, ops, settings))
+        # The Ladder, if this Worker holds a relay token: the placeholder and its
+        # edits are Room Ops, and without a token there is nobody to ask for one.
+        ops = room_ops_from_env()
+        settings = LadderSettings.from_env()
+
+        detail = f"adapter={adapter_name} repo={repo} ws={ws}"
+        print(f"agent-connect worker: {detail}")
+        status.serving(detail=detail, agent=agent, repo=repo, tasks_running=0)
+        asyncio.run(
+            serve(adapter, repo, results_dir, tasks_dir, poll, ops, settings, status)
+        )
+    except KeyboardInterrupt:
+        status.stopped("interrupted")
+        raise
+    except SystemExit as exc:
+        # `SystemExit(0)` is the SIGTERM above and an ordinary `--help`-shaped
+        # exit; anything with a code is a refusal to start, and the sentence the
+        # operator has to act on is exactly what an observer needs too.
+        if exc.code:
+            status.failed(str(exc.code))
+        else:
+            status.stopped("terminated")
+        raise
+    except BaseException as exc:  # noqa: BLE001 — report, then die as before
+        status.failed(f"{type(exc).__name__}: {exc}")
+        raise
 
 
 if __name__ == "__main__":

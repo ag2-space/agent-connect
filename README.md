@@ -261,6 +261,55 @@ its working directory can then send the copy. The permitted area is a boundary o
 paths, not a proof about contents — closing that needs a sandbox that refuses the
 first copy.
 
+## The status file: what the worker says about itself
+
+**Path:** `<workspace>/status.json` — by default
+`~/.agent-connect/workspace/status.json`, or wherever `AGENT_CONNECT_STATUS_FILE`
+says. This is part of the service contract: anything watching a worker (the
+desktop app's badge first, `cat` second) reads that file and needs to know
+nothing about the transport underneath.
+
+```json
+{
+  "version": 1,
+  "state": "serving",
+  "detail": "adapter=acp repo=/Users/me/agents ws=/Users/me/.agent-connect/workspace",
+  "pid": 4711,
+  "adapter": "acp",
+  "agent": "acp: Claude Code 2.1.0",
+  "repo": "/Users/me/agents",
+  "workspace": "/Users/me/.agent-connect/workspace",
+  "tasks_running": 0,
+  "started_at": 1755600000.0,
+  "updated_at": 1755600123.0,
+  "heartbeat_seconds": 15.0,
+  "last_error": null
+}
+```
+
+**Four states, and that is all of them:** `starting` (the file exists before
+anything can go wrong, so a worker that dies in preflight still leaves the
+reason), `serving`, `stopped` (it was asked to stop, and said so), and `error`
+— which carries the sentence the operator has to act on, in `detail` and in
+`last_error`.
+
+**Is it alive?** Compare the clocks: a worker is **stale** when
+`now - updated_at > 3 x heartbeat_seconds`. `updated_at` is refreshed at least
+every `heartbeat_seconds` while the worker is serving, and the file states that
+interval itself so a reader needs nothing out of band. Three intervals of slack
+is deliberate — one missed write is a busy machine, three is nobody home. A
+`kill -9`, a panic, a closed laptop lid: none of them get to write "stopped",
+and all of them show up as staleness. A worker that stops on purpose says so,
+so the ordinary case is not something anyone has to wait out.
+
+**Fields you do not recognise are not errors.** `version` goes up only for a
+change a reader could not survive; ignore what you do not know.
+
+Writes are atomic (write beside, rename over), so a reader never catches half a
+document. A status file that cannot be written is complained about once, on
+stderr, and never fails a task — an observer falls back on staleness, which is
+what it has for the `kill -9` case anyway.
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**
@@ -274,6 +323,8 @@ table.
 | `AGENT_CONNECT_ADAPTER` | which adapter runs the task: `codex`, `ollama`, `omnigent`, `cline`, `kilo`, `acp` | *(required)* |
 | `AGENT_CONNECT_REPO` | the working directory the agent operates in | cwd (installer: `~/agents`) |
 | `AGENT_CONNECT_WORKSPACE` | workspace dir holding `tasks/` + `results/` | `~/.agent-connect/workspace` |
+| `AGENT_CONNECT_STATUS_FILE` | the status file this worker owns (see the section above) | `<workspace>/status.json` |
+| `AGENT_CONNECT_STATUS_HEARTBEAT` | seconds between refreshes of the status file's `updated_at`, and the staleness window an observer reads out of it | `15.0` |
 | `AGENT_CONNECT_POLL` | seconds between scans for new tasks | `1.0` |
 | `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` | how much of one attached file is read into a prompt. An attachment over this is reported in the room, never shrunk to fit. `0` means no limit | `10485760` (10 MB) |
 | `AGENT_CONNECT_OUTGOING_MAX_BYTES` | how large a file the agent produced may be and still be sent to the room. The relay refuses more than this anyway; refusing it here means a sentence in the room instead of a log line. `0` means no limit | `26214400` (25 MB) |
