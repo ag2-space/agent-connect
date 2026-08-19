@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
+import asyncio
 import json
 import os
 import signal
@@ -33,12 +34,15 @@ from agent_connect.status import (
     SERVING,
     STALE_AFTER,
     STARTING,
+    STATES,
     STOPPED,
     StatusFile,
     heartbeat_seconds,
+    instance_name,
     is_stale,
     status_path,
 )
+from agent_connect.worker import _preflight
 
 ROOT = _bootstrap.ROOT
 
@@ -59,7 +63,8 @@ _runs = 0
 class Worker:
     """A real Worker process, and the status file it left behind."""
 
-    def __init__(self, adapter="ollama", heartbeat="0.2", status=None, **env):
+    def __init__(self, adapter="ollama", heartbeat="0.2", status=None,
+                 script=None, **env):
         global _runs
         _runs += 1
         self.dir = tmp / f"run-{_runs}"
@@ -82,9 +87,11 @@ class Worker:
             child["AGENT_CONNECT_STATUS_FILE"] = str(status)
         child.update(env)
         self._sink = open(self.log, "w")
+        argv = ([sys.executable, "-c", script] if script
+                else [sys.executable, "-m", "agent_connect"])
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "agent_connect"],
-            cwd=str(ROOT), env=child, stdout=self._sink, stderr=subprocess.STDOUT,
+            argv, cwd=str(ROOT), env=child,
+            stdout=self._sink, stderr=subprocess.STDOUT,
         )
 
     def doc(self):
@@ -226,19 +233,111 @@ check(True, "a status file that cannot be written raises nothing at all — an "
 path = tmp / "beat" / "status.json"
 status = StatusFile(path, heartbeat=10.0, clock=lambda: clock[0])
 status.serving(detail="one")
-written = json.loads(path.read_text())["updated_at"]
 clock[0] += 1.0
-status.beat(tasks_running=3)
-check(json.loads(path.read_text())["updated_at"] == written,
-      "a beat inside the heartbeat window does not rewrite the file — the serve "
-      "loop spins far more often than anything needs to read it")
-clock[0] += 20.0
 status.beat(tasks_running=3)
 after = json.loads(path.read_text())
 check(after["updated_at"] == clock[0] and after["tasks_running"] == 3,
-      "and a beat past it writes, carrying whatever changed in the meantime")
+      "a beat always writes — its whole job is that saying nothing means "
+      "something, and a beat that declined to write would break that promise")
 check(after["detail"] == "one" and after["state"] == SERVING,
-      "without restating — or losing — the facts that did not change")
+      "carrying what changed, without restating — or losing — what did not")
+
+try:
+    status._write("busy")
+    refused = False
+except ValueError:
+    refused = True
+check(refused,
+      "a state outside the four is refused: a reader switches on this value, "
+      "and 'the states, and the whole of them' has to stay true")
+check(STATES == {STARTING, SERVING, STOPPED, ERROR}, "and there are four of them")
+
+
+print("\n-- freshness is nobody else's setting to defeat --")
+
+# The heartbeat was briefly beaten by the Task-scanning loop, which made a slow
+# AGENT_CONNECT_POLL able to make a healthy Worker look dead.
+worker = Worker(heartbeat="0.2", **{"AGENT_CONNECT_POLL": "30"})
+doc = worker.wait_for(SERVING)
+first = doc["updated_at"]
+time.sleep(1.0)
+later = worker.doc()
+check(later["updated_at"] > first,
+      "a Worker whose Task scan runs every 30s with a 0.2s heartbeat is still "
+      "fresh — no other setting paces this one")
+check(not is_stale(later), "and therefore not stale, which is the point")
+check(later["uptime_seconds"] > doc["uptime_seconds"],
+      "and a monotonic uptime advances beside the wall clock, so a clock that "
+      "steps backwards is something a reader can notice")
+check("tasks_running" in later and "oldest_task_seconds" in later,
+      "the beat carries what only the serve loop knows: how much work is in "
+      "flight, and how long the oldest piece of it has been running")
+worker.stop()
+
+# The gap between `starting` and `serving` is a real wait — an ACP bridge can
+# take most of a minute to answer `initialize` — and it must not read as death.
+beats = tmp / "preflight" / "status.json"
+status = StatusFile(beats, heartbeat=0.2)
+status.starting()
+began = json.loads(beats.read_text())["updated_at"]
+
+
+async def slow_check():
+    await asyncio.sleep(0.8)
+    return None
+
+
+asyncio.run(_preflight(lambda: slow_check(), status))
+check(json.loads(beats.read_text())["updated_at"] > began,
+      "the file keeps beating while the Adapter's preflight runs: a Worker that "
+      "is starting slowly is not a Worker that has died")
+check(json.loads(beats.read_text())["state"] == STARTING,
+      "and it is still `starting` — beating says nothing new about the state")
+
+
+print("\n-- N workers, N files, and something to tell them apart --")
+
+worker = Worker(**{"AGENT_CONNECT_INSTANCE": "scratch"})
+doc = worker.wait_for(SERVING)
+check(doc.get("instance") == "scratch",
+      "AGENT_CONNECT_INSTANCE is carried into the file, so a supervisor can "
+      "match N status files to its own N rows without recognising a path")
+worker.stop()
+check(instance_name({}) == "" and instance_name({"AGENT_CONNECT_INSTANCE": " a "}) == "a",
+      "and it is just a name — unset is empty, not an error")
+
+
+print("\n-- an ending that is a number is not an explanation --")
+
+BOOM = """
+import sys
+from agent_connect import adapters, worker
+
+
+class Boom:
+    async def preflight(self):
+        sys.exit(3)
+
+    async def turn(self, ctx):        # speaks the event contract, so it is
+        yield None                    # selected unwrapped and its preflight runs
+
+
+adapters.ADAPTERS["boom"] = Boom()
+worker.main()
+"""
+worker = Worker(adapter="boom", script=BOOM)
+doc = worker.wait_for(ERROR)
+check(doc.get("state") == ERROR and doc.get("detail") == "exited with status 3",
+      "`sys.exit(3)` is recorded as an exit status in words — writing `3` into "
+      "the field an operator reads for the reason explains nothing")
+worker.stop()
+
+worker = Worker(**{"AGENT_CONNECT_POLL": "not-a-number"})
+doc = worker.wait_for(ERROR)
+check(doc.get("state") == ERROR and "ValueError" in (doc.get("detail") or ""),
+      "and a failure nobody anticipated is recorded with its type and message, "
+      "rather than leaving the file saying `starting` for ever")
+worker.stop()
 
 print("\n" + ("PASS — the status file green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)
