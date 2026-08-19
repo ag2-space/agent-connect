@@ -15,7 +15,10 @@ import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 import contextlib
 import io
 import os
+import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -76,6 +79,40 @@ with tempfile.TemporaryDirectory() as tmp:
 
     resolved, said = resolve(repo=home / "agents", home=home)
     check("WARNING" not in said, "a directory outside those folders warns about nothing")
+
+# --- and the entry point actually uses it -----------------------------------
+# `_resolve_repo` being right is worth nothing if `main()` stops calling it, and
+# that is a live risk rather than a hypothetical: this default arrived on a
+# branch that rewrote `main()`, and so did the status file, so a careless merge
+# of the two silently restores the old `os.getcwd()` line. Every assertion above
+# would still pass. This one would not.
+
+with tempfile.TemporaryDirectory() as home:
+    log = Path(home) / "out.log"
+    child = {"PATH": os.environ.get("PATH", ""), "HOME": home,
+             "PYTHONUNBUFFERED": "1",
+             "AGENT_CONNECT_ADAPTER": "ollama",
+             "AGENT_CONNECT_WORKSPACE": str(Path(home) / "ws"),
+             "AGENT_CONNECT_POLL": "0.05"}
+    with open(log, "w") as sink:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "agent_connect"],
+            cwd=str(_bootstrap.ROOT), env=child,
+            stdout=sink, stderr=subprocess.STDOUT,
+        )
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if "agent-connect worker:" in log.read_text() or proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=20)
+    said = log.read_text()
+    check(f"repo={home}/agents" in said,
+          "a Worker started with no AGENT_CONNECT_REPO works in ~/agents — the "
+          "entry point uses the default, not just the function that computes it")
+    check("defaulting repo to" in said, "and says so where an operator will see it")
 
 print("\n" + ("PASS — the agent's working directory green" if fails == 0
               else f"FAIL — {fails} failing"))
