@@ -1,0 +1,82 @@
+"""Where the agent works when nobody said: `~/agents`, and a warning if not.
+
+Regression for the pwd-default friction (owner-caught): defaulting the agent's
+working directory to the launch cwd put it under a macOS TCC-protected location
+(e.g. `~/Documents`), producing opaque file-access failures — the agent is told
+it may write and then is not allowed to. The fix defaults to a dedicated
+`~/agents` and warns loudly when the resolved directory is protected anyway.
+
+Run: python3 tests/test_worker_repo.py   (no dependencies)
+"""
+from __future__ import annotations
+
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
+
+import contextlib
+import io
+import os
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+from agent_connect.worker import _resolve_repo
+
+fails = 0
+
+
+def check(cond, name):
+    global fails
+    print(("  ok   " if cond else "  FAIL ") + name)
+    if not cond:
+        fails += 1
+
+
+@contextlib.contextmanager
+def home_at(path: Path):
+    """Run with `Path.home()` somewhere disposable, so nothing real is created."""
+    with mock.patch.object(Path, "home", staticmethod(lambda: path)):
+        yield
+
+
+def resolve(repo=None, home=None):
+    """`_resolve_repo`, with what it printed. Both are what an operator sees."""
+    env = {} if repo is None else {"AGENT_CONNECT_REPO": str(repo)}
+    with mock.patch.dict(os.environ, env, clear=False):
+        if repo is None:
+            os.environ.pop("AGENT_CONNECT_REPO", None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with home_at(home) if home else contextlib.nullcontext():
+                resolved = _resolve_repo()
+    return resolved, buf.getvalue()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    home = Path(tmp)
+
+    with tempfile.TemporaryDirectory() as explicit:
+        resolved, said = resolve(repo=explicit)
+        check(str(resolved) == explicit,
+              "an explicit AGENT_CONNECT_REPO is where the agent works, verbatim")
+
+    resolved, said = resolve(home=home)
+    check(resolved == home / "agents",
+          "with nothing set the agent works in ~/agents — not in whatever "
+          "directory the operator happened to launch from")
+    check(resolved.exists(), "which is created rather than left to fail later")
+    check("defaulting repo to" in said,
+          "and said out loud: an invisible default is how an agent ends up in "
+          "the wrong folder")
+
+    resolved, said = resolve(repo=home / "Documents" / "a", home=home)
+    check("WARNING" in said and "TCC-protected" in said and "Documents" in said,
+          "a working directory under a macOS privacy-protected folder is warned "
+          "about, because the failure it causes says only 'operation not permitted'")
+    check("AGENT_CONNECT_REPO" in said, "and the warning names what to change")
+
+    resolved, said = resolve(repo=home / "agents", home=home)
+    check("WARNING" not in said, "a directory outside those folders warns about nothing")
+
+print("\n" + ("PASS — the agent's working directory green" if fails == 0
+              else f"FAIL — {fails} failing"))
+raise SystemExit(1 if fails else 0)

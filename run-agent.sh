@@ -4,7 +4,7 @@
 #
 #   AGENT_CONNECT_TOKEN    your agent's relay token (from the Agent Portal) [required]
 #   AGENT_CONNECT_ADAPTER  adapter, e.g. codex [required]
-#   AGENT_CONNECT_REPO     repo the agent works in [default: cwd]
+#   AGENT_CONNECT_REPO     repo the agent works in [default: ~/agents]
 #   AGENT_CONNECT_WORKSPACE  task/result workspace [default: ~/.agent-connect/workspace]
 #   RELAY_BIN              ag2-sparrow console script [default: `command -v ag2-sparrow`;
 #                          `pip install ag2-sparrow` if you don't have it]
