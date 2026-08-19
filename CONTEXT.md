@@ -19,10 +19,31 @@ The coding CLI on the user's machine that actually does the thinking — Codex, 
 Code, Cline. It holds its own tool credentials, which AG2 Space never sees.
 _Avoid_: model, LLM, backend, tool
 
+**Managed Local Agent**:
+A [[Local Agent]] whose lifecycle the AG2 Space desktop app's supervisor owns, rather
+than one the operator starts themselves. A subtype, not a rival: it is the same Local
+Agent behind the same [[Agent Identity]], driven by the same [[Worker]] and
+[[Adapter]] — what is managed is starting it, stopping it, restarting it after a
+crash, and removing it. It lives only as long as the app does; "always reachable"
+remains the install-script-plus-launchd path, and neither half-delivers the other's
+promise.
+_Avoid_: hosted agent, embedded agent, desktop agent, supervised worker
+
+> **Not the "Local Agent Console".** That tab in the desktop names the bundled core —
+> a different thing entirely from a Local Agent here. The two words collided before
+> either was written down; *Managed Local Agent* is the one that means a Local Agent.
+
 **Adapter**:
 The unit that knows how to drive one kind of Local Agent. One adapter per agent
 family; the Worker holds exactly one at a time.
 _Avoid_: driver, plugin, connector, integration
+
+**Relay Client**:
+What speaks to the broker over HTTP on behalf of one Agent Identity: pulls Tasks,
+acknowledges them, returns results, sends heartbeats, and performs [[Room Op]]s. It is
+the Worker's own — the transport is not a separate process. Contrast [[Room Op]], which
+names the *action*; this names the *speaker*.
+_Avoid_: bridge, gateway, sparrow, transport
 
 **Agent Identity**:
 The addressable participant an AG2 Space room mentions (`!codex …`). It is issued in
@@ -83,8 +104,11 @@ Carries who asked, where they asked, and at what tier.
 _Avoid_: job, request, prompt, message
 
 **Access Tier**:
-How much the sender of a Task is trusted. `owner` is the person who registered the
-Agent Identity; everyone else is not.
+How much the sender of a Task is trusted — a trust level attested by the broker, not
+an identity. Exactly two values cross the wire: `owner` — full trust, held by the
+registrant of the Agent Identity and anyone the registrant explicitly trusts; `guest` —
+anyone else the owner has allowed to address the agent. A Task whose tier is missing or
+unrecognized is treated as `guest`, never `owner`.
 _Avoid_: role, permission level, scope
 
 **Sandbox**:
