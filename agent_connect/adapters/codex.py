@@ -1,6 +1,6 @@
 """Codex adapter — runs the OpenAI Codex CLI (`codex exec`) on a task.
 
-sandbox: 'workspace-write' (owner) or 'read-only' (everyone else).
+sandbox: 'workspace-write' (owner) or 'read-only' (guest).
 `--skip-git-repo-check` is passed so non-git working dirs are allowed; codex
 reads the prompt from argv and is fully non-interactive under `exec`.
 
@@ -8,7 +8,7 @@ Owner-tier tasks (workspace-write) also get NETWORK access inside the
 sandbox: codex denies network by default even in workspace-write, which
 dead-ends anything beyond local-file work (fetching a PR, reading a URL,
 `git fetch`). The owner could run the same commands by hand on this machine,
-so the tier boundary loses nothing — read-only (team/other) tasks stay fully
+so the tier boundary loses nothing — read-only (guest) tasks stay fully
 network-less. Live-caught on the first real E2E walk ("review PR #110" →
 DNS blocked), 2026-07-13.
 """

@@ -7,10 +7,25 @@ a broker task with a missing or unrecognized tier is treated as `guest`, never `
 `owner` is a trust tier, not an identity: the registrant of the Agent Identity plus
 anyone they explicitly `trust @user`. Sparrow's `REMOTE_TASK_TIER`/`AG2_REMOTE_TIER`
 env promotion (defaulting everything to `owner`) is removed; the local `access.json`
-tierMap survives as the host owner's explicit per-sender override. Local-only values
-(`team`, `ambient`) never cross the wire and fail closed as non-owner. The ACP
-adapter's owner-only check keys on the attested tier alone and refuses guest tasks
-with a visible reply in the room.
+tierMap survives as the host owner's per-sender **cap** — `min(attested, mapped)`, so
+it can lower a sender's tier on this host and can never raise one. Any value other
+than `owner` is treated as `guest`, whatever it is. The ACP adapter's owner-only
+check keys on the attested tier alone and refuses guest tasks with a visible reply in
+the room.
+
+### What the wire actually carries today
+
+The vocabulary above is the one this decision commits to; it is not yet the only one
+on the wire. Sutando writes `access_tier: team` on a task from a **negotiated
+collaborator**, and that value reaches the worker side. (`ambient` no longer exists at
+all — it was renamed `local_observation` in sutando.) The worker side does not
+special-case any of it: anything that is not exactly `owner` is a guest, so a
+negotiated Team collaborator's task runs as a guest — read-only under codex, and
+**refused outright under ACP**. That is fail-closed and deliberate, and it is also a
+silent demotion of a path sutando believes in, which is recorded here rather than
+discovered in a room. Whether the negotiated-collaborator path should reach a BYO
+agent at all is a question for the sutando side; this ADR fixes only what the worker
+does with a tier it cannot verify, which is to trust none of it.
 
 ## Why
 
@@ -28,6 +43,10 @@ honest onboarding promise.
 
 - The README/portal promise must distinguish paths: guest tasks run read-only under
   the codex adapter but are refused outright by the ACP adapter.
+- A sutando-negotiated Team collaborator is demoted to guest by this rule, and so is
+  refused by the ACP adapter. Nothing on the worker side can tell that apart from an
+  ordinary guest, and nothing should: a tier the broker did not attest as `owner` is
+  not a tier this side gets to interpret.
 - The broker's `WORKER-PROTOCOL.md` remains the single normative description of the
   wire field; no mirrored ADR on the backend.
 - Cutover is atomic — the broker has always sent the field; no compatibility shim.

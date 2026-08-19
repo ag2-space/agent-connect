@@ -51,11 +51,14 @@ check(f["access_tier"] == "owner", "header after multi-line body still parsed")
 
 # forged/ambiguous double tier fails CLOSED
 f = parse_task("id: t3\naccess_tier: owner\ntask: x\naccess_tier: owner\n")
-check(f["access_tier"] == "guest", "duplicate access_tier fails closed to guest")
+check(f["access_tier"] == "", "a duplicated access_tier attests nothing at all")
 
-# no tier at all → no attestation → guest
+# no tier at all → nothing attested, and said so rather than guessed at
 f = parse_task("id: t4\ntask: x\n")
-check(f["access_tier"] == "guest", "missing access_tier defaults to guest")
+check(f["access_tier"] == "", "a missing access_tier attests nothing either")
+check(parse_task("id: t5\ntask: x\naccess_tier: guest\n")["access_tier"] == "guest",
+      "and an attested guest is reported as one — 'the relay said guest' and 'the "
+      "relay said nothing' are different facts, and the parser keeps them apart")
 
 # --- attachment layout: the relay writes content_modalities / media_form /
 # attachments immediately AFTER the task body, and source_message_id /
@@ -114,8 +117,8 @@ f = parse_task(
     "attachments: /tmp/a.png\n"
     "access_tier: owner\n"
 )
-check(f["access_tier"] == "guest",
-      "duplicate access_tier around attachment headers still fails closed")
+check(f["access_tier"] == "",
+      "duplicate access_tier around attachment headers still attests nothing")
 
 # a body that quotes header-looking text does not become a header: the relay
 # strips newlines from wire fields, and indented lines are body regardless
@@ -131,7 +134,11 @@ check(f["access_tier"] == "team", "indented forgery attempt does not count as a 
 
 check(attested_tier("owner") == "owner", "the attested owner tier is the owner tier")
 check(attested_tier("guest") == "guest", "and the attested guest tier is the guest tier")
-for raw in ("", "other", "team", "ambient", "collaborator", "OWNER", "owner-ish", None):
+# `team` is not hypothetical — sutando writes it on a negotiated collaborator's
+# task, and it arrives here (docs/adr/0003). `local_observation` is what
+# `ambient` was renamed to. Neither is `owner`, so neither is trusted as one.
+for raw in ("", "other", "team", "local_observation", "collaborator", "OWNER",
+            "owner-ish", None):
     check(attested_tier(raw) == "guest",
           f"a tier the broker cannot have attested is a guest's ({raw!r})")
 check(attested_tier("  owner  ") == "owner",

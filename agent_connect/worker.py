@@ -88,12 +88,12 @@ def _resolve_repo() -> Path:
         )
     return repo
 
-#: The Access Tier vocabulary, and the whole of it. The broker attests one of
-#: these on every Task and the Worker acts on the attestation (`docs/adr/0003`);
+#: The Access Tier vocabulary this side acts on, and the whole of it. The broker
+#: attests the tier and the Worker acts on the attestation (`docs/adr/0003`);
 #: nothing here restamps a tier of its own. Anything that is not exactly `owner`
-#: — a missing header, a duplicated one, a local-only value that escaped onto
-#: the wire, a near-miss like `OWNER` — is not an attestation of ownership, and
-#: an unattested Task is a guest's.
+#: — a missing header, a duplicated one, a near-miss like `OWNER`, or one of the
+#: other words sutando still writes (`team`) — is not an attestation of
+#: ownership, and a Task without one is a guest's.
 OWNER = "owner"
 GUEST = "guest"
 
@@ -123,9 +123,12 @@ def attested_tier(raw: str) -> str:
     The broker computes the sender's Access Tier and attests it on the Task;
     this is the whole of the Worker's judgement about it — either the broker
     said `owner`, or it did not. A value it does not recognise is not a value it
-    may guess at: `team`, `ambient` and anything else local never cross the wire
-    (`docs/adr/0003`), so one arriving means something is wrong upstream, and the
-    safe reading of "something is wrong" is `guest`.
+    may guess at, and that is not a hypothetical: sutando writes
+    `access_tier: team` on a task from a negotiated collaborator, and it arrives
+    here. It is read as `guest`, like everything else that is not `owner` —
+    read-only under codex and refused under ACP. The demotion is deliberate and
+    recorded in `docs/adr/0003`; a tier this side cannot verify is a tier this
+    side does not get to interpret.
     """
     return OWNER if (raw or "").strip() == OWNER else GUEST
 
@@ -136,12 +139,17 @@ def parse_task(text: str) -> dict:
     Headers are `key: value` lines with a known key; `task:` starts the body,
     which may span multiple lines and ends at the next known-header line.
     The relay sanitizes newlines out of wire fields, so a message body cannot
-    fabricate a header line of its own. Defense-in-depth on top of that:
-    if more than one `access_tier` header appears, fail closed to `guest`.
+    fabricate a header line of its own. Defense-in-depth on top of that: more
+    than one `access_tier` header is a forgery attempt, and no tier at all is
+    read off a Task that has one.
 
-    The tier comes back exactly as it was written, so a diagnosis can see what
-    the relay actually said; `turn_context` is where it becomes one of the two
-    values the Worker acts on.
+    The tier comes back **exactly as it was written**, and comes back empty when
+    nothing was written or when two headers contradicted each other. That
+    distinction is the point of reporting it at all: "the relay attested guest"
+    and "the relay attested nothing" are different facts about a Task, and a
+    parser that answered `guest` to both would hide the second one from anybody
+    reading the file to find out what went wrong. Neither is a tier to act on —
+    `attested_tier`, applied in `turn_context`, is where both become `guest`.
 
     `access_tier`, `task` and `source_message_id` always come back, because
     each has a meaningful default — downstream threading reads the source
@@ -149,7 +157,7 @@ def parse_task(text: str) -> dict:
     one. Every other known header is returned verbatim under its own key only
     when the relay wrote it, so read those with `.get()`.
     """
-    fields: dict = {"access_tier": GUEST, "task": "", "source_message_id": ""}
+    fields: dict = {"access_tier": "", "task": "", "source_message_id": ""}
     body: list = []
     tiers: list = []
     in_body = False
@@ -169,8 +177,8 @@ def parse_task(text: str) -> dict:
     fields["task"] = "\n".join(body).strip()
     if len(tiers) == 1:
         fields["access_tier"] = tiers[0]
-    # zero headers → no attestation; multiple → forged/ambiguous. Both are
-    # left at the fail-closed default, which `attested_tier` reads as guest.
+    # zero headers → nothing was attested; multiple → forged, so nothing was
+    # attested either. Both stay empty, and `attested_tier` reads empty as guest.
     return fields
 
 

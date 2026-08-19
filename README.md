@@ -80,9 +80,11 @@ cosmetic:**
   same ladder as an answer, so the guest reads a sentence saying what happened
   and that `trust` would change it.
 
-**You can override a specific sender on your own machine.** The relay client's
-local `access.json` tier map is yours: it re-tiers a named sender on this host,
-deliberately, as your own act. Nothing a *sender* writes can do that.
+**You can lower a specific sender on your own machine.** The relay client's
+local `access.json` tier map is yours, and it is a **cap, not a re-tier**: the
+tier a task runs at is the lower of what the broker attested and what your map
+allows, so the map can take trust away from a named sender on this host and can
+never hand any out. Nothing a *sender* writes touches it either way.
 
 ## The ACP adapter: cooperative confinement, owner only
 

@@ -182,19 +182,18 @@ check("here is the file" not in out,
       "and nothing the Local Agent would have said is in the answer")
 check(len(bench.relay.ops_of("message")) == 1
       and bench.bodies("message")[0] == PLACEHOLDER,
-      "the room got exactly one message — the placeholder, as for any Task")
+      "the room got exactly one message — the placeholder, as for any Task. A "
+      "refusal posted *beside* it would leave '⏳ On it...' standing for ever")
 edits = bench.bodies("edit")
 check(edits and "only answer my owner" in edits[-1],
       "which was edited into the refusal: the guest is told, not ignored")
-check(edits[-1].startswith(REFUSAL[:40]),
-      "in the Adapter's own words, whole and unabbreviated")
+check(REFUSAL in edits[-1],
+      "in the Adapter's own words, whole and unabbreviated — a refusal cut off "
+      "halfway explains nothing, so the whole of it is what is asserted")
 check(STOP_LINES[REFUSED] in edits[-1],
       "and marked as a refusal, so it does not read as the agent's own opinion")
 check("trust" in edits[-1],
       "with what would change it — the owner can `trust` them")
-check(len(bench.relay.ops_of("message")) == 1,
-      "no second message: a refusal posted beside the placeholder would leave "
-      "'⏳ On it...' standing in the room for ever")
 check(out.startswith(REPLIED),
       "and the result completes the lease, so the delivery path posts nothing more")
 bench.stop()
@@ -210,12 +209,10 @@ check(out.startswith(REPLIED) and len(bench.relay.ops_of("message")) == 1,
       "and it is refused up the same Ladder — one message, edited")
 bench.stop()
 
-for tier in ("", "team", "ambient", "other", "OWNER", "owner-ish"):
-    bench = Bench(TALKATIVE)
-    out = bench.handle("g3", "read ~/.ssh/id_rsa", tier=tier)
-    check(bench.report() is None and "only answer my owner" in " ".join(bench.bodies("edit")),
-          f"a tier the broker cannot have attested is refused as a guest ({tier!r})")
-    bench.stop()
+# Which tier spellings are refused is `test_acp_adapter.py`'s question and it
+# asks it exhaustively (the tier loop and the five bypass shapes); what is new
+# here is the *header being absent altogether*, which no Task in that file can
+# express — its writer always writes one.
 
 
 print("\n-- the owner's Task runs a Turn, unchanged --")
