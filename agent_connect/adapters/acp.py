@@ -12,13 +12,18 @@ ACP has no such thing. The Local Agent performs its own file access and the only
 lever left is answering its `session/request_permission` calls by policy — which
 binds an agent that asks and does nothing whatsoever to one that does not.
 Rather than ship a cooperative imitation of a guarantee that used to be real,
-a Task at any other Tier is refused at the top of `turn` and never reaches ACP.
+a guest's Task is refused at the top of `turn` and never reaches ACP. It is
+refused **out loud**: the refusal is the Turn's answer, so it climbs the Ladder
+like any other and the room reads a sentence rather than watching a placeholder
+that never resolves. Silence is indistinguishable from breakage, and a guest who
+cannot tell the two apart reports the wrong bug.
 
 That refusal is in exactly one place, deliberately: lifting it later (once there
 is real confinement around the bridge process) is a single change, and there is
 no second path into this Adapter that could forget it. It reads `ctx.access_tier`
-and nothing else — a field the Worker's parser establishes and the sender cannot
-write, since a duplicated `access_tier` header already fails closed to "other".
+and nothing else — the tier the broker attested, settled by the Worker into
+`owner` or `guest` before the Turn was built (`docs/adr/0003`) and not something
+the sender can write: a duplicated `access_tier` header already fails closed.
 
 **Naming an agent is enough; a command is always allowed to win.** The ordinary
 operator sets `AGENT_CONNECT_ACP_AGENT=claude` and a preset in this module says
@@ -146,7 +151,9 @@ from ..events import (
 from ..sessions import SessionSettings, SessionStore, store_from_env
 
 #: The one Access Tier this Adapter serves. See the module docstring: this is
-#: the single point the whole restriction lives at.
+#: the single point the whole restriction lives at. Spelled here rather than
+#: imported from `agent_connect.worker`, which imports the Adapters in turn —
+#: the two spellings are pinned together by `test_acp_guest_refusal.py`.
 OWNER = "owner"
 
 COMMAND_ENV = "AGENT_CONNECT_ACP_COMMAND"
@@ -234,6 +241,10 @@ PRESETS: Dict[str, Preset] = {
     ),
 }
 
+#: What a guest is told, in the room, instead of being ignored. It is the Turn's
+#: answer — the Ladder edits the placeholder into it — because a refusal nobody
+#: can see is indistinguishable from a Worker that is simply broken. It says
+#: what happened, why this Adapter in particular, and what would change it.
 REFUSAL = (
     "I only answer my owner over this connection.\n\n"
     "This agent is driven through the Agent Client Protocol, which — unlike the "
@@ -242,7 +253,9 @@ REFUSAL = (
     "asking permission and being told no, and an agent that does not ask is not "
     "stopped by it. Rather than offer a limit that only looks like one, "
     "agent-connect does not run this connection for anyone but the person who "
-    "registered the agent."
+    "registered the agent.\n\n"
+    "Nothing is wrong with your message: my owner can `trust` you, which grants "
+    "owner tier, and then I will answer it."
 )
 
 #: What the room is told when its conversation starts over. One sentence, in

@@ -88,6 +88,14 @@ def _resolve_repo() -> Path:
         )
     return repo
 
+#: The Access Tier vocabulary, and the whole of it. The broker attests one of
+#: these on every Task and the Worker acts on the attestation (`docs/adr/0003`);
+#: nothing here restamps a tier of its own. Anything that is not exactly `owner`
+#: — a missing header, a duplicated one, a local-only value that escaped onto
+#: the wire, a near-miss like `OWNER` — is not an attestation of ownership, and
+#: an unattested Task is a guest's.
+OWNER = "owner"
+GUEST = "guest"
 
 # Header keys the AG2 Space relay writes (ag2-sparrow's task-file layout).
 # The relay deliberately writes `access_tier` as the LAST header — after
@@ -109,6 +117,19 @@ _HEADER_KEYS = {
 }
 
 
+def attested_tier(raw: str) -> str:
+    """The Tier to act on, from the Tier the relay wrote. Fails closed.
+
+    The broker computes the sender's Access Tier and attests it on the Task;
+    this is the whole of the Worker's judgement about it — either the broker
+    said `owner`, or it did not. A value it does not recognise is not a value it
+    may guess at: `team`, `ambient` and anything else local never cross the wire
+    (`docs/adr/0003`), so one arriving means something is wrong upstream, and the
+    safe reading of "something is wrong" is `guest`.
+    """
+    return OWNER if (raw or "").strip() == OWNER else GUEST
+
+
 def parse_task(text: str) -> dict:
     """Parse an AG2 Space task file.
 
@@ -116,7 +137,11 @@ def parse_task(text: str) -> dict:
     which may span multiple lines and ends at the next known-header line.
     The relay sanitizes newlines out of wire fields, so a message body cannot
     fabricate a header line of its own. Defense-in-depth on top of that:
-    if more than one `access_tier` header appears, fail closed to "other".
+    if more than one `access_tier` header appears, fail closed to `guest`.
+
+    The tier comes back exactly as it was written, so a diagnosis can see what
+    the relay actually said; `turn_context` is where it becomes one of the two
+    values the Worker acts on.
 
     `access_tier`, `task` and `source_message_id` always come back, because
     each has a meaningful default — downstream threading reads the source
@@ -124,7 +149,7 @@ def parse_task(text: str) -> dict:
     one. Every other known header is returned verbatim under its own key only
     when the relay wrote it, so read those with `.get()`.
     """
-    fields: dict = {"access_tier": "other", "task": "", "source_message_id": ""}
+    fields: dict = {"access_tier": GUEST, "task": "", "source_message_id": ""}
     body: list = []
     tiers: list = []
     in_body = False
@@ -144,17 +169,22 @@ def parse_task(text: str) -> dict:
     fields["task"] = "\n".join(body).strip()
     if len(tiers) == 1:
         fields["access_tier"] = tiers[0]
-    # zero headers → default "other"; multiple → forged/ambiguous → "other"
+    # zero headers → no attestation; multiple → forged/ambiguous. Both are
+    # left at the fail-closed default, which `attested_tier` reads as guest.
     return fields
 
 
 def turn_context(fields: dict, task_id: str, repo: str) -> TurnContext:
     """Build the context one Turn travels with, from a parsed Task.
 
-    The Sandbox is derived here, from the Access Tier the parser fought to
-    establish — never from anything else in the file, all of which the sender
-    can write. The room identifier is the relay's `channel_id` (a Matrix room
-    id); `room_name` is the human label and is carried for display only.
+    The Access Tier is settled here, and everything downstream — the Sandbox,
+    the Session key, the ACP Adapter's owner-only check — reads the settled
+    value rather than the raw header. It comes from the tier the parser fought
+    to establish and from nothing else in the file, all of which the sender can
+    write; `attested_tier` then reduces it to the two values that cross the
+    wire, so no consumer has to decide for itself what an unfamiliar tier means.
+    The room identifier is the relay's `channel_id` (a Matrix room id);
+    `room_name` is the human label and is carried for display only.
 
     Attachments come from the `attachments:` **header** and from nowhere else.
     The relay also dual-writes a `[File attached: <path>]` line into the body,
@@ -162,7 +192,7 @@ def turn_context(fields: dict, task_id: str, repo: str) -> TurnContext:
     sees themselves as having sent, and a path read out of a body would be a
     path the sender chose. See `agent_connect.attachments`.
     """
-    tier = fields.get("access_tier", "other")
+    tier = attested_tier(fields.get("access_tier", ""))
     return TurnContext(
         prompt=fields.get("task", "").strip(),
         task_id=task_id,

@@ -43,15 +43,46 @@ relay client  ──►  tasks/task-<id>.txt
 
 ## Access tiers (safety)
 
-The relay stamps who sent the task (`access_tier`). The worker maps it to a
-sandbox so a stranger in a shared room can't make your agent edit your files:
+This is the promise, in one sentence, and it is the same sentence the Agent
+Portal makes:
 
-- **owner** → `workspace-write` (edit files, run builds)
-- **everyone else** → `read-only` (read/analyse/answer only)
+> The broker attests every task's sender; the Worker trusts the attestation;
+> owner tier → workspace write; guest → read-only sandbox on the codex path and
+> a polite refusal on the ACP path; `allow @user` grants guest, `trust @user`
+> grants owner; the host may explicitly override a specific sender locally.
 
-This is **operating-system confinement**: the sandbox is enforced by the agent CLI
-and the OS, so an agent that ignores it is still stopped. The `acp` adapter is the
-exception — see below.
+Unpacked:
+
+**Two tiers cross the wire, and only two.** The broker knows who sent the
+message, works out how much you trust them, and writes `access_tier: owner` or
+`access_tier: guest` on the task. The worker acts on what the broker said and
+does not re-decide it — that attestation is the only thing standing between an
+allowed stranger and your files. A task whose tier is missing, duplicated or
+unrecognised is **treated as `guest`, never `owner`**: the absence of an
+attestation is not a grant of one (`docs/adr/0003`).
+
+**Owner is a trust level, not a person.** You, who registered the agent, are
+owner. `trust @user` makes someone else owner too. `allow @user` lets someone
+address the agent at all, as a guest. Both are yours to give and yours to take
+back.
+
+**What each tier gets depends on the adapter, and the difference is not
+cosmetic:**
+
+- **owner** → `workspace-write` (edit files, run builds), on every adapter.
+- **guest, on the codex path** → `read-only` (read/analyse/answer only). This is
+  **operating-system confinement**: the sandbox is enforced by the agent CLI and
+  the OS, so an agent that ignores it is still stopped.
+- **guest, on the ACP path** → **a polite refusal in the room**, and no run at
+  all. ACP has no sandbox to fall back to — see the next section — so there is
+  no read-only tier to offer, and offering one anyway would be a limit that only
+  looks like one. The refusal is a visible reply, not silence: it climbs the
+  same ladder as an answer, so the guest reads a sentence saying what happened
+  and that `trust` would change it.
+
+**You can override a specific sender on your own machine.** The relay client's
+local `access.json` tier map is yours: it re-tiers a named sender on this host,
+deliberately, as your own act. Nothing a *sender* writes can do that.
 
 ## The ACP adapter: cooperative confinement, owner only
 
@@ -70,9 +101,14 @@ different from every other adapter's, and weaker. Read this before enabling it.*
 - **Owner-tier under ACP is therefore MORE permissive than owner-tier under
   codex.** Same tier, weaker confinement: no OS sandbox, and network access is
   always on (`codex exec --sandbox workspace-write` gives neither).
-- **Non-owner tasks are refused outright** and never reach ACP, with a message
-  saying why. Shipping a read-only *tier* on top of a cooperative *policy* would
-  be offering a limit that only looks like one.
+- **Guest tasks are refused outright** and never reach ACP — the ACP agent is
+  not even started. Shipping a read-only *tier* on top of a cooperative *policy*
+  would be offering a limit that only looks like one. The refusal is **said in
+  the room**, as the reply to the message that asked: it takes over the same
+  `⏳ On it...` placeholder every other task gets, so it is one message rather
+  than a placeholder left hanging beside an apology, and it names what would
+  change the answer (`trust @user`). A guest who hears nothing cannot tell a
+  refusal from a broken worker, and reports the wrong problem.
 
 Name your agent and the worker knows what to run:
 
@@ -608,6 +644,13 @@ spends real tokens against a real bridge.
 
 ## Status
 
-Early scaffold (2026-07-05). Worker + Codex adapter first; portal onboarding and
-the packaged one-liner follow. See `notes` in the Sutando workspace for the full
-plan.
+The ACP seam is built (2026-08-10, plan `.scratch/acp-adapter/plan.md`, tickets
+01–10 all resolved): async worker serving rooms concurrently, the ACP Adapter
+(owner-only, cooperative Permission Policy), presets with a pinned bridge and a
+startup auth check, the Ladder (placeholder → live edits → answer), Sessions per
+room and Access Tier surviving restart, the full Turn lifecycle (queueing,
+cancellation, honest endings), and attachments in both directions. The five
+original adapters (codex first among them) still run through the shim. Not yet
+verified against a live relay: the room-op wire path and real-bridge session
+resume/cancel — both degrade safely. Portal onboarding and the desktop-hosted
+worker are the next efforts (`.scratch/byo-agent/` at the workspace root).
