@@ -20,7 +20,9 @@ import _bootstrap  # noqa: F401 — distribution root on sys.path
 import socket
 import threading
 import time
+import types
 
+from ag2_relay_client import resolver as resolver_module
 from ag2_relay_client.resolver import BoundedResolver
 
 fails = 0
@@ -106,6 +108,57 @@ check(concurrent.calls == 1, "five concurrent callers made ONE underlying resolv
 check(len(errors) == 5, "and all five were released by the bound")
 concurrent.release.set()
 
+# --- A1/A2: a helper thread that will not START must not poison the slot.
+# The single-flight slot is claimed before the thread runs, and only the
+# thread's own `finally` clears it — so a `start()` that raises (thread or
+# memory pressure, or "can't create new thread at interpreter shutdown" on
+# 3.12+) leaves a slot nothing will ever clear. Every later resolve for that key
+# would then wait out the whole bound and fail with the underlying resolver
+# asked zero times, forever, long after threads recovered: a permanent version
+# of the 21-hour wedge.
+class RefusingThread:
+    """A thread that cannot be started, the way a loaded machine has one."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        raise RuntimeError("can't start new thread")
+
+
+answers = []
+
+
+def answering(host, port, *args, **kwargs):
+    answers.append(host)
+    return [V4]
+
+
+pressured = BoundedResolver(timeout=5, getaddrinfo=answering)
+saved_threading = resolver_module.threading
+resolver_module.threading = types.SimpleNamespace(
+    Thread=RefusingThread, Event=threading.Event, Lock=threading.Lock)
+started = time.monotonic()
+refused_start = None
+try:
+    pressured.getaddrinfo("gw.example", 443)
+except Exception as exc:  # noqa: BLE001 — the type is the assertion
+    refused_start = exc
+finally:
+    resolver_module.threading = saved_threading
+check(isinstance(refused_start, OSError),
+      "a resolver thread that will not start raises an OSError — urllib wraps "
+      "those as URLError, and the reconnect path only knows those")
+check(isinstance(refused_start, socket.gaierror),
+      "and specifically a gaierror, the same class a resolution failure raises")
+check(time.monotonic() - started < 1,
+      "it fails at once rather than waiting out a bound nothing will end")
+check(answers == [], "the underlying resolver was never reached, as expected")
+check(pressured.getaddrinfo("gw.example", 443) == [V4],
+      "and the NEXT call — threads recovered — resolves normally")
+check(answers == ["gw.example"],
+      "the failed start released its slot instead of poisoning the key forever")
+
 # --- A3: v4 preferred, v6 kept as the fallback it is
 def both(host, port, *args, **kwargs):
     return [V6, V4]
@@ -124,9 +177,18 @@ check(BoundedResolver(getaddrinfo=both, prefer_ipv4=False).getaddrinfo("gw.examp
 
 # --- A4: scoped to this client, not bolted onto the interpreter
 original = socket.getaddrinfo
-r = BoundedResolver()
+asked = []
+
+
+def counting(host, port, *args, **kwargs):
+    asked.append(host)
+    return socket.getaddrinfo(host, port, *args, **kwargs)
+
+
+r = BoundedResolver(getaddrinfo=counting)
 r.getaddrinfo("localhost", 80)
-r.create_connection
+check(asked == ["localhost"],
+      "this object resolves through the resolver it was handed, not the module's")
 check(socket.getaddrinfo is original,
       "socket.getaddrinfo is left alone — the bound is per-connection, not process-global")
 
@@ -139,8 +201,11 @@ listener = socket.socket()
 listener.bind(("127.0.0.1", 0))
 listener.listen(1)
 port = listener.getsockname()[1]
-sock = BoundedResolver().create_connection(("127.0.0.1", port), timeout=5)
+sock = r.create_connection(("127.0.0.1", port), timeout=5)
 check(sock is not None, "create_connection reaches a listening socket")
+check(asked[-1] == "127.0.0.1",
+      "and it opened it through THIS object's bounded resolver — the whole point "
+      "of handing one in rather than patching the module")
 sock.close()
 listener.close()
 

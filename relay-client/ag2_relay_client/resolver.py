@@ -102,10 +102,33 @@ class BoundedResolver:
             if call is None:
                 call = _Inflight()
                 self._inflight[args] = call
-                threading.Thread(
+                worker = threading.Thread(
                     target=self._run, args=(args, call),
                     name="ag2-relay-dns", daemon=True,
-                ).start()
+                )
+                try:
+                    worker.start()
+                except Exception as exc:  # noqa: BLE001 — see below
+                    # A start that fails means `_run` never runs, so its
+                    # `finally` never clears the slot and nothing else ever
+                    # will: every later resolve for this key would attach to a
+                    # call that will not happen, wait out the full bound and
+                    # fail, with the underlying resolver asked zero times —
+                    # forever, long after threads recover. That is a permanent
+                    # version of the 21-hour wedge A1 and A2 exist to prevent,
+                    # so the slot goes back before the error goes up.
+                    self._inflight.pop(args, None)
+                    # And it goes up as a `gaierror`: `start()` raises
+                    # `RuntimeError` ("can't create new thread", and at
+                    # interpreter shutdown on 3.12+), which is not an `OSError`,
+                    # so urllib would not wrap it as a `URLError` and the
+                    # reconnect path would not recognise it. A1 requires a
+                    # resolve failure to surface as an ordinary retryable
+                    # network error.
+                    raise socket.gaierror(
+                        f"DNS resolution for {args[0]!r} could not start its "
+                        f"resolver thread: {exc}"
+                    ) from exc
 
         if not call.done.wait(self.timeout):
             raise socket.gaierror(

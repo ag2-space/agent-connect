@@ -111,6 +111,27 @@ with tempfile.TemporaryDirectory() as tmp:
     check(read_token_file(split_layout).url == "https://gw.example/relay",
           "the split layout's URL line is read, not dropped")
 
+    # A raw onboarding line is recognised by NOT being an assignment, not by
+    # holding no `=`: a base64-padded secret ends in `=`, and the "=-free" test
+    # read this file as empty — a loud error at construction, a silent skip at
+    # rotation, where the rotation simply never landed.
+    padded = Path(tmp) / "padded.token"
+    padded.write_text("# written by connect\n"
+                      "https://gw.example/relay|eyJhbGciOiJIUzI1NiJ9.abc==\n")
+    check(read_token_file(padded).secret ==
+          "https://gw.example/relay|eyJhbGciOiJIUzI1NiJ9.abc==",
+          "a raw onboarding line whose secret carries `=` is still the token")
+
+    bare_padded = Path(tmp) / "bare-padded.token"
+    bare_padded.write_text("eyJhbGciOiJIUzI1NiJ9.abc==\n")
+    check(read_token_file(bare_padded).secret == "eyJhbGciOiJIUzI1NiJ9.abc==",
+          "and so is a bare padded secret on its own")
+
+    other_key = Path(tmp) / "other-key.env"
+    other_key.write_text("# not ours\nSOME_OTHER_KEY=abc\nexport ANOTHER=xyz\n")
+    check(read_token_file(other_key).secret == "",
+          "an unrelated KEY=VALUE line is still not mistaken for a token")
+
     missing = Path(tmp) / "nope.env"
     check(read_token_file(missing).secret == "" and read_token_file(missing).url == "",
           "a missing file is empty, not an exception")
@@ -265,6 +286,69 @@ with tempfile.TemporaryDirectory() as tmp:
     check(outcome.rotated and split_src.secret == "FIFTH",
           "a trailing slash is not a gateway change")
 
+    # Scheme and host are case-insensitive per RFC 3986, so a difference there
+    # is NOT a different gateway. The raw string compare refused one anyway —
+    # and because both sides print through `redact_url`, which lowercases them,
+    # the log line named the same URL twice. A legitimate rotation could then
+    # never land, for the life of the process, with auth recovery holding.
+    case_file = Path(tmp) / "case.env"
+    case_file.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay%7CBEFORE\n")
+    case_src = TokenSource(token_file=case_file)
+    case_file.write_text("REMOTE_TASK_TOKEN=https://GW.Example/relay%7CROTATED\n")
+    outcome = case_src.reload()
+    check(outcome.rotated and case_src.secret == "ROTATED",
+          "a capitalised host is the same gateway — the rotation lands")
+    case_file.write_text("REMOTE_TASK_TOKEN=HTTPS://gw.example/relay%7CAGAIN\n")
+    check(case_src.reload().rotated, "and so is a capitalised scheme")
+    check(case_src.base_url == "https://gw.example/relay",
+          "the running base URL is still the one this client started on")
+
+    # The path, however, is case-SENSITIVE — a different path is a different
+    # gateway and stays refused.
+    case_file.write_text("REMOTE_TASK_TOKEN=https://gw.example/Relay%7CNOPE\n")
+    outcome = case_src.reload()
+    check(not outcome.rotated and case_src.secret == "AGAIN",
+          "a path whose case changed IS a different gateway, and is refused")
+
+    # A file may name a gateway in BOTH layouts. Consulting whichever is found
+    # first let a re-onboard through: the combined token still naming the old
+    # gateway, the URL line naming the new one, and the freshly rotated bearer
+    # then going to the old endpoint — C5's scar verbatim.
+    both_layouts = Path(tmp) / "both-layouts.env"
+    both_layouts.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay%7CSTART\n")
+    both_src = TokenSource(token_file=both_layouts)
+    both_layouts.write_text(
+        "REMOTE_TASK_TOKEN=https://gw.example/relay%7CROTATED\n"
+        "REMOTE_TASK_URL=https://other.example/relay\n")
+    outcome = both_src.reload()
+    check(not outcome.rotated and both_src.secret == "START",
+          "a URL line naming a new gateway is refused even when the token names the old one")
+    both_layouts.write_text(
+        "REMOTE_TASK_TOKEN=https://other.example/relay%7CROTATED\n"
+        "REMOTE_TASK_URL=https://gw.example/relay\n")
+    outcome = both_src.reload()
+    check(not outcome.rotated and both_src.secret == "START",
+          "and so is the mirror image — every URL the file names is checked")
+
+    # When redaction makes the two URLs print identically — it drops userinfo,
+    # query and fragment, which are the likeliest things to have changed — the
+    # message has to say WHAT differs, without printing any of it.
+    queried = Path(tmp) / "queried.env"
+    queried.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay?token=abc%7CSTART\n")
+    queried_src = TokenSource(token_file=queried)
+    check(queried_src.base_url == "https://gw.example/relay?token=abc",
+          "a gateway provisioned with a query is carried as provisioned")
+    queried.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay?token=xyz%7CROTATED\n")
+    captured.records.clear()
+    outcome = queried_src.reload()
+    check(not outcome.rotated and queried_src.secret == "START",
+          "a changed query is a different gateway, and is refused")
+    check("query" in outcome.reason,
+          "the refusal names the component that differs, since the redacted URLs match")
+    check("abc" not in captured.text and "xyz" not in captured.text
+          and "START" not in captured.text and "ROTATED" not in captured.text,
+          "and it prints neither query, nor either secret")
+
     token_file.unlink()
     outcome = src.reload()
     check(not outcome.rotated and src.secret == "SECOND",
@@ -274,6 +358,35 @@ with tempfile.TemporaryDirectory() as tmp:
     check(not no_durable.rotated, "with no durable source there is nothing to reload")
 
     logging.getLogger("ag2_relay_client").removeHandler(captured)
+
+# --- C7: after a rotation, the source names the layer now supplying the bearer
+with tempfile.TemporaryDirectory() as tmp:
+    # Constructed from an inline token but carrying a durable file: the first
+    # rotation swaps in the FILE's secret, and a source line still naming the
+    # construction argument is exactly the wrong-file misdiagnosis C7 prevents.
+    mixed = Path(tmp) / "mixed.env"
+    mixed.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay%7CFROM-FILE\n")
+    mixed_src = TokenSource(token="https://gw.example/relay|FROM-ARG", token_file=mixed)
+    check("construction" in mixed_src.source,
+          "before any rotation the source names the argument that supplied the token")
+    outcome = mixed_src.reload()
+    check(outcome.rotated and mixed_src.secret == "FROM-FILE",
+          "the file's secret rotates in over the constructed one")
+    check(str(mixed) in mixed_src.source,
+          "and the source now names the file the bearer actually comes from")
+    check("FROM-FILE" not in mixed_src.source and "FROM-FILE" not in repr(mixed_src),
+          "still the source, never the value")
+
+    # A raw onboarding line whose secret is base64-padded: the rotation has to
+    # land, where the "=-free line" test skipped the file in silence and left
+    # the client 401ing on a revoked bearer.
+    raw_padded = Path(tmp) / "raw-padded.token"
+    raw_padded.write_text("https://gw.example/relay|FIRST\n")
+    raw_src = TokenSource(token_file=raw_padded)
+    raw_padded.write_text("https://gw.example/relay|eyJhbGciOiJIUzI1NiJ9.next==\n")
+    outcome = raw_src.reload()
+    check(outcome.rotated and raw_src.secret == "eyJhbGciOiJIUzI1NiJ9.next==",
+          "a raw-line rotation to a padded secret lands rather than being skipped")
 
 print("\n" + ("PASS — credentials green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

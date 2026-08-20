@@ -40,6 +40,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from .credentials import TokenSource
 from .resolver import BoundedResolver
+from .state import redact_url
 
 log = logging.getLogger(__name__)
 
@@ -66,13 +67,21 @@ class RelayHTTPError(Exception):
     to look at the body to know what the status meant — an ack answered `404`
     means "no such task" from one deployment and "no such endpoint" from
     another, and only the body tells them apart.
+
+    The URL is on the attribute in full and in the message redacted (D3). The
+    message is not just for reading: the client writes `str(exc)` into
+    `connection-status.json`, which nothing downstream redacts and which lives
+    under a state dir that syncs to a vault — so a gateway provisioned with
+    `user:pass@` or a `?token=` query would land there in plaintext.
     """
 
     def __init__(self, status: int, body: str, url: str, message: str = ""):
         self.status = status
         self.body = body or ""
+        #: The URL as requested, unredacted, for a caller that has to act on it.
         self.url = url
-        super().__init__(message or f"HTTP {status} from {url}: {self.body[:200]}")
+        super().__init__(
+            message or f"HTTP {status} from {redact_url(url)}: {self.body[:200]}")
 
 
 class AuthRejected(RelayHTTPError):
@@ -100,7 +109,9 @@ class RelayHTTP:
         self._opener = _opener_for(self.resolver)
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
-        return f"<RelayHTTP {self.base_url}>"
+        # Redacted for the same reason the errors are: a repr reaches logs and
+        # tracebacks, and the gateway may carry userinfo or a query (D3).
+        return f"<RelayHTTP {redact_url(self.base_url)}>"
 
     @property
     def base_url(self) -> str:
@@ -161,7 +172,8 @@ class RelayHTTP:
             # A 200 carrying an HTML interstitial is the edge talking, not the
             # broker. Loud enough to back off on, rather than an empty answer.
             raise RelayHTTPError(
-                status, raw, url, f"answer from {url} was not JSON: {raw[:200]}"
+                status, raw, url,
+                f"answer from {redact_url(url)} was not JSON: {raw[:200]}"
             ) from None
 
     def open_stream(
@@ -274,8 +286,11 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Redacted rather than `netloc`, which carries userinfo when the
+        # redirect target has any — and a redirect target is the one URL in this
+        # module that this client did not provision (D3).
         log.warning("refusing a %s redirect to %s — this request is credentialed",
-                    code, urllib.parse.urlsplit(newurl).netloc or newurl)
+                    code, redact_url(newurl))
         return None
 
 
