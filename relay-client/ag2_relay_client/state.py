@@ -19,11 +19,17 @@ separately, been the source of a production bug:
 - **URL redaction** (D3) runs before any gateway URL is persisted or logged. A
   state dir can be vault-synced; a gateway configured with `user:pass@` userinfo
   or a `?token=` query must not land there in plaintext.
+
+`write_private_atomic` lives here for the same reason: it is *how* this library
+is allowed to write, and both files it writes — the journal and the status —
+need the same discipline. A reader must see the old file or the new one and
+never a half-written one, and neither file is anybody else's business.
 """
 from __future__ import annotations
 
 import os
 import re
+import tempfile
 import urllib.parse
 from pathlib import Path
 from typing import Union
@@ -97,6 +103,36 @@ def redact_url(value: str) -> str:
         return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
     except Exception:  # noqa: BLE001 — redaction must never break status I/O
         return UNREDACTABLE
+
+
+def write_private_atomic(path, text: str) -> None:
+    """Write `text` to `path` so a reader sees either the old file or the new.
+
+    `0600`, because a journal is nobody else's business and a state dir is
+    exactly the kind of directory that gets synced somewhere. The fsync is what
+    makes "durable" mean durable rather than "in the page cache when the power
+    went" — the whole ack-ordering rule (F2) is a lie without it.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        prefix="." + path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        try:
+            os.fchmod(handle, 0o600)
+        except (AttributeError, OSError):  # pragma: no cover — non-POSIX modes
+            pass
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 class StateLayout:

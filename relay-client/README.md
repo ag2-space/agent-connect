@@ -21,9 +21,72 @@ URL-encoded separator) had to be learned twice too. They live here once now.
 
 ## Status
 
-Under construction. What ships today is the foundation the wire loop is built
-on: credentials, name resolution, the request core, backoff, and the state-dir
-layout. The Task queue and the outbound surface follow.
+Under construction. What ships today is the whole task path — poll, lease,
+journal, ack, results, heartbeat, auth recovery, status — behind the seam
+below. Media in both directions, Room Ops, the marker grammar and the
+singleton-per-bearer guard follow.
+
+## The seam
+
+```python
+from ag2_relay_client import RelayClient, TokenSource
+
+client = RelayClient(TokenSource(token_file="~/.ag2/relay.env"),
+                     state_dir="~/.ag2/state", instance="prod")
+client.start()
+
+task = client.next_task(timeout=30)      # or read client.tasks yourself
+if task:
+    client.complete(task.id, my_agent.handle(task.body))
+```
+
+Two things wide, and that is the whole consumer surface for the inbound half:
+Tasks come out of an in-memory queue, answers go back through `complete` — or
+`reject(id, reason)`, which dead-letters a permanently malformed task instead of
+letting it re-serve five times.
+
+The queue is a **handoff, not durability**. What survives a restart is the
+journal under the state dir, and the promise attached to it is worth stating
+plainly:
+
+- A task the client has already answered is **re-completed upstream, never
+  handed to the consumer twice** — a reconnect replays the broker's unacked
+  pool, and the replays that prompted this were 500 tasks each.
+- An answer is **retained until the broker takes it**. A failed POST, a killed
+  process: the answer is on disk and goes out on a later pass, under the same
+  id, which the broker dedups.
+- A blank answer is refused. "Nothing to say" is `[no-send]`, which completes
+  the lease and posts nothing; a blank body means "not ready", and delivering it
+  would archive the task and strand the real answer.
+
+Everything the loop knows about itself is readable while it runs:
+`client.snapshot()` for a thread-safe copy, `client.on_status(hook)` for a
+callback on every change, and a connection-only `connection-status.json` under
+the state dir so a supervisor can read it whether or not the consumer bothered
+to. A hook that raises is the hook's problem: nothing beside the wire is allowed
+to block delivery.
+
+## What the loop guarantees, and why it is shaped like this
+
+Polling cadence is a correctness property. The broker extends a lease only while
+the worker keeps polling; a worker that stops has its in-flight tasks re-served.
+So nothing in the loop blocks unboundedly — the long poll is `wait=25` with a
+socket timeout of `wait+10`, every side call is bounded, the Task queue is
+unbounded so a slow consumer cannot stall the poll thread, and status writes,
+hooks and logs all fail silently by contract. Health is asked of
+`client.healthz()`; `GET /v1/tasks` is never a probe, because it leases tasks.
+
+The ordering inside one accepted task is journal, then ack, then delivery. The
+ack is informational and gates nothing — its 404 is content-sniffed, because
+`not leased to you` is one task's expired lease and a bare 404 is a broker
+without the route, and treating the first as the second once blinded a whole
+host's delivery state.
+
+A rejected bearer is a wait, not a death: the durable token source is re-read at
+once (a rotation may already have happened), and otherwise the loop holds at a
+slow cadence, saying so every pass, until one lands — then resumes live, no
+restart. A token file that starts naming a *different* gateway is a
+reconfiguration and is refused.
 
 ## Credentials
 
