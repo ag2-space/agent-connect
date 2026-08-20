@@ -1,37 +1,40 @@
 """What arrived attached to a room message, and what may safely be done with it.
 
-Two jobs, and nothing else: read the relay's `attachments:` header into the
-`Attachment` vocabulary, and open one of those files carefully enough that a
-path someone else influenced cannot make the Worker read something it should
-not. Which content block an attachment becomes, and what the room is told when
-it cannot become one, belongs to the Adapter — this module has no idea what ACP
-is.
+Two jobs, and nothing else: take the Relay Client's resolved attachments into
+the `Attachment` vocabulary the Adapter boundary speaks, and open one of those
+files carefully enough that a path someone else influenced cannot make the
+Worker read something it should not. Which content block an attachment becomes,
+and what the room is told when it cannot become one, belongs to the Adapter —
+this module has no idea what ACP is.
 
-## The header's shape is not invented here
+## Nothing here parses a wire, because there is no wire here to parse
 
-`attachments:` is **a one-line JSON array of objects**, each with a `locator`
-and optional `id` / `mime` / `filename` / `size` / `sha256` / `expiry`. That is
-not a reading of the documentation — it is the relay client's own encoder and
-decoder, `ag2_sparrow/local_task_protocol.py`: `AttachmentRef.as_dict`,
-`format_attachments` (`json.dumps(..., separators=(",", ":"))`, guaranteed
-single-line so it cannot forge a header) and `parse_attachments`. The sibling
-headers `content_modalities` (comma-joined `text,image,audio,video,file`) and
-`media_form` (`attachment`) are stamped by `media_attachment_headers` in the
-same module, and both are *derived from the same refs* — the modalities are one
-per ref mime, and the form is the literal constant `"attachment"` on the
-messaging task path. They are a summary of the list, so this module reads the
-list and ignores the summary: where the two could ever disagree, the list is the
-one carrying the bytes.
+This module used to decode a one-line JSON `attachments:` header, plus the
+`content_modalities` and `media_form` that were stamped beside it. **The broker
+never sent any of them.** Its task object has no media field at all; media rides
+*inside* the task string as one `[ag2space-media: …]` marker, and the header
+shape — `locator` / `id` / `mime` / `filename` / `size` / `sha256` / `expiry` —
+was `AttachmentRef` out of sutando's task-file schema, synthesized by
+`ag2-sparrow` on its way to a file this Worker no longer reads. `id`, `sha256`
+and `expiry` were never populated even there. A decoder for a header nobody
+writes is not tolerance, it is a room with no door, so it is gone.
 
-Decoding is tolerant on purpose, matching the relay's own rule: a malformed
-value, a non-list payload, an element that is not an object, or an element with
-no locator is skipped rather than raised. An attachment nobody can parse must
-not cost the person their question.
+Reading the marker, fetching the bytes over the poll bearer, bounding them at
+the gateway's own ceiling and writing them to disk is the Relay Client's job, in
+`ag2_relay_client.media`, and it is finished before a Task is delivered. What
+reaches this module is a tuple in which every attachment either has a local path
+or has an honest sentence about why it has not — no URL, no marker text, and
+nothing left to parse. `delivered` is the whole of the crossing.
+
+**A fetch that failed is still an attachment.** It is carried, named, and given
+to the Adapter with the library's own reason, because an agent that can say "you
+attached something and I could not read it" is more use than a Turn that died,
+and rejecting the Task would steal the person's chance to be answered in words.
 
 ## The path is sender-adjacent data
 
-The relay wrote the locator, not the sender — but what the relay wrote came from
-a message someone else sent, and the file at the end of it was chosen by that
+The Relay Client wrote the path, not the sender — but what it wrote came from a
+message someone else sent, and the file at the end of it was chosen by that
 person too. So the path is resolved before it is judged, and the judging is done
 on the **open file descriptor** rather than on the path, so what was measured is
 what is read:
@@ -47,11 +50,11 @@ what is read:
 * `fstat` on that descriptor: a regular file, and no bigger than the limit;
 * read with the limit still enforced, in case it grew between the two.
 
-**The legacy body marker is deliberately not read.** The relay dual-writes
-`[File attached: <path>]` into the task body beside these headers. The body is
-what the person typed; a header is not. Reading a path out of the body would let
-anyone in a room name any file on the operator's machine and have the Worker
-read it, so this module never looks there — and neither should anything else.
+**A path in the message body is deliberately not read.** Whatever a sender types
+that looks like `[File attached: /etc/passwd]` is left exactly where they typed
+it. The body is what a person wrote; reading a path out of it would let anyone
+in a room name any file on the operator's machine and have the Worker open it,
+so this module never looks there — and neither should anything else.
 
 `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` bounds what is read. An attachment over it
 is reported, never shrunk: nothing here converts, resizes or transcodes anything
@@ -59,14 +62,13 @@ is reported, never shrunk: nothing here converts, resizes or transcodes anything
 """
 from __future__ import annotations
 
-import json
 import mimetypes
 import os
 import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 from .events import Attachment
 
@@ -83,8 +85,8 @@ DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 #: the content — a statement that there is none.
 OCTET_STREAM = "application/octet-stream"
 
-#: The relay's modality vocabulary (`local_task_protocol.CONTENT_MODALITIES`
-#: minus `text`, which is the message body rather than a file).
+#: The kinds of thing a file can be, as an Adapter has to reason about them: a
+#: content block per kind under ACP, a sentence per kind everywhere else.
 IMAGE, AUDIO, VIDEO, FILE = "image", "audio", "video", "file"
 
 #: A modality, in the words a person would use for it in a room.
@@ -96,9 +98,8 @@ MODALITY_WORDS: Dict[str, str] = {
 #: willing to repeat to a Local Agent as if it were one.
 _MIME = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
 
-#: Control characters, including the newline a JSON-encoded filename can carry
-#: through a one-line header. Scrubbed before a name is repeated in a room,
-#: where a bare newline would let a filename forge lines of its own.
+#: Control characters. Scrubbed before a name is repeated in a room, where a
+#: bare newline would let a filename forge lines of its own.
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -120,45 +121,42 @@ class Opened:
         return not self.problem
 
 
-def parse(raw: Optional[str]) -> Tuple[Attachment, ...]:
-    """The `attachments:` header value, as `Attachment`s. Never raises."""
-    if not raw or not raw.strip():
-        return ()
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return ()
-    if not isinstance(payload, list):
-        return ()
-    out = []
-    for element in payload:
-        if not isinstance(element, dict):
-            continue
-        locator = element.get("locator")
-        if not isinstance(locator, str) or not locator.strip():
-            # A ref with nothing to point at is meaningless — the relay's
-            # encoder drops these too, so one here did not round-trip.
-            continue
-        out.append(
-            Attachment(
-                locator=locator,
-                mime=_string(element.get("mime")),
-                filename=_string(element.get("filename")),
-                size=_count(element.get("size")),
-                sha256=_string(element.get("sha256")),
-                id=_string(element.get("id")),
-            )
+def delivered(resolved: Iterable) -> Tuple[Attachment, ...]:
+    """The Relay Client's attachments, in the words the Adapter boundary uses.
+
+    The library resolves each marker into an attachment of its own — a `path`,
+    a `name`, and an `ok`/`reason` pair for a fetch that did not happen — and
+    this is the one place those become the boundary's `path`, `filename` and
+    `reason`. One crossing, named, instead of the same two renames done again
+    inside every Adapter: the last time an Adapter was handed the library's
+    object unconverted, `label` read a field that was not there and every Turn
+    carrying any file at all died as a worker error nobody could act on.
+
+    Nothing is fetched, opened or judged here, and nothing is dropped. An
+    attachment whose fetch failed comes through carrying the library's reason,
+    which is written room-facing on purpose and carries neither the URL nor the
+    host it could not reach.
+    """
+    return tuple(
+        Attachment(
+            path=one.path or "",
+            mime=one.mime or "",
+            filename=one.name or "",
+            size=one.size or 0,
+            reason="" if one.ok else (one.reason or ""),
         )
-    return tuple(out)
+        for one in (resolved or ())
+    )
 
 
 def mime_of(attachment: Attachment) -> str:
     """The media type to declare for this attachment.
 
-    The relay's label when it is a usable one; otherwise a guess from the file
-    *name*'s extension, which is only ever allowed to choose how the bytes are
-    labelled — never which bytes are read, and never whether they are read at
-    all. Nothing is sniffed and nothing is opened to find out.
+    The Relay Client's label when it is a usable one — it comes from the fetch's
+    own `Content-Type`, falling back to the marker's hint — and otherwise a
+    guess from the file *name*'s extension, which is only ever allowed to choose
+    how the bytes are labelled, never which bytes are read and never whether
+    they are read at all. Nothing is sniffed and nothing is opened to find out.
     """
     declared = (attachment.mime or "").split(";")[0].strip().lower()
     if _MIME.match(declared):
@@ -169,12 +167,7 @@ def mime_of(attachment: Attachment) -> str:
 
 
 def modality(attachment: Attachment) -> str:
-    """`image` / `audio` / `video` / `file`, by media type.
-
-    The same mapping the relay uses when it stamps `content_modalities`
-    (`local_task_protocol.modality_for_mime`), reimplemented rather than
-    imported because that module is the relay client's, not ours.
-    """
+    """`image` / `audio` / `video` / `file`, by media type."""
     mime = mime_of(attachment)
     for prefix, name in ((IMAGE, IMAGE), (AUDIO, AUDIO), (VIDEO, VIDEO)):
         if mime.startswith(prefix + "/"):
@@ -186,13 +179,15 @@ def label(attachment: Attachment) -> str:
     """A name for this attachment that is safe to repeat in a room.
 
     The platform's filename when there is one, else the local file's own name.
-    Both came from somewhere else, so both are scrubbed of control characters,
-    collapsed to single spaces and truncated: a name is for a person to
-    recognise the file by, and nothing more is owed to it.
+    Both came from somewhere else — the first from a marker that does not escape
+    anything, the second from a directory the Relay Client owns — so both are
+    scrubbed of control characters, collapsed to single spaces and truncated: a
+    name is for a person to recognise the file by, and nothing more is owed to
+    it.
     """
     name = _clean(attachment.filename)
     if not name:
-        name = _clean(Path(attachment.locator or "").name)
+        name = _clean(Path(attachment.path or "").name)
     name = name[:120].strip()
     return name or "an unnamed attachment"
 
@@ -220,9 +215,16 @@ def read(attachment: Attachment, limit: int = 0) -> Opened:
     is a different screenshot and a person asking what is wrong with theirs
     deserves to be told, not answered about a picture they did not send.
 
-    See the module docstring for why each of the checks below is here.
+    An attachment the Relay Client never managed to fetch is reported in the
+    library's own words rather than this module's. It has no path, and every
+    sentence below is about a path — "it is not absolute" would be a true
+    statement about a file that never had one and a lie about why it is missing.
+
+    See the module docstring for why each of the checks after that is here.
     """
-    raw = attachment.locator or ""
+    if attachment.reason:
+        return Opened(problem=attachment.reason)
+    raw = attachment.path or ""
     if "\x00" in raw:
         return Opened(problem="its path is not a path")
     path = Path(raw)
@@ -256,29 +258,6 @@ def read(attachment: Attachment, limit: int = 0) -> Opened:
 
 
 # -- internals --------------------------------------------------------------
-
-
-def _string(value: Any) -> str:
-    """A field that is only interesting when it is genuinely a string.
-
-    `str(value)` on whatever JSON happened to hold would turn a nested object
-    into a Python `repr` and then carry it around as if the platform had said
-    it.
-    """
-    return value if isinstance(value, str) else ""
-
-
-def _count(value: Any) -> int:
-    """A byte count, or `0` for "unknown".
-
-    A bool is not a count (`int(True) == 1` would lie) and a negative one is
-    nonsense that would slip past a `size and size > limit` check — both become
-    unknown, which is honest and which nothing here trusts anyway: the size that
-    decides whether an attachment is read is the one `fstat` reports.
-    """
-    if isinstance(value, bool) or not isinstance(value, int):
-        return 0
-    return value if value > 0 else 0
 
 
 def _clean(text: str) -> str:

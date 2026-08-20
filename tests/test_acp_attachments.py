@@ -1,9 +1,13 @@
 """Tests for an attachment reaching the Local Agent, at the Worker's seam.
 
-Nothing here is mocked. A Task file with an `attachments:` header goes into
-`tasks/`, the Worker handles it, a real fake ACP Agent child process receives
-real JSON-RPC over stdio, and the assertions are on what the agent's own report
-says it was sent — the content blocks, in order, with their bytes.
+Nothing here is mocked. A Task carrying the attachments the Relay Client hands
+over — `ag2_relay_client.media.Attachment`, built here exactly as the fetcher
+builds it — goes through the Worker, a real fake ACP Agent child process
+receives real JSON-RPC over stdio, and the assertions are on what the agent's
+own report says it was sent: the content blocks, in order, with their bytes.
+
+There is no header and no marker anywhere in this file, because there is none
+on the wire: the library resolved both before the Task was delivered.
 
 The load-bearing assertion is byte equality: what arrives base64'd in the
 `image` block, decoded, is `read_bytes()` of the file on disk. That is the whole
@@ -27,9 +31,9 @@ import tempfile
 from pathlib import Path
 
 try:
+    from ag2_relay_client.media import UNREACHABLE, Attachment
     from agent_connect.adapters.acp import AcpAdapter
     from agent_connect.attachments import MAX_BYTES_ENV
-    from agent_connect.events import Attachment
     from agent_connect.sessions import SessionStore
     from _queue import task as queued_task
     from agent_connect.worker import handle_one
@@ -83,24 +87,31 @@ class Bench:
             store=SessionStore(base / "sessions.json"),
         )
 
-    def file(self, name: str, data: bytes) -> Path:
+    def file(self, name: str, data: bytes, mime: str = "image/png") -> Attachment:
+        """A file the fetcher saved, and the attachment it hands over for it."""
         path = self.media / name
         path.write_bytes(data)
-        return path
+        return Attachment(path=str(path), mime=mime, name=name,
+                          size=len(data), ok=True)
 
-    def handle(self, task_id: str, body: str, attachments=None, **fields) -> str:
-        """Run one Task — carrying resolved local paths — through the Worker.
+    def absent(self, name: str, mime: str = "image/png",
+               where: str = "", reason: str = "") -> Attachment:
+        """An attachment the fetcher could not produce bytes for.
 
-        `attachments` is written the way the relay used to describe them,
-        because that is what these tests are about; `_queue` turns each dict
-        into the `Attachment` the library hands over. There is no header to
-        write it into any more, and no file to write the header in.
+        Two shapes, and the difference matters: a fetch that never happened has
+        no path at all and carries the library's own `reason`, while a path that
+        stopped being readable between the save and the Turn is `ok` and fails
+        in `agent_connect.attachments` instead.
         """
+        if reason:
+            return Attachment(mime=mime, name=name, ok=False, reason=reason)
+        return Attachment(path=where or str(self.media / name), mime=mime,
+                          name=name, ok=True)
+
+    def handle(self, task_id: str, body: str, attachments=(), **fields) -> str:
+        """Run one Task — carrying what the library delivers — through the Worker."""
         fields.setdefault("tier", fields.pop("access_tier", "owner"))
-        task = queued_task(
-            task_id, body,
-            attachments=tuple(Attachment(**a) for a in (attachments or ())),
-            **fields)
+        task = queued_task(task_id, body, attachments=tuple(attachments), **fields)
         previous = os.environ.get("FAKE_ACP_REPORT")
         os.environ["FAKE_ACP_REPORT"] = str(self.report_path)
         try:
@@ -134,9 +145,7 @@ ANSWERS = {"turns": [{"actions": [{"type": "message",
 bench = Bench(ANSWERS)
 shot = bench.file("shot.png", PNG)
 out = bench.handle(
-    "a1", "what is wrong with this?",
-    attachments=[{"locator": str(shot), "mime": "image/png",
-                  "filename": "shot.png", "size": len(PNG)}],
+    "a1", "what is wrong with this?", attachments=[shot],
     channel_id="!room:ag2.space", sender_name="Ada",
 )
 blocks = bench.blocks()
@@ -147,11 +156,11 @@ check(len(blocks) == 2, "the prompt carried two content blocks: the text and the
 check(blocks[0]["type"] == "text" and blocks[1]["type"] == "image",
       "the text comes first and the attachment follows it as content")
 check(blocks[1].get("mimeType") == "image/png",
-      "the image is declared with the media type the relay recorded")
-check(base64.b64decode(blocks[1]["data"]) == shot.read_bytes(),
+      "the image is declared with the media type the Relay Client recorded")
+check(base64.b64decode(blocks[1]["data"]) == Path(shot.path).read_bytes(),
       "and the bytes the Local Agent received are the bytes on disk, exactly — "
       "nothing was converted, resized or transcoded")
-check("shot.png" not in blocks[0]["text"] or str(shot) not in blocks[0]["text"],
+check(shot.path not in blocks[0]["text"],
       "the local path is not pasted into the prompt as a filename to go and read")
 check("shot.png" in blocks[0]["text"],
       "the text names what follows it, so the agent can tell two images apart")
@@ -163,28 +172,22 @@ check(blocks[0]["text"].endswith("what is wrong with this?"),
 bench = Bench(ANSWERS)
 one = bench.file("one.png", PNG)
 two = bench.file("two.png", PNG[:64] + b"second")
-notes = bench.file("notes.pdf", b"%PDF-1.4\nnot really a pdf\n")
-out = bench.handle(
-    "a2", "compare these",
-    attachments=[
-        {"locator": str(one), "mime": "image/png", "filename": "one.png"},
-        {"locator": str(two), "mime": "image/png", "filename": "two.png"},
-        {"locator": str(notes), "mime": "application/pdf", "filename": "notes.pdf"},
-    ],
-)
+notes = bench.file("notes.pdf", b"%PDF-1.4\nnot really a pdf\n",
+                   mime="application/pdf")
+out = bench.handle("a2", "compare these", attachments=[one, two, notes])
 blocks = bench.blocks()
 check(len(blocks) == 4, "three attachments on one message all reach the agent")
 check([b["type"] for b in blocks] == ["text", "image", "image", "resource"],
       "each as the kind of block its media type calls for, in the order sent")
-check(base64.b64decode(blocks[1]["data"]) == one.read_bytes()
-      and base64.b64decode(blocks[2]["data"]) == two.read_bytes(),
+check(base64.b64decode(blocks[1]["data"]) == Path(one.path).read_bytes()
+      and base64.b64decode(blocks[2]["data"]) == Path(two.path).read_bytes(),
       "the two images are not confused with each other")
 resource = blocks[3]["resource"]
-check(base64.b64decode(resource["blob"]) == notes.read_bytes()
+check(base64.b64decode(resource["blob"]) == Path(notes.path).read_bytes()
       and resource["mimeType"] == "application/pdf",
       "a file that is neither image nor audio rides as an embedded resource, "
       "byte for byte")
-check(resource["uri"] == Path(notes).resolve().as_uri(),
+check(resource["uri"] == Path(notes.path).resolve().as_uri(),
       "which names where it came from, rather than replacing it with the name")
 check("one.png" in blocks[0]["text"] and "two.png" in blocks[0]["text"]
       and "notes.pdf" in blocks[0]["text"],
@@ -199,12 +202,8 @@ blind = {"agentCapabilities": {"promptCapabilities": {"image": False,
          "turns": [{"actions": [{"type": "message", "text": "I see no image."}],
                     "stopReason": "end_turn"}]}
 bench = Bench(blind)
-shot = bench.file("screenshot.png", PNG)
-out = bench.handle(
-    "b1", "what is wrong with this?",
-    attachments=[{"locator": str(shot), "mime": "image/png",
-                  "filename": "screenshot.png"}],
-)
+out = bench.handle("b1", "what is wrong with this?",
+                   attachments=[bench.file("screenshot.png", PNG)])
 blocks = bench.blocks()
 check(len(blocks) == 1 and blocks[0]["type"] == "text",
       "an agent that did not advertise images is sent none")
@@ -219,6 +218,9 @@ check("I see no image." in out,
       "the Turn still runs and its answer still comes back")
 check(blocks[0]["text"].endswith("what is wrong with this?"),
       "the person's own text is unchanged by an attachment that failed")
+check("not readable" not in blocks[0]["text"],
+      "and the agent is not told the file is unreadable when the truth is that "
+      "it arrived and the agent said it could not take it")
 
 # Advertised for images, not for anything else: the same message, but now it
 # can say what *would* work.
@@ -226,13 +228,10 @@ partly = {"agentCapabilities": {"promptCapabilities": {"image": True}},
           "turns": [{"actions": [{"type": "message", "text": "ok"}],
                      "stopReason": "end_turn"}]}
 bench = Bench(partly)
-shot = bench.file("shot.png", PNG)
-tune = bench.file("voice.ogg", b"OggS\x00\x02voice")
 out = bench.handle(
     "b2", "look and listen",
-    attachments=[{"locator": str(shot), "mime": "image/png", "filename": "shot.png"},
-                 {"locator": str(tune), "mime": "audio/ogg", "filename": "voice.ogg"}],
-)
+    attachments=[bench.file("shot.png", PNG),
+                 bench.file("voice.ogg", b"OggS\x00\x02voice", mime="audio/ogg")])
 blocks = bench.blocks()
 check([b["type"] for b in blocks] == ["text", "image"],
       "the kind it advertised goes; the kind it did not stays behind")
@@ -246,12 +245,7 @@ check("This agent accepts: images." in out,
 # --- an attachment that cannot be read is reported the same way -------------
 
 bench = Bench(ANSWERS)
-missing = bench.media / "gone.png"
-out = bench.handle(
-    "c1", "have a look",
-    attachments=[{"locator": str(missing), "mime": "image/png",
-                  "filename": "gone.png"}],
-)
+out = bench.handle("c1", "have a look", attachments=[bench.absent("gone.png")])
 check(len(bench.blocks()) == 1, "a file that is not there is not sent")
 check("I can't read that kind of attachment" in out and "gone.png" in out,
       "and its absence is stated in the room rather than swallowed")
@@ -260,26 +254,81 @@ check("not on this machine" in out, "with the reason it could not be read")
 bench = Bench(ANSWERS)
 out = bench.handle(
     "c2", "have a look",
-    attachments=[{"locator": str(bench.media), "mime": "image/png",
-                  "filename": "a-directory"}],
-)
+    attachments=[bench.absent("a-directory", where=str(bench.media))])
 check(len(bench.blocks()) == 1 and "regular file" in out,
-      "a locator pointing at something that is not a file is refused and said")
+      "a path pointing at something that is not a file is refused and said")
 
 # Two attachments, two different failures, one message about them.
 bench = Bench(ANSWERS)
 out = bench.handle(
     "c3", "have a look",
-    attachments=[{"locator": str(bench.media / "nope.png"), "mime": "image/png",
-                  "filename": "nope.png"},
-                 {"locator": "relative/path.png", "mime": "image/png",
-                  "filename": "relative.png"}],
-)
+    attachments=[bench.absent("nope.png"),
+                 bench.absent("relative.png", where="relative/path.png")])
 check(out.count("I can't read that kind of attachment") == 1,
       "several failures are one fact about the run, said once")
 check("nope.png" in out and "relative.png" in out,
       "and every file that failed is named in it")
 check("2 of its attachments" in out, "counted, so nothing looks like it got through")
+
+# --- a fetch that never happened degrades to words, and the Turn goes on ----
+# The Relay Client delivers a Task whose media it could not download rather than
+# holding or rejecting it: the gateway answers 502 for every cause, so waiting
+# for a good answer is waiting for ever, and dead-lettering steals the person's
+# chance of being answered in words. What is left is a name and a reason, and
+# both ends hear it — the agent in its prompt, the room in a notice.
+
+seen = {"turns": [{"actions": [{"type": "message",
+                                "text": "I can see you attached something, but "
+                                        "it did not reach me."}],
+                   "stopReason": "end_turn"}]}
+bench = Bench(seen)
+out = bench.handle("f1", "what is wrong with this?",
+                   attachments=[bench.absent("photo.jpg", mime="image/jpeg",
+                                             reason=UNREACHABLE)])
+blocks = bench.blocks()
+check(len(blocks) == 1 and blocks[0]["type"] == "text",
+      "an attachment with no bytes behind it is sent as no content block")
+check("it did not reach me" in out,
+      "the Turn runs and is answered — a failed fetch is not a failed Turn")
+check("photo.jpg" in blocks[0]["text"] and "not readable" in blocks[0]["text"],
+      "the agent is told in band that a file was meant to be here and is not")
+check(blocks[0]["text"].endswith("what is wrong with this?"),
+      "in the framing, never inside what the person typed")
+check(UNREACHABLE in out and "photo.jpg" in out,
+      "and the room is told, in the Relay Client's own words for why")
+check("not absolute" not in out and "not on this machine" not in out,
+      "not in this module's words for a path, which is a different failure")
+check("://" not in out and "://" not in blocks[0]["text"],
+      "neither end is shown the address that could not be fetched")
+
+# An agent that would not have taken the file anyway is not the reason it is
+# missing. Asked in that order the room hears "this agent did not say it can
+# take image attachments" about a file that never reached the machine — a true
+# sentence about the wrong failure, under a media type read off a marker hint.
+bench = Bench({"agentCapabilities": {"promptCapabilities": {"image": False,
+                                                            "embeddedContext": False}},
+               "turns": [{"actions": [{"type": "message", "text": "ok"}],
+                          "stopReason": "end_turn"}]})
+out = bench.handle("f3", "have a look",
+                   attachments=[bench.absent("photo.jpg", mime="image/jpeg",
+                                             reason=UNREACHABLE)])
+check(UNREACHABLE in out,
+      "a fetch that never happened is answered before the agent's capabilities "
+      "are asked about it")
+check("did not say it can take" not in out,
+      "so what the agent advertises is never reported as why a file is absent")
+
+# The same, with nothing typed alongside it: an upload with no caption whose
+# fetch also failed is the thinnest Task the wire can produce, and it still has
+# to reach the agent as a question rather than be dead-lettered as empty.
+bench = Bench(seen)
+out = bench.handle("f2", "",
+                   attachments=[bench.absent("photo.jpg", mime="image/jpeg",
+                                             reason=UNREACHABLE)])
+blocks = bench.blocks()
+check("it did not reach me" in out, "a captionless upload that failed is still asked")
+check("photo.jpg" in blocks[0]["text"],
+      "and the one thing known about it — its name — is what it is asked about")
 
 # --- the size limit refuses; it never resizes -------------------------------
 
@@ -288,11 +337,7 @@ big = bench.file("big.png", PNG * 40)
 previous = os.environ.get(MAX_BYTES_ENV)
 os.environ[MAX_BYTES_ENV] = "1024"
 try:
-    out = bench.handle(
-        "d1", "what is wrong with this?",
-        attachments=[{"locator": str(big), "mime": "image/png",
-                      "filename": "big.png"}],
-    )
+    out = bench.handle("d1", "what is wrong with this?", attachments=[big])
 finally:
     if previous is None:
         os.environ.pop(MAX_BYTES_ENV, None)
@@ -308,12 +353,9 @@ check("resiz" not in out.lower() and "shrunk" not in out.lower(),
 # --- a non-owner Task never gets as far as opening anything -----------------
 
 bench = Bench(ANSWERS)
-shot = bench.file("shot.png", PNG)
-out = bench.handle(
-    "e1", "what is in this file?",
-    attachments=[{"locator": str(shot), "mime": "image/png", "filename": "shot.png"}],
-    access_tier="other",
-)
+out = bench.handle("e1", "what is in this file?",
+                   attachments=[bench.file("shot.png", PNG)],
+                   access_tier="other")
 check("only answer my owner" in out and bench.report() is None,
       "a Task at another Tier is refused before an attachment is opened at all")
 

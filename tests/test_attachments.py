@@ -1,21 +1,26 @@
-"""Tests for the attachment header and for opening what it points at.
+"""Tests for what the Relay Client hands over, and for opening what it points at.
 
-Two halves. The first is the header format — the one-line JSON array
-`ag2-sparrow`'s `format_attachments` used to write — decoded the way its own
-`parse_attachments` decoded it, tolerantly. **No such header reaches the Worker
-any more**: the Relay Client is a library in-process, it resolves the wire's media
-markers itself and delivers local paths, and transport-seam ticket 08 is where
-this parser goes with the header it read. It is kept and tested until then
-because deleting a decoder and its replacement in one change leaves nothing to
-compare against.
+Three halves, and the first one is a guard rather than a test of behaviour.
+**Nothing in `agent_connect` parses a wire for attachments any more, and nothing
+may start again.** There is no `attachments:` header — the broker never sent one
+and never has — and the `[ag2space-media: …]` marker that really does ride
+inside the task string is read, fetched and written to disk by
+`ag2_relay_client.media` before a Task is delivered. So the guard walks every
+module in the package and refuses to find that vocabulary anywhere except in
+prose: a docstring may explain why the parser is gone, and no line of code may
+bring it back.
 
-The second half is the part that touches the filesystem, and it is the
-interesting one — and it does *not* retire with the header, because bytes still
-land on disk: the locator is sender-adjacent data, so every check that stands
-between it and `os.read` is asserted here against a real file, a real symlink, a
-real FIFO and a real directory.
+The second half is the crossing itself — the library's `path` / `name` /
+`ok` / `reason` becoming the boundary's `path` / `filename` / `reason` — which
+is the one place those two vocabularies meet. It is tested against the library's
+real `Attachment`, imported, because the last fixture that described the
+boundary's own type instead proved nothing and hid a Turn that died on every
+message carrying a file.
 
-No dependencies: this is the Worker's own vocabulary, not ACP.
+The third is the part that touches the filesystem, and it is the interesting
+one: bytes still land on disk, and the path is sender-adjacent data, so every
+check that stands between it and `os.read` is asserted against a real file, a
+real symlink, a real FIFO and a real directory.
 
 Run: python3 tests/test_attachments.py
 """
@@ -23,12 +28,15 @@ from __future__ import annotations
 
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
+import ast
 import asyncio
-import json
 import os
 import tempfile
 from pathlib import Path
 
+from ag2_relay_client.media import UNREACHABLE
+from ag2_relay_client.media import Attachment as Resolved
+import agent_connect
 from agent_connect import attachments
 from agent_connect.adapters.shim import ShimAdapter
 from agent_connect.attachments import Attachment
@@ -48,52 +56,104 @@ def check(cond, name):
 tmp = tempfile.TemporaryDirectory()
 base = Path(tmp.name)
 
-# --- the header is a one-line JSON array of objects -------------------------
-# Not invented here: `local_task_protocol.format_attachments` is the encoder,
-# `parse_attachments` the decoder, and this is that shape.
+# --- no marker or header parsing remains anywhere in agent_connect ----------
+# Mechanical on purpose. This one is not an assertion about today's code so much
+# as a door held shut: every vocabulary below belongs to a parser this package
+# no longer has, and the cheapest way for one to come back is for somebody to
+# reasonably decide that reading a path out of a body is convenient.
+#
+# Docstrings are exempt and comments are invisible to `ast`, which is the whole
+# design: the modules are *supposed* to say why they do not parse this. What is
+# scanned is every other string constant, which is where a marker tag, a header
+# name or a dead field would have to live if code were reading one.
 
-header = json.dumps(
-    [
-        {"locator": "/tmp/media/shot.png", "mime": "image/png",
-         "filename": "shot.png", "size": 1234, "sha256": "ab", "id": "m1"},
-        {"locator": "/tmp/media/notes.pdf", "mime": "application/pdf",
-         "filename": "notes.pdf"},
-    ],
-    separators=(",", ":"),
+#: Wire vocabulary no module in this package may carry as code.
+FORBIDDEN = (
+    "ag2space-media",     # the marker the library resolves before delivery
+    "attachments:",       # the header that never existed on this wire
+    "content_modalities",  # sparrow's summary of a header it wrote itself
+    "media_form",         # the same, and always the constant "attachment"
+    "File attached",      # the body line sparrow dual-wrote; a sender can type it
+    "Photo attached",
+    "locator",            # AttachmentRef's word: a URL there, a path here
+    "sha256",             # never populated even by the client that invented it
 )
-refs = attachments.parse(header)
-check(len(refs) == 2, "several attachments on one message all decode")
-check(refs[0].locator == "/tmp/media/shot.png" and refs[0].mime == "image/png",
-      "the locator and the media type come back as written")
-check(refs[0].filename == "shot.png" and refs[0].size == 1234
-      and refs[0].sha256 == "ab" and refs[0].id == "m1",
-      "and so does every optional field the relay may have stamped")
-check(refs[1].size == 0 and refs[1].sha256 == "",
-      "an element the relay wrote compactly keeps meaningful defaults")
-check("\n" not in header,
-      "the encoded value is a single line, so it cannot forge a header of its own")
 
-# Tolerant by contract: a bad attachments header must not cost the person their
-# question, which is the relay's own rule for the same value.
-check(attachments.parse(None) == () and attachments.parse("") == ()
-      and attachments.parse("   ") == (),
-      "a missing or empty header is no attachments")
-check(attachments.parse("not json at all") == (),
-      "a malformed value is skipped, not raised")
-check(attachments.parse('{"locator": "/x"}') == (),
-      "a payload that is not a list is skipped")
-check(attachments.parse('["/tmp/x", 3, null]') == (),
-      "elements that are not objects are skipped")
-check(attachments.parse('[{"mime": "image/png"}, {"locator": ""}]') == (),
-      "an element with nothing to point at is dropped")
-mixed = attachments.parse(
-    '[{"locator": "/a", "size": true}, {"locator": "/b", "size": -5},'
-    ' {"locator": "/c", "mime": {"x": 1}}]'
-)
-check(len(mixed) == 3, "one nonsensical field does not lose the whole attachment")
-check(mixed[0].size == 0, "a JSON bool is not a byte count")
-check(mixed[1].size == 0, "and neither is a negative one")
-check(mixed[2].mime == "", "a field that is not a string is not str()'d into one")
+PACKAGE = Path(agent_connect.__file__).resolve().parent
+
+
+def code_strings(tree: ast.AST):
+    """Every string constant in a module that is not a docstring."""
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and id(node) not in docstrings):
+            yield node
+
+
+modules = sorted(PACKAGE.rglob("*.py"))
+check(len(modules) >= 10, "the guard found the package it is guarding")
+offences = []
+for module in modules:
+    tree = ast.parse(module.read_text(), filename=str(module))
+    for node in code_strings(tree):
+        for word in FORBIDDEN:
+            if word in node.value:
+                offences.append(f"{module.relative_to(PACKAGE)}:{node.lineno} {word!r}")
+check(not offences,
+      "no module carries wire vocabulary as code" + (f" — {offences}" if offences else ""))
+
+check(not hasattr(attachments, "parse"),
+      "the header decoder is gone, not merely unused")
+check("json" not in vars(attachments),
+      "and so is the JSON it decoded with")
+check(not any(f in Attachment.__dataclass_fields__
+              for f in ("locator", "sha256", "id", "expiry")),
+      "the boundary's Attachment carries none of AttachmentRef's dead fields")
+check(set(Attachment.__dataclass_fields__)
+      == {"path", "mime", "filename", "size", "reason"},
+      "only a local path, two labels, a size, and why there are no bytes")
+
+# The prose is not merely allowed, it is expected: the guard would be a puzzle
+# without the module that explains what it is guarding against.
+check("ag2space-media" in (attachments.__doc__ or ""),
+      "the module still says out loud whose job the marker is")
+
+# --- the library's vocabulary crosses into the boundary's --------------------
+# `delivered` is the whole of the crossing, and it is tested against the real
+# `ag2_relay_client.media.Attachment` rather than a hand-written stand-in: a
+# stand-in is exactly how a Turn carrying any file at all came to die on a
+# field the boundary did not have.
+
+crossed = attachments.delivered((
+    Resolved(path="/tmp/media/shot.png", mime="image/png", name="shot.png",
+             kind="m.image", size=1234, ok=True),
+    Resolved(mime="image/jpeg", name="photo.jpg", kind="m.image",
+             ok=False, reason=UNREACHABLE),
+))
+check(len(crossed) == 2, "every attachment on a Task crosses, failures included")
+check(crossed[0].path == "/tmp/media/shot.png" and crossed[0].mime == "image/png"
+      and crossed[0].filename == "shot.png" and crossed[0].size == 1234,
+      "a fetched one arrives with its path, its media type, its name and its size")
+check(crossed[0].ok and crossed[0].reason == "",
+      "and with nothing to say about why it is not here, because it is")
+check(crossed[1].path == "" and not crossed[1].ok
+      and crossed[1].reason == UNREACHABLE,
+      "a failed fetch keeps the library's own sentence for why there are no bytes")
+check("://" not in crossed[1].reason and "http" not in crossed[1].reason,
+      "which names neither the address nor the host — that is what it is for")
+check(crossed[1].filename == "photo.jpg",
+      "and is still named, so a person can be told which of their files it was")
+check(attachments.delivered(()) == () and attachments.delivered(None) == (),
+      "a Task that carried nothing crosses as nothing")
 
 # --- media type and modality ------------------------------------------------
 
@@ -114,8 +174,9 @@ check(attachments.mime_of(Attachment("/a", filename="mystery")) ==
       attachments.OCTET_STREAM,
       "and a name that says nothing gets no invented media type")
 
-# A name is repeated in a room, so it is scrubbed: a JSON-encoded filename can
-# carry a newline through a one-line header, and a room message is lines.
+# A name is repeated in a room, so it is scrubbed. The marker it came from
+# escapes nothing at all, so a filename is the last thing to be trusted with a
+# line of its own in a room message.
 check(attachments.label(Attachment("/tmp/x", filename="shot.png")) == "shot.png",
       "the platform's filename is what a person is told")
 check("\n" not in attachments.label(
@@ -168,6 +229,19 @@ check(not piped.ok and "regular file" in piped.problem,
 check(not attachments.read(Attachment("/dev/zero")).ok,
       "a character device is refused too")
 
+# A file that never arrived has no path, and every sentence above is about a
+# path. Saying "its path is not absolute" of one would be a true statement about
+# a file that never had one and a lie about why it is missing.
+never = attachments.delivered(
+    (Resolved(mime="image/jpeg", name="photo.jpg", ok=False, reason=UNREACHABLE),))[0]
+gone = attachments.read(never)
+check(not gone.ok and gone.problem == UNREACHABLE,
+      "a fetch that never happened is reported in the Relay Client's words")
+check("absolute" not in gone.problem and gone.data == b"",
+      "not in this module's words for a path it was never given")
+check(attachments.read(never, limit=1).problem == UNREACHABLE,
+      "and the limit has nothing to say about bytes that do not exist")
+
 # The limit is a refusal, never a resize: a shrunk screenshot is a different
 # screenshot, and the person asking about theirs deserves to be told.
 big = base / "big.bin"
@@ -196,12 +270,8 @@ check(attachments.max_bytes({"AGENT_CONNECT_ATTACHMENT_MAX_BYTES": "-1"})
       "and neither is a negative one")
 
 # --- the Task carries them, and the body is left alone ----------------------
-# The header these used to be written in is gone with the file it was written
-# in: the library resolves the wire's media markers and delivers local paths.
-# What is asserted here is the part that did not change — an attachment travels
-# beside the prompt and never inside it.
 
-shot = Attachment(locator=str(real), mime="image/png", filename="shot.png")
+shot = Resolved(path=str(real), mime="image/png", name="shot.png", ok=True)
 ctx = turn_context(
     task("t9", f"what is wrong with this?\n[Photo attached: {real}]",
          room="!room:ag2.space", attachments=(shot,)),
@@ -243,8 +313,9 @@ shim_ws = base / "shim"
 shim_out = asyncio.run(handle_one(
     task("s1", "what is wrong with this?", room="!room:ag2.space",
          attachments=(
-             Attachment(locator=str(real), mime="image/png", filename="shot.png"),
-             Attachment(locator=str(real), mime="application/pdf", filename="notes.pdf"),
+             Resolved(path=str(real), mime="image/png", name="shot.png", ok=True),
+             Resolved(path=str(real), mime="application/pdf", name="notes.pdf",
+                      ok=True),
          )),
     shimmed, str(base), shim_ws / "results"))
 
@@ -260,6 +331,22 @@ check(impl.seen is not None and impl.seen.endswith("what is wrong with this?"),
       "the person's own text reaches the Adapter unchanged")
 check(str(real) not in (impl.seen or ""),
       "and no attachment path is smuggled into the prompt for it to go and read")
+
+# A shimmed Adapter takes text and nothing else — but that is not why a file
+# nobody could download is absent, and only the library's reason says which of
+# the two happened.
+impl = OnlyText()
+shim_ws2 = base / "shim2"
+(shim_ws2 / "results").mkdir(parents=True)
+shim_gone = asyncio.run(handle_one(
+    task("s2", "what is wrong with this?", room="!room:ag2.space",
+         attachments=(Resolved(mime="image/jpeg", name="photo.jpg", ok=False,
+                               reason=UNREACHABLE),)),
+    ShimAdapter("codex", impl), str(base), shim_ws2 / "results"))
+check("photo.jpg" in shim_gone and UNREACHABLE in shim_gone,
+      "a file that never arrived is named to the room with the reason it did not")
+check("I answered the text." in shim_gone,
+      "and the Turn is answered anyway — a failed fetch is not a failed Turn")
 
 tmp.cleanup()
 print("\n" + ("PASS — attachments green" if fails == 0 else f"FAIL — {fails} failing"))

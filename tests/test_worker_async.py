@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 from _queue import FakeClient, task
+from ag2_relay_client import media
 from agent_connect import events as ev
 from agent_connect.adapters import ADAPTERS, ShimAdapter, get as get_adapter
 from agent_connect.events import Done, MessageChunk, TurnContext
@@ -344,9 +345,9 @@ check(len(client.completed) + len(client.rejected) == 3,
 # retry can recover it, for a screenshot somebody dropped into a room.
 results = workspace()
 client = FakeClient()
-shot = task("e4", "", attachments=(ev.Attachment(
-    locator="/tmp/nothing/Screenshot.png", filename="Screenshot.png",
-    mime="image/png"),))
+shot = task("e4", "", attachments=(media.Attachment(
+    path="/tmp/nothing/Screenshot.png", name="Screenshot.png",
+    mime="image/png", ok=True),))
 looked = NativeStub()
 body = asyncio.run(handle_one(shot, looked, "/repo", results, client=client))
 check(client.refusal("e4") is None,
@@ -356,7 +357,8 @@ check(client.answer("e4") == body and body,
 check(len(looked.seen) == 1 and "Screenshot.png" in looked.seen[0].prompt,
       "the Adapter is asked about the file by name — an upload with no caption "
       "is still a question, and this is the only place that knows what it is")
-check(looked.seen and looked.seen[0].attachments == shot.attachments,
+check(looked.seen and [a.path for a in looked.seen[0].attachments]
+      == ["/tmp/nothing/Screenshot.png"],
       "and the file travels beside the prompt, never folded into it")
 
 still_empty = task("e5", "")
