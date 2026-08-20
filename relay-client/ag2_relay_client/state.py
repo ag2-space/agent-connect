@@ -112,6 +112,15 @@ def write_private_atomic(path, text: str) -> None:
     exactly the kind of directory that gets synced somewhere. The fsync is what
     makes "durable" mean durable rather than "in the page cache when the power
     went" — the whole ack-ordering rule (F2) is a lie without it.
+
+    Two fsyncs, not one. The first makes the *bytes* durable; the second makes
+    the *rename* durable. `os.replace` is atomic, which is what a concurrent
+    reader needs, and that is a different property from surviving a power cut:
+    without the directory fsync the entry can still name the old file after the
+    machine comes back, so the journal is a version behind exactly in the crash
+    this file exists for. The journal's own docstring claims "an fsync on every
+    change, because 'durable' is what F2's ack ordering rests on" — that was
+    half of it (E2, F7).
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +142,28 @@ def write_private_atomic(path, text: str) -> None:
         except OSError:
             pass
         raise
+    fsync_dir(path.parent)
+
+
+def fsync_dir(directory) -> None:
+    """Make a rename in `directory` durable, best-effort.
+
+    Best-effort by construction: not every filesystem lets a directory be
+    opened for fsync (and Windows does not let it be opened at all), and a
+    write that already landed must not be failed because the entry pointing at
+    it could not be flushed. Never raises — this runs inside the poll iteration
+    by way of the journal (D4).
+    """
+    try:
+        handle = os.open(str(directory), os.O_RDONLY)
+    except OSError:  # pragma: no cover — platform/filesystem dependent
+        return
+    try:
+        os.fsync(handle)
+    except OSError:  # pragma: no cover — same
+        pass
+    finally:
+        os.close(handle)
 
 
 class StateLayout:

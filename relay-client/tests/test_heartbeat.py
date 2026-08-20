@@ -217,5 +217,45 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(second.inflight() == ["task-slow"],
           "a task this run accepted stays in flight until it is answered")
 
+# --- C4: a consumer with its own scheduler can say "this one is mine" -------
+# `prepare()` invites exactly such a consumer, and such a consumer can carry
+# work across a restart that this run never accepted from the wire. E3 drops
+# those — right for an id whose Task died with its process, wrong for one a
+# consumer persisted and is still working on, and it costs the room sidecar
+# (F7), so an attachment produced afterwards has no room to target. The live set
+# and the reconciler are both private, so there was no way to say so.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    first = client_for(broker, tmp)
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task("task-carried")]})
+    first.poll_once()
+    first.next_task(timeout=1)
+    bury(first)
+
+    resumed = client_for(broker, tmp)
+    check(resumed.inflight() == ["task-carried"],
+          "the id is inherited from the journal, as an id this run never "
+          "accepted from the wire")
+    check(resumed.journal.room_for("task-carried") == "!room:ag2.space",
+          "with the room sidecar E3 would take with it (F7)")
+
+    resumed.hold("task-carried")
+    for _ in range(5):
+        resumed.heartbeat()
+    check(resumed.inflight() == ["task-carried"],
+          "a held id is never reconciled away, however many passes go by (C4)")
+    check(resumed.journal.room_for("task-carried") == "!room:ag2.space",
+          "so the room a media answer has to target is still there")
+
+    broker.on("POST", "/v1/results", json={"ok": True})
+    resumed.complete("task-carried", "the answer the consumer was still writing")
+    check(resumed.inflight() == [], "and answering releases the hold")
+
+    refused = None
+    try:
+        resumed.hold("../etc/passwd")
+    except ValueError as exc:
+        refused = exc
+    check(refused is not None, "an id that is not a wire slug is refused (F8)")
+
 print("\n" + ("PASS — heartbeat green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

@@ -86,7 +86,18 @@ class StatusReporter:
             "connected": False,
             "state": RECONNECTING,
             "error": None,
+            #: How long the loop waits because something *failed*.
             "backoff_s": 0.0,
+            #: How long it waits because it is deliberately not polling — a
+            #: standby waiting its turn behind another poller's guard (J1).
+            #: Separate from `backoff_s` on purpose: a supervisor that cannot
+            #: tell a retry from a standby cannot tell an outage from a
+            #: correctly arbitrated pair of clients.
+            "recheck_s": 0.0,
+            #: Seconds left on F4's ack cooldown. Non-zero means tasks accepted
+            #: right now are going un-acked, which against this broker means
+            #: their leases are being requeued underneath a running Turn.
+            "acks_paused_s": 0.0,
             "inflight": 0,
             "pending_results": 0,
             "last_ok_ts": _previous_last_ok(self.path),

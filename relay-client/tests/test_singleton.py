@@ -39,7 +39,7 @@ from pathlib import Path
 from fake_broker import FakeBroker
 
 from ag2_relay_client import singleton
-from ag2_relay_client.client import RelayClient
+from ag2_relay_client.client import NO_SEND, RelayClient
 from ag2_relay_client.credentials import TokenSource
 from ag2_relay_client.singleton import DEGRADED, HELD, IDLE, LOST, PollerGuard
 from ag2_relay_client.status import DISPLACED, STANDBY
@@ -71,9 +71,11 @@ class Listening(logging.Handler):
                    for level, text in self.lines)
 
 
-def wire_task(wire_id="task-1"):
-    return {"id": wire_id, "task": "do it", "channel_id": "!room:ag2.space",
+def wire_task(wire_id="task-1", **over):
+    task = {"id": wire_id, "task": "do it", "channel_id": "!room:ag2.space",
             "user_id": "@alice:ag2.space", "access_tier": "owner"}
+    task.update(over)
+    return task
 
 
 def client_for(broker, tmp, **kwargs):
@@ -320,6 +322,46 @@ with tempfile.TemporaryDirectory() as tmp:
     check(PollerGuard(undated).claim() == HELD,
           "a record with no heartbeat is infinitely stale, whatever its pid")
 
+    # B3: and neither does a stamp from the FUTURE. `age = now - stamp` was
+    # never bounded below, so a negative age was always under the window and
+    # every other client on the bearer answered LOST for as long as the clock
+    # was wrong — with no error anywhere to fail open on. Realistic on a
+    # desktop: an RTC ahead of NTP at boot, a VM or snapshot restore, a state
+    # dir synced or restored from another machine, a laptop resume.
+    for label, stamp in (("an hour", time.time() + 3600),
+                         ("a year", time.time() + 365 * 86400),
+                         ("infinitely", float("inf"))):
+        ahead = Path(tmp) / f"ahead-{label.replace(' ', '-')}.lock"
+        ahead.write_text(json.dumps(
+            {"owner": "somebody", "pid": 1, "heartbeat_ts": stamp}))
+        check(PollerGuard(ahead).claim() == HELD,
+              f"a record stamped {label} ahead does not silence this bearer "
+              f"forever — freshness cannot arbitrate against a clock, so J1's "
+              f"fail-open rule takes the guard (B3)")
+    # `json.loads` accepts `Infinity` and `NaN` as bare tokens, and both used to
+    # reach the arithmetic as floats.
+    for token in ("Infinity", "NaN"):
+        odd = Path(tmp) / f"{token}.lock"
+        odd.write_text('{"owner": "somebody", "pid": 1, "heartbeat_ts": %s}' % token)
+        check(PollerGuard(odd).claim() == HELD,
+              f"and neither does a JSON {token} stamp, which json.loads accepts")
+
+    # A stamp a couple of seconds ahead is ordinary clock skew between two
+    # processes and is still a live claim: the tolerance is not a licence to
+    # take the guard from anybody whose clock is a hair fast.
+    skewed = Path(tmp) / "skewed.lock"
+    skewed.write_text(json.dumps(
+        {"owner": "somebody", "pid": 1, "heartbeat_ts": time.time() + 1.0}))
+    check(PollerGuard(skewed).claim() == LOST,
+          "while a stamp a second ahead is ordinary skew, and keeps its claim")
+
+    # B8: `os.write` may write fewer bytes than it was handed, and the return
+    # value used to be dropped — a short write plus an ftruncate to the intended
+    # length leaves NUL padding inside the JSON, which reads as a free guard.
+    written = (_bootstrap.ROOT / "ag2_relay_client" / "singleton.py").read_text()
+    check("os.write(handle" not in written.replace("step = os.write(handle", ""),
+          "the guard's write checks how much of the record actually landed")
+
     # A holder whose *renew* fails keeps polling: it wrote the record last, and
     # a claim that could not be checked has not been lost.
     working = PollerGuard(Path(tmp) / "working.lock")
@@ -356,6 +398,29 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     snapshot = other.snapshot()
     check(snapshot["state"] == STANDBY and snapshot["singleton"] == LOST,
           "and says which of the two it is, in the file a supervisor reads")
+    # B9: a standby is not a retry. The recheck interval used to be written into
+    # `backoff_s`, whose own constant says "It is not backoff — nothing failed",
+    # so a supervisor could not tell a client that is failing from a pair of
+    # clients arbitrating correctly.
+    check(snapshot["backoff_s"] == 0.0 and snapshot["recheck_s"] == 7.0,
+          "and says it in its own field: nothing failed, so nothing is backing "
+          "off (B9)")
+
+    # B5: of the four calls a consumer can make straight onto the wire, the
+    # heartbeat is the one a standby must not make. It announces this client as
+    # the bearer's live worker and carries an `inflight` the broker's presence
+    # sweep schedules against — two clients announcing that about one bearer is
+    # the split brain the guard exists to prevent.
+    broker.forget()
+    check(other.heartbeat() is False, "a standby refuses to heartbeat (B5, J1)")
+    check(broker.requests == [], "and sends nothing at all")
+    # `complete` and `reject` stay open on purpose: they deliver an answer for a
+    # lease this client genuinely holds, and F5 plus J1's fail-open rule agree
+    # that losing a user's answer to a lock is the worse outcome. `healthz`
+    # leases nothing, claims nothing and marks no presence.
+    broker.on("GET", "/v1/healthz", json={"status": "ok", "healthy": True})
+    check(other.healthz()["healthy"] is True,
+          "while healthz stays open — it leases nothing and claims nothing")
 
     # The standby is a standby, not a corpse: when the holder releases, it
     # takes over by itself.
@@ -366,34 +431,190 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
 
 # A holder that is displaced stops polling immediately — on its own thread,
 # mid-flight, which is the shape of the reaped-process incident.
+#
+# The holder here is made to *hang*, which is the incident's actual shape and
+# not what this scenario used to do: it used to rely on the guard's refresh
+# throttle being longer than the freshness window, so a perfectly live client
+# went stale for being punctual. That is B2 in miniature, and the guard now
+# refuses to be configured that way — `refresh_interval` is capped at a third of
+# `stale_after` — so a hung holder has to actually hang. A broker that takes
+# 1.2 s to answer the long poll does it: the loop is inside one bounded call,
+# reaches no stamp, and ages out exactly as J1 wants.
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
-    broker.on("GET", "/v1/tasks", json={"tasks": []})
+    broker.on("GET", "/v1/tasks", json={"tasks": []}, delay=1.2)
     reaped = client_for(broker, tmp, idle_gap=0.02, singleton_stale_after=0.3)
     reaped.start()
-    time.sleep(0.3)
-    check(len(broker.took("GET", "/v1/tasks")) > 0, "the holder is polling")
+    time.sleep(0.6)
+    check(len(broker.requests) > 0, "the holder is polling, and is inside a poll")
 
-    # Its record is now stale — it stamped once and the freshness window is
-    # 0.3 s — so a replacement takes the bearer.
     replacement = client_for(broker, tmp, singleton_stale_after=0.3)
-    check(replacement.poll_once() == 0.0, "a replacement takes the stale guard")
+    check(replacement.poll_once() == 0.0,
+          "a replacement takes the guard from a holder that has stopped saying "
+          "it is alive — pid-alive is not liveness, and this one's pid is fine")
 
     stopped_at = None
-    for _ in range(100):
+    for _ in range(200):
         time.sleep(0.05)
         if reaped.snapshot()["state"] == DISPLACED:
             stopped_at = len(broker.took("GET", "/v1/tasks"))
             break
     check(stopped_at is not None,
           "and the displaced client notices on its next turn, without being told")
-    time.sleep(0.3)
+    time.sleep(0.5)
     check(stopped_at is not None
           and len(broker.took("GET", "/v1/tasks")) == stopped_at,
           "then stops polling immediately — a displaced poller that finishes "
           "its turn is the double delivery, arriving late")
     check(reaped.snapshot()["error"] and "another poller" in reaped.snapshot()["error"],
           "the status file says why it went quiet, in words")
+
+    # B4: the documented way back. DISPLACED stops the loop from inside `_run`,
+    # which used to leave `_thread` pointing at a dead thread — so `start()`,
+    # which is what the README means by "coming back is the consumer's
+    # decision", raised `RuntimeError: this client is already started`. Only
+    # `stop()` cleared it, and nothing said you had to call it first.
+    # The replacement is the live holder now, and it stays live: a window it
+    # cannot go stale inside, and one fresh stamp before the question is asked.
+    reaped.guard.stale_after = replacement.guard.stale_after = 30.0
+    replacement.poll_once()
+    restarted = None
+    try:
+        reaped.start()
+    except RuntimeError as exc:
+        restarted = exc
+    check(restarted is None,
+          "a displaced client can be started again without stop() first (B4)")
+    check(reaped.guard.displaced is False,
+          "and it re-enters the arbitration honestly rather than re-acquiring "
+          "on its own — which would be the same incident with extra steps")
+    for _ in range(60):
+        time.sleep(0.05)
+        if reaped.snapshot()["state"] == STANDBY:
+            break
+    check(reaped.snapshot()["state"] == STANDBY,
+          "so it stands by behind the live holder, which is the whole point: "
+          "coming back must not mean polling alongside whoever took over")
     reaped.stop()
+
+# B2: a live holder must never lose the guard, and the turn has to be bounded
+# for that to be true. The measured failures were 125.0 s (one owed result, the
+# backoff at its cap) and 120.9 s with no failure at all — against a 120 s
+# window. Two things fixed it: the loop bounds its own turn, and it re-stamps
+# the record wherever it demonstrably got to instead of once per turn.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    # A result POST that takes far longer than the whole freshness window. This
+    # is the shape of the real one: `add_result` does the room's outbound send
+    # inside the request, so a large reply outlasts the timeout.
+    broker.on("POST", "/v1/results", json={"ok": True}, delay=0.9)
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task()]})
+    holder = client_for(broker, tmp, singleton_stale_after=0.6)
+    holder.poll_once()
+    holder.next_task(timeout=1)
+
+    rival = PollerGuard(holder.layout.singleton_path, stale_after=0.6)
+    broker.on("GET", "/v1/tasks", json={"tasks": []}, delay=0.5)
+    started = time.monotonic()
+    holder.complete("task-1", "an answer that takes a while to hand over")
+    holder.poll_once()
+    turn = time.monotonic() - started
+    check(turn > 0.6,
+          f"the turn ran longer than the whole freshness window ({turn:.2f}s of "
+          f"0.60s) — which is the case that displaced a live holder")
+    check(rival.claim() == LOST,
+          "and the holder still has the guard: it stamped at the phase "
+          "boundaries it passed, so the window bounds the longest single call "
+          "and not the sum of them (B2, J1)")
+    check(holder.guard.state == HELD and holder.guard.displaced is False,
+          "so a client that was alive the whole time is not displaced")
+
+# B2's other half: the wait between turns is chunked, so a client idling out a
+# backoff is not mistaken for a hung one. A 60s backoff cap under a 150s window
+# was the largest single term in the arithmetic, and it bought nothing — a loop
+# that is genuinely hung never reaches the wait at all.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    waiting = client_for(broker, tmp, singleton_stale_after=0.6)
+    waiting.guard.claim()
+    waiting.guard.refresh_interval = 0.0
+    rival = PollerGuard(waiting.layout.singleton_path, stale_after=0.6)
+    stamped = record_of(waiting.layout.singleton_path)["heartbeat_ts"]
+    waiting._wait(0.9)
+    check(record_of(waiting.layout.singleton_path)["heartbeat_ts"] > stamped,
+          "the guard is re-stamped through a wait longer than the window")
+    check(rival.claim() == LOST, "so an idling holder keeps its bearer")
+
+# B6: `stop()` releases only after the loop has actually left. A join that timed
+# out used to release anyway — emptying the record while the poll thread was
+# still inside `GET /v1/tasks`, so another client polled alongside it, which is
+# the precise thing the release-after-join ordering exists to prevent.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    broker.on("GET", "/v1/tasks", json={"tasks": []}, delay=1.0)
+    slow = client_for(broker, tmp, idle_gap=0.01)
+    slow.start()
+    time.sleep(0.3)
+    slow.stop(timeout=0.05)     # shorter than the poll it is inside
+    record = record_of(slow.layout.singleton_path) if \
+        slow.layout.singleton_path.read_text().strip() else None
+    check(record is not None and record.get("owner") == slow.guard.owner,
+          "a stop() whose join timed out leaves the guard held rather than "
+          "handing the bearer to a second poller while this one may still be "
+          "inside a poll (B6)")
+    time.sleep(1.2)             # let the thread finish and leave
+
+# ...and a clean stop, where the join really joined, does release.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    broker.on("GET", "/v1/tasks", json={"tasks": []})
+    quick = client_for(broker, tmp, idle_gap=0.01)
+    quick.start()
+    time.sleep(0.2)
+    quick.stop()
+    check(quick.layout.singleton_path.read_text().strip() == "",
+          "a clean stop still releases, so a restart does not wait out a "
+          "freshness window it does not need")
+
+# B1: a standby that takes over must re-read the journal. Nothing on the
+# STANDBY -> HELD edge used to, so a fresh holder answered an already-answered
+# task a second time (F3 defeated) and its first accept rewrote the file from
+# stale memory, erasing the previous holder's `done` ledger. The longer it had
+# stood by, the more history it reverted.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    holder = client_for(broker, tmp)
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task()]})
+    broker.on("POST", "/v1/results", json={"ok": True})
+    holder.poll_once()
+
+    # The standby boots now — while `task-1` is merely accepted — and then
+    # stands by for as long as the holder lives. Everything the holder does to
+    # the journal from here is invisible to it until something re-reads.
+    standby = client_for(broker, tmp, standby_recheck=0.01)
+    check(standby.poll_once() == 0.01, "the standby stands by")
+    check(standby.journal.done_ids() == [],
+          "with the journal as it was at its boot: nothing answered yet")
+
+    holder.next_task(timeout=1)
+    holder.complete("task-1", "the holder's answer")
+    check(holder.journal.is_done("task-1"), "the holder answers and retires it")
+
+    holder.stop()               # a clean handover: the guard is released
+    broker.forget()
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    broker.on("POST", "/v1/results", json={"ok": True, "duplicate": True})
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(attempt=2)]})
+    check(standby.poll_once() == 0.0, "the standby takes the bearer over")
+
+    check(standby.next_task(timeout=0.2) is None,
+          "and does NOT hand the already-answered task to its consumer — the "
+          "journal is re-read on the takeover, so F3 still has a memory to "
+          "check against (B1)")
+    replayed = broker.took("POST", "/v1/results")
+    check(len(replayed) == 1 and replayed[0].json["body"] == NO_SEND,
+          "it re-completes the lease upstream instead")
+    check(standby.journal.is_done("task-1"),
+          "and the `done` ledger the previous holder built survives — it used "
+          "to be erased by the new holder's first write")
+    on_disk = holder.layout.journal_path.read_text()
+    check("task-1" in on_disk and '"done"' in on_disk,
+          "on disk too, which is where the next restart reads it from")
 
 # A guard the client cannot evaluate must not cost a single task.
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:

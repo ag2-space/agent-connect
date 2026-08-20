@@ -75,14 +75,27 @@ the worker keeps polling; a worker that stops has its in-flight tasks re-served.
 So nothing in the loop blocks unboundedly — the long poll is `wait=25` with a
 socket timeout of `wait+10`, every side call is bounded, the Task queue is
 unbounded so a slow consumer cannot stall the poll thread, and status writes,
-hooks and logs all fail silently by contract. Health is asked of
-`client.healthz()`; `GET /v1/tasks` is never a probe, because it leases tasks.
+hooks and logs all fail silently by contract. Neither of the two unbounded
+*lists* the loop meets can stretch a turn either: the owed-result queue and a
+poll answer (the broker drains its whole queue into one) each get a wall-clock
+slice of the turn, and what does not fit waits for the next one. Health is asked
+of `client.healthz()`; `GET /v1/tasks` is never a probe, because it leases tasks.
 
-The ordering inside one accepted task is journal, then ack, then delivery. The
-ack is informational and gates nothing — its 404 is content-sniffed, because
-`not leased to you` is one task's expired lease and a bare 404 is a broker
-without the route, and treating the first as the second once blinded a whole
-host's delivery state.
+The ordering inside one accepted task is journal, then delivery, then ack. The
+ack does not gate the handoff — but it is **not** informational, whatever
+`WORKER-PROTOCOL.md` says. Against this broker, liveness alone extends an
+un-acked lease twice and then requeues it with `attempt` bumped, and a re-serve
+starts un-acked again, so the ack is what buys a long Turn its lease. A re-served
+id the consumer still holds is therefore re-acked — never re-delivered — and a
+pause on acking is written into the status file as the delivery outage it is.
+Its 404 is content-sniffed, because `not leased to you` is one task's expired
+lease and a bare 404 is a broker without the route, and treating the first as the
+second once blinded a whole host's delivery state.
+
+A result that the broker will not take costs its own id a backoff and costs the
+answers behind it nothing: a `break` there put the poisoned answer permanently at
+the head of an oldest-first queue, with everything behind it durable, owed and
+never sent.
 
 A rejected bearer is a wait, not a death: the durable token source is re-read at
 once (a rotation may already have happened), and otherwise the loop holds at a
@@ -165,8 +178,11 @@ Four properties, and each one is an incident:
   winner, because the whole decision — read, judge, write — happens under an
   exclusive lock on the guard file.
 - **Liveness is heartbeat freshness, never pid-alive.** The holder re-stamps the
-  record once per turn of its poll loop; a holder that stops loses the guard
-  after ~2 minutes, however alive its pid may be. The ghost that prompted this
+  record wherever its poll loop demonstrably got to — at every phase boundary of
+  a turn, and through the wait between turns — so the freshness window bounds the
+  longest single call the loop can be *inside*, not the sum of the calls it
+  makes. A holder that stops turning loses the guard after 150 s, however alive
+  its pid may be; a holder that is merely slow never does. The ghost that prompted this
   was alive-but-stale for *days*, and pid recycling makes "is that pid running?"
   a question about somebody else's process. There is no `os.kill` in the guard,
   and a test asserts there never will be.
@@ -174,7 +190,9 @@ Four properties, and each one is an incident:
   stands by and keeps asking — so a holder that dies without releasing is taken
   over from with nobody in the loop — while a client whose claim is *taken* stops
   polling on that same turn and stays stopped, saying `displaced` in its status.
-  Coming back is the consumer's decision, never the loop's.
+  Coming back is the consumer's decision, never the loop's: `start()` re-enters
+  the arbitration as a standby, so a client that was displaced comes back behind
+  whoever took the bearer rather than alongside them.
 - **It fails open.** An I/O error, a filesystem without locking, a bug in the
   guard: all of them mean *poll anyway*, loudly logged and visible as
   `"degraded"` in the status. A lock that fails closed silences delivery
@@ -182,7 +200,10 @@ Four properties, and each one is an incident:
   guard was there to prevent in the first place.
 
 A clean `stop()` releases the guard, so a restart takes it back at once rather
-than waiting out a freshness window. `RelayClient(..., singleton=False)` turns
+than waiting out a freshness window — but only when its join actually joined. A
+`stop()` whose join times out leaves the guard held and says so: releasing a
+bearer this client may still be inside a poll for is the dual poller the
+ordering exists to prevent. `RelayClient(..., singleton=False)` turns
 the whole thing off for a consumer that has its own singleton mechanism; it logs
 a warning, because nothing else here prevents a second poller.
 

@@ -15,15 +15,28 @@ so a slow consumer can never stall the poll thread, and the status write, the
 hook and the log are all best-effort by contract (D4). A stall here does not
 look like a stall — it looks like duplicate delivery.
 
-**The ordering that makes at-least-once safe.** Journal first, then ack, then
-deliver (F2): an ack that goes out before local durability leaves the broker
-showing "received" for work no surviving process knows about. A result is
-retained until its POST succeeds (F5) — success is the only thing that retires
-it, because `POST /v1/results` is what completes the lease. And every id the
-broker re-serves is checked against the journal before anything executes (F3):
-already answered means re-complete, never re-execute. The reconnect replays of
-2026-06-30 and 2026-07-01 were 500 historical tasks each, and without that check
-every one of them ran again.
+**The ordering that makes at-least-once safe.** Journal first, then the ack
+(F2): an ack that goes out before local durability leaves the broker showing
+"received" for work no surviving process knows about. A result is retained until
+its POST succeeds (F5) — success is the only thing that retires it, because
+`POST /v1/results` is what completes the lease. And every id the broker re-serves
+is checked against the journal before anything executes (F3): already answered
+means re-complete, never re-execute. The reconnect replays of 2026-06-30 and
+2026-07-01 were 500 historical tasks each, and without that check every one of
+them ran again.
+
+**The ack is not informational, whatever the protocol doc says.** `WP.md` states
+that the ack "never touches the lease". The broker's source says otherwise, and
+the source is what runs: liveness alone extends an un-acked lease exactly
+`UNACKED_EXTEND_GRACE` times (`taskqueue.py:68` and the extend gate at `:327`),
+and only `acknowledged_ts` extends it indefinitely — while `take()` re-leases
+with no `acknowledged_ts` carried over (`:499`), so every re-serve starts
+un-acked again. An un-acked lease therefore dies about three visibility windows
+after it was served, however hard its consumer is still working, and the attempt
+cap dead-letters it at five. Two things follow, and both are load-bearing here:
+a re-served id the consumer still holds is **re-acked** (never re-delivered),
+and a pause on acking is a pause on delivery, so it is said out loud and it is
+never allowed to swallow a re-ack.
 
 **Media is resolved before delivery, off this thread.** A task body can carry an
 `[ag2space-media:]` marker, which is a URL and not a file; the stage in
@@ -43,11 +56,13 @@ here so the question has an answer that costs nothing.
 """
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .backoff import Backoff
@@ -92,7 +107,60 @@ HEARTBEAT_INTERVAL_S = 60.0
 #: F4's cooldown. A broker with no `/ack` route at all gets a rest — and then
 #: gets asked again, because a permanent latch means a broker that *gains* the
 #: endpoint in a deploy is never picked up until the worker restarts.
+#:
+#: It is a pause on *delivery*, not on bookkeeping — see the module docstring on
+#: what an un-acked lease actually costs — so it is written into the status file
+#: while it runs, it says what it costs in the log, and a re-serve is re-acked
+#: straight through it.
 ACK_COOLDOWN_S = 300.0
+
+#: The broker's own number, mirrored here so the log line above can be honest
+#: about what the pause costs: `UNACKED_EXTEND_GRACE` in
+#: `services/shared/queue/taskqueue.py:68`.
+UNACKED_EXTEND_GRACE = 2
+
+#: What one turn may spend POSTing owed results before the rest wait for the
+#: next one — and what it may spend on the side calls an intake makes (the
+#: per-task acks and the dead-letter rejects).
+#:
+#: Both exist because the poll iteration is what keeps every in-flight lease
+#: alive (F1) and what the singleton guard measures freshness against (J1), and
+#: neither the owed-result queue nor a poll answer has any bound on its length:
+#: `GET /v1/tasks` drains the broker's whole queue into one answer, and the
+#: reconnect replays were 500 tasks each. Unbounded, one pass cost a timeout per
+#: item — 10 tasks at the ack's own timeout is 100 s of poll iteration, which is
+#: a lost lease per task still in flight.
+#:
+#: The result budget is deliberately larger than `RESULT_TIMEOUT_S`, so a turn
+#: always gets at least one whole attempt at the head of the queue and the drain
+#: can never stall on its own bound.
+RESULT_DRAIN_BUDGET_S = 30.0
+INTAKE_BUDGET_S = 10.0
+
+#: How long a drain waits for the drain lock before leaving it to whoever has
+#: it. The consumer thread drains too (`complete()` posts immediately), and this
+#: used to be an unbounded wait *inside the poll iteration* — the poll thread
+#: parked for the length of the consumer's whole pass, which is F1's failure
+#: mode wearing a mutex.
+DRAIN_LOCK_WAIT_S = 1.0
+
+#: The longest slice of the between-turns wait the loop takes in one call. The
+#: wait is chunked so the singleton guard can be re-stamped through it: a client
+#: idling out a 60 s backoff is deliberately quiet, not hung, and waiting it out
+#: in one call was the largest single term in J1's freshness arithmetic.
+GUARD_TOUCH_SLICE_S = 15.0
+
+#: How long `stop()` waits for the poll thread by default. Short, because this
+#: is a daemon thread that leaves at its next check and a consumer calling
+#: `stop()` should not be parked for the length of a long poll to find that out.
+#: The 40 s it replaces put every consumer on the obvious path behind a 35 s
+#: socket timeout.
+STOP_JOIN_S = 5.0
+
+#: How many un-sent acks to remember across turns. Bounded because it is a
+#: backlog and not a queue of work; ids fall off the old end, and an id whose
+#: ack is lost that way is re-acked the next time the broker re-serves it.
+ACK_BACKLOG_MAX = 1024
 
 #: How long a client that lost the singleton race waits before asking for the
 #: bearer again (J1). It is not backoff — nothing failed — and it is short
@@ -141,7 +209,31 @@ class RelayClient:
     `media_dir` is where inbound attachments are fetched to (the state dir by
     default), and `media_retention_s` opts out of deleting them when the task is
     answered — for a consumer whose own archives point at those paths.
+
+    **The authenticated session is private and sealed, and the object has no
+    `__dict__`.** `RelayHTTP` is a bearer token with a `.post` on it, and a
+    public attribute holding one is the raw-wire escape hatch this library
+    refuses to have: `client.http.post("/v1/rooms/X/media", {"content_b64": …})`
+    is every egress rule in `egress.py` bypassed in one line. Ticket 04 sealed
+    the identical hatch on `RoomOps`; this is the same seal, for the same
+    reason. A caller with its own transport passes it as `http=` at
+    construction, which is the supported and only route.
     """
+
+    #: Slots, so the seal below has no `__dict__` to be walked around.
+    __slots__ = (
+        "credentials", "layout", "_http", "journal", "status", "backoff",
+        "poll_wait", "socket_margin", "heartbeat_interval", "ack_cooldown",
+        "auth_recheck_interval", "guard", "standby_recheck", "idle_gap",
+        "result_budget", "intake_budget", "tier", "client_name",
+        "capabilities", "tasks", "media", "_reconciler", "_live", "_presence",
+        "_ack_disabled_until", "_ack_owed", "_intake_deadline",
+        "_result_retry_at", "_heartbeat_disabled", "_last_heartbeat",
+        "_deferred_auth", "_drain_lock", "_stop", "_thread",
+    )
+
+    #: Written once, in `__init__`, and never again.
+    _SEALED = frozenset({"_http"})
 
     def __init__(
         self,
@@ -160,6 +252,8 @@ class RelayClient:
         singleton: bool = True,
         singleton_stale_after: float = STALE_AFTER_S,
         standby_recheck: float = STANDBY_RECHECK_S,
+        result_budget: float = RESULT_DRAIN_BUDGET_S,
+        intake_budget: float = INTAKE_BUDGET_S,
         idle_gap: float = 0.0,
         tier: str = "owner",
         client_name: str = "ag2-relay-client",
@@ -167,7 +261,7 @@ class RelayClient:
     ):
         self.credentials = credentials
         self.layout = StateLayout(state_dir, instance)
-        self.http = http or RelayHTTP(credentials, resolver=resolver)
+        self._http = http or RelayHTTP(credentials, resolver=resolver)
         self.journal = Journal(self.layout.journal_path)
         self.status = StatusReporter(
             self.layout.status_path, gateway=credentials.base_url, instance=instance)
@@ -188,6 +282,9 @@ class RelayClient:
             PollerGuard(self.layout.singleton_path,
                         stale_after=singleton_stale_after) if singleton else None)
         self.standby_recheck = float(standby_recheck)
+        #: The two wall-clock bounds one turn puts on itself. See the constants.
+        self.result_budget = float(result_budget)
+        self.intake_budget = float(intake_budget)
         #: What the loop waits after a *healthy* poll. Zero: the long poll is
         #: the pacing. A test with an instant broker sets it to keep the loop
         #: from spinning.
@@ -211,7 +308,7 @@ class RelayClient:
         #: that wants to re-upload what arrived says so with an explicit root,
         #: so egress policy stays in one visible place.
         self.media = MediaIngress(
-            self.http,
+            self._http,
             MediaStore(media_dir or self.layout.media_path, media_retention_s),
             deliver=self.tasks.put,
             on_auth_rejected=self._defer_auth,
@@ -223,23 +320,75 @@ class RelayClient:
         #: working on, which is what keeps E3 from dropping a live one.
         self._live: set = set()
         self._presence: Tuple[Optional[str], Optional[str]] = (None, None)
-        self._ack_disabled_until = 0.0
+        #: Monotonic, not wall clock (A8): an NTP step backwards used to extend
+        #: this pause by the size of the step, and a pause on acking is a pause
+        #: on delivery. `None` is "not paused" rather than `0.0`, because a
+        #: monotonic clock's zero point is undefined — on CPython 3.9 for macOS
+        #: it is process start, so `0.0` is a *live* deadline for the first
+        #: milliseconds of a run.
+        self._ack_disabled_until: Optional[float] = None
+        #: Acks a turn's budget had no room for, oldest first, mapped to whether
+        #: they are urgent — an urgent one is a re-serve, and it goes out even
+        #: while acking is otherwise paused. See `_ack_phase`.
+        self._ack_owed: "OrderedDict[str, bool]" = OrderedDict()
+        self._intake_deadline = 0.0
+        #: Per-result retry gates, monotonic. A result that failed waits before
+        #: it is tried again, which is what lets the drain move on to the answer
+        #: behind it instead of stalling the whole queue on one id.
+        self._result_retry_at: Dict[str, Tuple[Backoff, float]] = {}
         self._heartbeat_disabled = False
-        self._last_heartbeat = 0.0
+        #: `None` is "never", for the same reason as above: with a monotonic
+        #: clock whose origin is process start, a `0.0` sentinel makes the
+        #: interval gate read "sent 0 seconds ago" on the very first turn and
+        #: the client never announces itself.
+        self._last_heartbeat: Optional[float] = None
         self._deferred_auth: Optional[AuthRejected] = None
         self._drain_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
-        return f"<RelayClient {self.layout.instance} {self.http.base_url}>"
+        return f"<RelayClient {self.layout.instance} {self._http.base_url}>"
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self._SEALED and hasattr(self, name):
+            raise AttributeError(
+                f"{name} is fixed at construction; build another RelayClient "
+                f"rather than repointing this one")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in self._SEALED:
+            raise AttributeError(f"{name} is fixed at construction")
+        object.__delattr__(self, name)
 
     # --- lifecycle ---------------------------------------------------------
 
     def start(self) -> "RelayClient":
-        """Open the state dir, replay what a previous run left, and poll."""
-        if self._thread is not None:
+        """Open the state dir, replay what a previous run left, and poll.
+
+        Startable again after the loop has stopped by itself, which it does on
+        a displacement and on an unrecoverable auth rejection. It used not to
+        be: `_thread` was left pointing at a thread that had already exited, so
+        the documented way back — "coming back is the consumer's decision" —
+        raised `RuntimeError: this client is already started`, and only
+        `stop()` cleared it, which neither the README nor `PollerGuard` says
+        you have to call first.
+        """
+        if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("this client is already started")
+        self._thread = None
+        if self.guard is not None and self.guard.displaced:
+            # The loop never re-acquires a guard it was displaced from — that
+            # is the reaped-process incident with extra steps, plus flapping.
+            # `start()` is not the loop: it is the consumer deciding. Releasing
+            # here clears nothing on disk (the record names the poller that
+            # took it) and only lets this client re-enter the arbitration
+            # honestly — it will stand by behind a live holder, not poll
+            # alongside one.
+            log.warning("this client was displaced from the bearer's guard; "
+                        "start() re-enters the arbitration as a standby (J1)")
+            self.guard.release()
         self.prepare()
         self._stop.clear()
         self._thread = threading.Thread(
@@ -281,39 +430,91 @@ class RelayClient:
             log.info("%d id(s) were accepted by an earlier run and never "
                      "answered; the broker will re-serve them (F3 decides "
                      "whether they re-execute)", len(stale))
+        # One status write before the first turn, so there is never a window
+        # where the only thing on disk is the constructor's default with no
+        # guard verdict in it (D2). A first turn can legitimately last most of a
+        # minute — a long poll on top of a drain — and a supervisor reading a
+        # bare `reconnecting` in that window cannot tell "starting" from
+        # "wedged", which is exactly the 2026-07-25 shape.
+        self._update_status(RECONNECTING, error=None, backoff_s=0.0)
 
-    def stop(self, timeout: float = 40.0) -> None:
-        """Stop polling. Anything already answered stays on disk to be re-POSTed."""
+    def stop(self, timeout: float = STOP_JOIN_S) -> None:
+        """Stop polling. Anything already answered stays on disk to be re-POSTed.
+
+        The default join is short on purpose: this is a daemon poll thread that
+        leaves at its next check, and a consumer should not be parked for the
+        length of a long poll to learn that.
+        """
         self._stop.set()
         thread, self._thread = self._thread, None
+        left = True
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
+            left = not thread.is_alive()
         # After the poll thread, so nothing is still being handed to it. A
         # download in flight is not waited out — `stop()` returning promptly
         # matters more, and a late fetch can only put a Task on a queue nobody
         # is reading and leave a file for the next run's sweep.
         self.media.stop()
         if self.guard is not None:
-            # After the join, not before: a guard released while this loop is
-            # still turning is a bearer two clients may poll at once. Released
-            # at all — rather than left to go stale — because a restart that
-            # has to wait out a freshness window it does not need is two
-            # minutes of a user's messages going nowhere.
-            self.guard.release()
+            if left:
+                # After the join, not before: a guard released while this loop
+                # is still turning is a bearer two clients may poll at once.
+                # Released at all — rather than left to go stale — because a
+                # restart that has to wait out a freshness window it does not
+                # need is minutes of a user's messages going nowhere.
+                self.guard.release()
+            else:
+                # The invariant above only holds if the join actually joined,
+                # and it did not: the loop is still inside a bounded call. A
+                # release here empties the record while this client may yet
+                # poll once more, and another client then polls alongside it —
+                # precisely the thing the ordering exists to prevent. Left
+                # held, it goes stale by itself.
+                log.warning(
+                    "the poll thread had not stopped %ss after stop() — leaving "
+                    "the singleton guard held rather than releasing a bearer "
+                    "this client may still poll. A replacement waits out the "
+                    "%.0fs freshness window instead (J1).",
+                    timeout, self.guard.stale_after)
         self._update_status(STOPPED)
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                delay = self.poll_once()
-            except Exception:  # noqa: BLE001 — D1: an unexpected error costs
-                # a delay, never the bearer's only poller. `poll_once` already
-                # catches broadly; this is the second belt, for a bug in the
-                # backoff or the status write itself.
-                log.exception("unexpected error in the poll loop")
-                delay = self.backoff.after_error()
-            if delay:
-                self._stop.wait(delay)
+        try:
+            while not self._stop.is_set():
+                try:
+                    delay = self.poll_once()
+                except Exception:  # noqa: BLE001 — D1: an unexpected error
+                    # costs a delay, never the bearer's only poller.
+                    # `poll_once` already catches broadly; this is the second
+                    # belt, for a bug in the backoff or the status write itself.
+                    log.exception("unexpected error in the poll loop")
+                    delay = self.backoff.after_error()
+                self._wait(delay)
+        finally:
+            # A displacement and an unrecoverable auth rejection both stop the
+            # loop from in here, and a `_thread` left pointing at a dead thread
+            # made `start()` raise "already started". Cleared by whoever is
+            # actually leaving, and only if `stop()` has not already replaced
+            # it with a newer one.
+            if self._thread is threading.current_thread():
+                self._thread = None
+
+    def _wait(self, delay: float) -> None:
+        """Wait between two turns without letting the guard go stale (J1).
+
+        In slices, because the longest of these is the 60 s backoff cap and a
+        client idling out a backoff is deliberately quiet, not hung: it is
+        still the poller of record and it is still the one that will answer.
+        Waiting it out in a single call was the largest single term in the
+        freshness arithmetic and it bought nothing — a loop that is genuinely
+        hung never reaches this method at all.
+        """
+        while delay > 0 and not self._stop.is_set():
+            slice_s = min(delay, GUARD_TOUCH_SLICE_S)
+            self._stop.wait(slice_s)
+            delay -= slice_s
+            self._keep_guard_fresh()
 
     # --- the loop ----------------------------------------------------------
 
@@ -330,22 +531,21 @@ class RelayClient:
             # this turn: the bearer is somebody else's to poll (J1).
             return not_ours
         try:
-            # Both of these are best-effort and swallow their own failures;
-            # what they are not allowed to swallow is a rejected bearer, which
-            # they hand to the recovery below (C8).
-            self._drain_results()
-            self._heartbeat()
+            self._before_the_wire()
             self._raise_deferred_auth()
-            answer = self.http.get(
+            answer = self._http.get(
                 "/v1/tasks", params={"wait": self.poll_wait},
                 timeout=self.poll_wait + self.socket_margin)
+            self._keep_guard_fresh()
             self._intake_all(answer)
+            self._keep_guard_fresh()
             if self.journal.pending_results():
                 # Either a redelivery was just re-completed above, or the
                 # consumer answered while the poll was in flight. Either way it
                 # goes now rather than one long-poll window later: the thing at
                 # stake is a lease, and a lease is on a clock.
                 self._drain_results()
+                self._keep_guard_fresh()
                 self._raise_deferred_auth()
         except AuthRejected as exc:
             return self._on_auth_rejected(exc)
@@ -359,6 +559,53 @@ class RelayClient:
         self.backoff.after_success()
         self._update_status(CONNECTED)
         return self.idle_gap
+
+    def _before_the_wire(self) -> None:
+        """The two side channels that run ahead of `GET /v1/tasks` — and D4.
+
+        D4 is verbatim about this spot: "any code that runs inside the poll
+        iteration before the `GET /v1/tasks` MUST NOT be able to raise". Both
+        steps here reach `journal._save`, which can raise on a full disk, a
+        read-only mount or a state dir that went away under a running client.
+        Reproduced: a result POST that *succeeded* and a retire that did not,
+        so every later pass re-POSTed and re-raised at the same line — the loop
+        backed off to its 60 s cap and never polled again, every in-flight lease
+        expired unextended, and the status file still said `reconnecting`. A
+        side channel had become the delivery blocker, which is the whole of what
+        D4 forbids.
+
+        A rejected bearer is the one thing that does not stop here: it is
+        deferred by the steps themselves and raised by the caller (C8).
+        """
+        for step in (self._drain_results, self._heartbeat):
+            try:
+                step()
+            except Exception:  # noqa: BLE001 — D4, see above
+                log.exception("a side channel before the poll raised; the poll "
+                              "goes ahead anyway — nothing in here is allowed "
+                              "to be what stops delivery (D4)")
+            self._keep_guard_fresh()
+
+    def _keep_guard_fresh(self) -> None:
+        """Say "the loop is still turning", between two of its bounded calls.
+
+        The guard's liveness test is the freshness of a stamp, and the stamp
+        used to happen once per turn — which quietly made the freshness window
+        a bound on the *whole* turn, the sum of every call in it. It was never
+        that: measured, a holder with one owed result and its backoff at the cap
+        took 125 s against a 120 s window, and one with no failure at all took
+        120.9 s, and in both cases a standby took the bearer from a client whose
+        thread was alive throughout — which then went DISPLACED permanently.
+
+        So the stamp happens wherever the loop demonstrably got to. This is not
+        a second liveness channel and must never become one: there is no timer
+        and no thread behind it, so a loop hung inside any one call reaches no
+        stamp and ages out exactly as J1 wants. Only a holder stamps — a
+        standby touching the file here would take the bearer between two turns
+        without ever writing the status that says it did.
+        """
+        if self.guard is not None and self.guard.held:
+            self.guard.touch()
 
     # --- the singleton guard (J1) -----------------------------------------
 
@@ -387,7 +634,10 @@ class RelayClient:
         """
         if self.guard is None:
             return None
+        was_standing_by = self.guard.state == LOST and not self.guard.displaced
         if self.guard.claim() != LOST:
+            if was_standing_by:
+                self._took_the_bearer_over()
             return None
         if self.guard.displaced:
             log.error("another poller took this bearer's guard — polling stops "
@@ -402,8 +652,45 @@ class RelayClient:
         self._update_status(
             STANDBY,
             error="another poller holds this bearer's guard",
-            backoff_s=self.standby_recheck)
+            # Not `backoff_s`: nothing failed, and a supervisor reading a
+            # non-zero backoff cannot tell a client that is retrying from one
+            # that is deliberately waiting its turn. The constant's own comment
+            # said "it is not backoff" and then it was written into the backoff
+            # field anyway.
+            backoff_s=0.0,
+            recheck_s=self.standby_recheck)
         return self.standby_recheck
+
+    def _took_the_bearer_over(self) -> None:
+        """A standby just became the holder: re-read the journal (J1, F3).
+
+        The journal is read once, in `prepare()`, and a standby can stand by
+        for hours. Everything the previous holder answered in that time is on
+        disk and absent from this client's memory, and nothing on the
+        STANDBY→HELD edge used to reload it. Reproduced: the holder answered
+        `task-1` and retired it, the standby (booted earlier, journal empty)
+        took the stale guard, the broker redelivered `task-1` — and the standby
+        handed it to its consumer a second time, because `is_done` asked a
+        memory that had never seen it. Then its first `journal.accept()` rewrote
+        the whole file from that stale memory and erased the `done` entry. The
+        longer it had stood by, the more history it reverted.
+
+        Best-effort by construction: this runs before the poll, and D4 says
+        nothing in there may be what stops delivery. A reload that fails leaves
+        this client with the dedup memory it had, which is the pre-existing
+        situation and not a worse one.
+        """
+        try:
+            self.journal.load()
+        except Exception:  # noqa: BLE001 — D4
+            log.exception("could not re-read the journal on taking this bearer "
+                          "over; the dedup memory may be behind the file until "
+                          "the next restart (F3)")
+            return
+        log.info("took the bearer over from another poller — the journal was "
+                 "re-read: %d id(s) still owe an answer, %d already answered "
+                 "and remembered for dedup (J1, F3)",
+                 self.journal.inflight(), len(self.journal.done_ids()))
 
     def _intake_all(self, answer: Any) -> int:
         """Every task in one poll answer, accepted or explained."""
@@ -416,9 +703,29 @@ class RelayClient:
             if served is not None:
                 log.warning("poll answered with a `tasks` field that is not a list")
             served = []
+        # `GET /v1/tasks` has no bound on the batch: the broker drains its whole
+        # queue into one answer, and the reconnect replays were 500 tasks each.
+        # Every side call the intake makes is a blocking POST, so they share one
+        # bounded slice of this turn and the rest of the batch is journalled and
+        # delivered without waiting for them.
+        self._intake_deadline = time.monotonic() + self.intake_budget
         accepted = 0
         for raw in served:
-            accepted += self._intake(raw)
+            try:
+                accepted += self._intake(raw)
+            except AuthRejected:
+                raise
+            except Exception:  # noqa: BLE001 — one task, not the batch
+                # A task that could not be written down is a task this client
+                # will not deliver: the broker re-serves it and F3 absorbs the
+                # duplicate. Losing the rest of a batch the broker has already
+                # leased to us would not be absorbed by anything.
+                log.exception("a leased task could not be taken in; the broker "
+                              "will re-serve it. The rest of the batch is "
+                              "unaffected")
+        # After the whole batch, and only then: the acks are the part that can
+        # cost seconds each, and F2 says the ack must not gate the handoff.
+        self._ack_phase()
         # Raised after the whole batch, never in the middle of it: a rejected
         # bearer seen by an ack must reach recovery (C8), but not by dropping
         # tasks the broker has already leased to us.
@@ -442,19 +749,47 @@ class RelayClient:
             log.info("task %s was already answered — re-completing the lease, "
                      "not re-executing (attempt %s)", wire_id, task.attempt)
             return 0
+        # A re-serve of an id this client still owes an answer for. F3 says do
+        # not hand it over again — and the ack, which is the part that was
+        # missing entirely, has to go again.
+        #
+        # `WORKER-PROTOCOL.md` says the ack "never touches the lease". The
+        # broker's source says otherwise, and the source is what runs: `take()`
+        # re-leases with no `acknowledged_ts` carried over
+        # (`taskqueue.py:499`), so every re-serve starts un-acked, and an
+        # un-acked lease is extended on liveness alone at most
+        # `UNACKED_EXTEND_GRACE` times (`:68`, gate at `:327`) before it is
+        # requeued with `attempt` bumped. So a ten-minute Turn burned all five
+        # attempts and was dead-lettered around minute fifteen while its
+        # consumer was still typing — and the eventual `complete()` then POSTed
+        # into a broker with no lease and no room for it, which answers 200 and
+        # counts a `results_undelivered`. This client retired the id as
+        # delivered. The user's answer was gone, with no error at either end.
+        #
+        # The re-ack is marked urgent, which is what carries it through F4's
+        # cooldown: a re-serve is proof the lease is real and about to die
+        # without it, and it happens at most once per visibility window per
+        # task, so it can never become the hammering the cooldown is for.
         if self.journal.is_pending(wire_id):
-            log.info("task %s already has an answer waiting to be POSTed — "
-                     "the redelivery changes nothing", wire_id)
+            self._owe_ack(wire_id, urgent=True)
+            log.info("task %s already has an answer waiting to be POSTed — the "
+                     "re-serve is re-acked so the new lease survives, and the "
+                     "drain below completes it", wire_id)
             return 0
         if wire_id in self._live:
-            return 0  # queued or in the consumer's hands; a re-serve is a no-op
+            log.info("task %s is queued or in the consumer's hands — the "
+                     "re-serve is re-acked so its new lease is not requeued "
+                     "out from under a running Turn, and nothing is handed "
+                     "over twice (F3, attempt %s)", wire_id, task.attempt)
+            self._owe_ack(wire_id, urgent=True)
+            return 0
 
-        # Durable first, then the ack, then the handoff (F2). The room sidecar
-        # is captured here because this is the only moment it is known and a
-        # media answer produced after a restart still has to find its room (F7).
+        # Durable first, then the handoff, and the ack after both (F2). The
+        # room sidecar is captured here because this is the only moment it is
+        # known and a media answer produced after a restart still has to find
+        # its room (F7).
         self.journal.accept(wire_id, room=task.room_id)
         self._live.add(wire_id)
-        self._ack(wire_id)
         if task.metadata_stripped:
             log.info("stripped unsigned room-ops metadata from task %s", wire_id)
         # Delivery goes through the media stage, which strips any
@@ -463,6 +798,7 @@ class RelayClient:
         # fetch. Nothing that reaches `self.tasks` has ever carried a marker,
         # and nothing on this thread ever waits for a download (F1).
         self.media.accept(task)
+        self._owe_ack(wire_id)
         return 1
 
     def _dead_letter_unusable(self, raw: Any) -> None:
@@ -481,11 +817,23 @@ class RelayClient:
                   wire_id)
         if not isinstance(wire_id, str) or not 0 < len(wire_id) <= 256:
             return
+        if not self._intake_budget_left():
+            # The batch has used its slice of this turn. This reject is the
+            # best-effort half of an already best-effort path: skipping it costs
+            # a re-serve of a task nobody can act on, and taking it costs the
+            # poll iteration a timeout that every live lease pays for (F1).
+            log.warning("no room left in this turn's intake budget for the "
+                        "dead-letter reject of %.80r; the broker re-serves it "
+                        "until its attempt cap", wire_id)
+            return
         try:
-            self.http.post(
+            self._http.post(
                 "/v1/results",
                 {"id": wire_id, "status": "rejected", "error_code": INVALID_TASK_SCHEMA},
-                timeout=RESULT_TIMEOUT_S)
+                # A side call's timeout, not a result's: this is not a user's
+                # answer, and it used to be able to hold the poll for 20 s per
+                # malformed task in a batch with no bound on its length.
+                timeout=SIDE_TIMEOUT_S)
         except AuthRejected as exc:
             self._defer_auth(exc)
         except Exception as exc:  # noqa: BLE001 — best-effort by construction
@@ -494,9 +842,62 @@ class RelayClient:
 
     # --- ack (F2, F4) ------------------------------------------------------
 
-    def _ack(self, wire_id: str) -> bool:
-        """Tell the broker the task was received. Informational, and it is
-        allowed to fail — the ack never touches the lease.
+    def _intake_budget_left(self) -> bool:
+        """Has this turn's slice for intake side calls run out? (F1)"""
+        return time.monotonic() < self._intake_deadline
+
+    def _owe_ack(self, wire_id: str, urgent: bool = False) -> None:
+        """Remember that an id needs acking. Sent by `_ack_phase`, not here."""
+        self._ack_owed[wire_id] = urgent or self._ack_owed.get(wire_id, False)
+        self._ack_owed.move_to_end(wire_id)
+        while len(self._ack_owed) > ACK_BACKLOG_MAX:
+            self._ack_owed.popitem(last=False)
+
+    def _acks_paused(self) -> bool:
+        return (self._ack_disabled_until is not None
+                and time.monotonic() < self._ack_disabled_until)
+
+    def _ack_phase(self) -> None:
+        """Ack what this batch journalled, oldest first, inside one slice.
+
+        Off the delivery path on purpose. The ack used to be a blocking POST
+        between `journal.accept` and the handoff, once per task, on a batch with
+        no bound on its length. Measured at an ordinary 300 ms round trip that
+        is 3.1 s of pure delivery latency for ten tasks; at the ack's own
+        timeout a ten-task batch is 100 s of poll iteration, and the poll
+        iteration is what keeps every *other* lease alive (F1). F2 says the ack
+        must not gate anything, and there it gated both delivery and cadence.
+
+        So the tasks reach the consumer first and the acks follow, for as long
+        as this turn can spare. What does not fit is owed to the next turn
+        rather than dropped, because "we will ack it eventually" is a real
+        deadline: an un-acked lease is extended on liveness alone twice and
+        then requeued (see the module docstring).
+
+        A cooldown (F4) holds back the ordinary acks and leaves them owed — they
+        go out when the route comes back. It never holds back an urgent one: a
+        re-serve is a live lease about to be requeued, and it doubles as the
+        probe that notices the route is back.
+        """
+        for wire_id, urgent in list(self._ack_owed.items()):
+            if not self._intake_budget_left():
+                log.info("this turn's intake budget is spent with %d ack(s) "
+                         "still owed; they go out on the next turn",
+                         len(self._ack_owed))
+                break
+            if not urgent and self._acks_paused():
+                continue  # still owed; the pause is time-gated, not a latch
+            self._ack_owed.pop(wire_id, None)
+            if not self.journal.knows(wire_id) or self.journal.is_done(wire_id):
+                continue  # answered and retired while the ack waited its turn
+            self._ack(wire_id, urgent=urgent)
+
+    def _ack(self, wire_id: str, urgent: bool = False) -> bool:
+        """Tell the broker the task was received.
+
+        Allowed to fail, and never a gate on delivery (F2) — but not
+        informational, whatever `WORKER-PROTOCOL.md` says: against this broker
+        the ack is what buys a long Turn its lease. See the module docstring.
 
         The 404 is the interesting part. It means two different things and only
         the body tells them apart: `not leased to you` is a routine per-task
@@ -506,26 +907,23 @@ class RelayClient:
         a cooldown rather than a latch, so a deploy that adds the route is
         picked up without a restart (F4).
         """
-        now = time.time()
-        if now < self._ack_disabled_until:
+        now = time.monotonic()
+        if self._acks_paused() and not urgent:
             return False
         safe_id = urllib.parse.quote(wire_id, safe="")
         try:
-            self.http.post(f"/v1/tasks/{safe_id}/ack", {"id": wire_id},
-                           timeout=SIDE_TIMEOUT_S)
+            self._http.post(f"/v1/tasks/{safe_id}/ack", {"id": wire_id},
+                            timeout=SIDE_TIMEOUT_S)
         except AuthRejected as exc:
             self._defer_auth(exc)  # C8
             return False
         except RelayHTTPError as exc:
             if exc.status in (404, 405):
-                if exc.status == 404 and "not leased" in (exc.body or "").lower():
+                if exc.status == 404 and _says_not_leased(exc.body):
                     log.info("ack for %s: the lease is gone (re-served or not "
                              "ours) — every other task keeps acking", wire_id)
                     return False
-                self._ack_disabled_until = now + self.ack_cooldown
-                log.warning("this broker has no task-ack route (HTTP %s) — "
-                            "acking pauses for %ss, then asks again",
-                            exc.status, self.ack_cooldown)
+                self._pause_acking(now, exc.status)
                 return False
             log.info("ack for %s failed: HTTP %s — the broker may redeliver",
                      wire_id, exc.status)
@@ -535,8 +933,31 @@ class RelayClient:
                      wire_id, _describe(exc))
             return False
         # A success re-enables acking: the cooldown is a pause, not a state.
-        self._ack_disabled_until = 0.0
+        self._ack_disabled_until = None
         return True
+
+    def _pause_acking(self, now: float, status: int) -> None:
+        """F4's cooldown — said out loud, because of what it costs.
+
+        Implemented as specified and correct as far as it goes: a bare 404/405
+        is a route that is not there, and hammering it once per accepted task
+        helps nobody. What was missing is that against this broker the pause is
+        a pause on *delivery*. Everything accepted inside it goes un-acked, and
+        an un-acked lease is extended on liveness alone twice and then requeued
+        with `attempt` bumped, so a busy window ends in re-serves and eventually
+        in dead-letters for work that was never in trouble. It cannot be
+        allowed to be silent, and it is not allowed to swallow a re-ack.
+        """
+        self._ack_disabled_until = now + self.ack_cooldown
+        log.warning(
+            "this broker has no task-ack route (HTTP %s) — acking pauses for "
+            "%ss, then asks again. That pause is not free: an un-acked lease is "
+            "extended on liveness alone only %d times before the broker requeues "
+            "it with `attempt` bumped, so tasks accepted in this window may be "
+            "re-served under a running Turn. Re-serves are re-acked straight "
+            "through the pause, and `acks_paused_s` in the status file says how "
+            "much of it is left (F4).",
+            status, self.ack_cooldown, UNACKED_EXTEND_GRACE)
 
     # --- results (F5) ------------------------------------------------------
 
@@ -595,37 +1016,118 @@ class RelayClient:
         self._drain_results()
 
     def _drain_results(self) -> int:
-        """POST everything still owed, oldest first. Never raises (D4)."""
+        """POST what is owed, oldest first, bounded, and never head-of-line.
+
+        Two rules, and each one was a way this method lost answers.
+
+        **A failure belongs to its result, not to the queue.** It used to
+        `break` on the first one, and `pending_results()` is oldest-first, so a
+        result the broker would not take sat at the head and every answer behind
+        it was durable, owed, and never sent — unreachable by `Reconciler`,
+        which only inspects `accepted_ids()`, and never re-offered, because
+        `is_pending` makes a redelivery a no-op. `inflight` then only grew, with
+        no path back down: E3's scar arriving through the front door. The
+        trigger is not exotic — `add_result` does the room's outbound send
+        inside the request, so one reply large enough to outlast
+        `RESULT_TIMEOUT_S` blocks the queue permanently. So a failure now costs
+        *that* id a backoff and costs the answers behind it nothing.
+
+        **The pass is bounded.** Continuing rather than breaking means a broker
+        that is simply down would otherwise cost one timeout per owed result,
+        inside the poll iteration — and the poll iteration is what keeps every
+        in-flight lease alive (F1) and what the singleton guard measures
+        freshness against (J1). So it gets a slice of the turn and the rest wait
+        for the next one.
+
+        Never raises (D4), including on the journal write that retires an id.
+        """
+        if not self._drain_lock.acquire(timeout=DRAIN_LOCK_WAIT_S):
+            # The consumer thread is inside its own drain, POSTing this very
+            # queue. Waiting for it here would add its whole pass to this turn,
+            # and F1 pays for that in lost leases; the answers are durable and
+            # this pass has nothing to add.
+            log.info("another thread is draining results — this pass leaves it "
+                     "to them rather than holding the poll behind a lock")
+            return 0
+        try:
+            return self._drain_locked()
+        finally:
+            self._drain_lock.release()
+
+    def _drain_locked(self) -> int:
+        deadline = time.monotonic() + self.result_budget
+        owed = self.journal.pending_results()
+        self._forget_stale_result_gates({wire_id for wire_id, _ in owed})
         delivered = 0
-        with self._drain_lock:
-            for wire_id, payload in self.journal.pending_results():
-                try:
-                    answer = self.http.post("/v1/results", payload,
-                                            timeout=RESULT_TIMEOUT_S)
-                except AuthRejected as exc:
-                    self._defer_auth(exc)  # C8
-                    break
-                except Exception as exc:  # noqa: BLE001 — F5: keep and retry
-                    log.warning("result POST for %s failed (%s) — the result is "
-                                "retained and retried; nothing is lost",
-                                wire_id, _describe(exc))
-                    break
-                if isinstance(answer, Mapping) and answer.get("ok") is False:
-                    log.warning("the broker refused the result for %s — retained "
-                                "for the next pass", wire_id)
-                    break
-                duplicate = isinstance(answer, Mapping) and answer.get("duplicate")
-                self.journal.retire(wire_id)
-                self._live.discard(wire_id)
-                delivered += 1
-                log.info("result delivered for %s%s", wire_id,
-                         " (the broker had it already)" if duplicate else "")
+        for index, (wire_id, payload) in enumerate(owed):
+            if time.monotonic() >= deadline:
+                log.info("the result drain used its %.0fs of this turn; %d "
+                         "answer(s) go on the next pass — they are on disk and "
+                         "nothing is lost (F5)", self.result_budget,
+                         len(owed) - index)
+                break
+            gate = self._result_retry_at.get(wire_id)
+            if gate is not None and time.monotonic() < gate[1]:
+                continue  # this one is waiting out its own failure
+            try:
+                answer = self._http.post("/v1/results", payload,
+                                         timeout=RESULT_TIMEOUT_S)
+            except AuthRejected as exc:
+                # The one broker-wide verdict there is: this bearer is rejected
+                # for every id, so trying the next one is a wasted round trip.
+                self._defer_auth(exc)  # C8
+                break
+            except Exception as exc:  # noqa: BLE001 — F5: keep and retry
+                self._retry_result_later(wire_id, _describe(exc))
+                continue
+            if isinstance(answer, Mapping) and answer.get("ok") is False:
+                self._retry_result_later(wire_id, "the broker refused it")
+                continue
+            duplicate = isinstance(answer, Mapping) and answer.get("duplicate")
+            self.journal.retire(wire_id)
+            self._live.discard(wire_id)
+            self._result_retry_at.pop(wire_id, None)
+            delivered += 1
+            log.info("result delivered for %s%s", wire_id,
+                     " (the broker had it already)" if duplicate else "")
         return delivered
+
+    def _retry_result_later(self, wire_id: str, why: str) -> None:
+        """Hold one result back for a while. The rest of the queue goes now."""
+        ladder = (self._result_retry_at.get(wire_id) or (Backoff(), 0.0))[0]
+        delay = ladder.after_error()
+        self._result_retry_at[wire_id] = (ladder, time.monotonic() + delay)
+        log.warning("result POST for %s failed (%s) — the answer is retained "
+                    "and retried in %ss, and every answer behind it goes now. "
+                    "Nothing is lost (F5).", wire_id, why, delay)
+
+    def _forget_stale_result_gates(self, owed_ids: set) -> None:
+        for wire_id in [k for k in self._result_retry_at if k not in owed_ids]:
+            self._result_retry_at.pop(wire_id, None)
 
     # --- heartbeat (E1, E2, E3) --------------------------------------------
 
     def heartbeat(self) -> bool:
-        """Send a heartbeat now, if the broker still has the endpoint."""
+        """Send a heartbeat now, if the broker still has the endpoint.
+
+        Refused while another poller holds this bearer's guard (J1). Of the four
+        calls a consumer can make straight onto the wire, this is the one that
+        has to be: a heartbeat is this client announcing itself as the bearer's
+        live worker, carrying an `inflight` the broker's presence sweep
+        schedules against, and two clients announcing that about one bearer is
+        the split brain the guard exists to prevent.
+
+        The other three stay open, deliberately. `complete` and `reject` deliver
+        an answer for a lease this client genuinely holds, and F5 plus J1's
+        fail-open rule agree that losing a user's answer to a lock is the worse
+        outcome — a standby posting a result it owes is the *right* thing.
+        `healthz` leases nothing, claims nothing and marks no presence.
+        """
+        if self.guard is not None and self.guard.state == LOST:
+            log.info("not heartbeating: another poller holds this bearer's "
+                     "guard, and two clients claiming one bearer's presence is "
+                     "the split brain the guard is for (J1)")
+            return False
         return self._heartbeat(force=True)
 
     def _heartbeat(self, force: bool = False) -> bool:
@@ -644,8 +1146,12 @@ class RelayClient:
         """
         if self._heartbeat_disabled:
             return False
-        now = time.time()
-        if not force and now - self._last_heartbeat < self.heartbeat_interval:
+        # Monotonic (A8): on the wall clock an NTP step backwards silently
+        # suspended the heartbeat for the size of the step, and `inflight` is a
+        # signal the broker's presence sweep schedules against.
+        now = time.monotonic()
+        if (not force and self._last_heartbeat is not None
+                and now - self._last_heartbeat < self.heartbeat_interval):
             return False
         self._last_heartbeat = now
         self._reconciler.reconcile(self._live)
@@ -664,7 +1170,7 @@ class RelayClient:
             payload["step"] = presence_step
 
         try:
-            self.http.post("/v1/heartbeat", payload, timeout=SIDE_TIMEOUT_S)
+            self._http.post("/v1/heartbeat", payload, timeout=SIDE_TIMEOUT_S)
         except AuthRejected as exc:
             self._defer_auth(exc)  # C8
             return False
@@ -779,11 +1285,31 @@ class RelayClient:
     def healthz(self) -> Any:
         """The liveness probe. It exists so that nothing ever probes with
         `GET /v1/tasks`, which leases tasks (F1)."""
-        return self.http.get("/v1/healthz", timeout=SIDE_TIMEOUT_S)
+        return self._http.get("/v1/healthz", timeout=SIDE_TIMEOUT_S)
 
     def inflight(self) -> List[str]:
         """The ids this client owes the broker an answer for (E2)."""
         return self.journal.inflight_ids()
+
+    def hold(self, broker_id: str) -> None:
+        """Say that an id is in this consumer's hands, and must not be reconciled.
+
+        `prepare()` invites a consumer with a scheduler of its own, and such a
+        consumer can be holding work across a restart that *this* run never
+        accepted from the wire. E3's reconciler drops exactly those — ids the
+        journal calls accepted that no live Task claims — which is right for an
+        id whose Task died with its process and wrong for one a consumer
+        persisted and is still working on. Getting it wrong costs the room
+        sidecar (F7), so an attachment produced afterwards has no room to
+        target and is simply not delivered.
+
+        There was no supported way to say so: the live set and the reconciler
+        are both private, and reaching into them is not an interface. This is
+        that way. `complete`, `reject` and a successful result POST all release
+        the hold again, so a consumer that answers never has to.
+        """
+        wire_id = self._require_wire_id(broker_id)
+        self._live.add(wire_id)
 
     # --- internals ---------------------------------------------------------
 
@@ -797,6 +1323,12 @@ class RelayClient:
             # the guard held" look identical from outside and are not the same
             # operational situation.
             singleton=self.guard.state if self.guard is not None else "off",
+            # How much of F4's ack cooldown is left, because against this broker
+            # a pause on acking is a pause on delivery and a supervisor cannot
+            # otherwise tell "quiet" from "every lease in this window is being
+            # requeued underneath us".
+            acks_paused_s=(0.0 if self._ack_disabled_until is None else round(
+                max(0.0, self._ack_disabled_until - time.monotonic()), 1)),
             **fields)
 
     def _require_wire_id(self, broker_id: Any) -> str:
@@ -809,6 +1341,41 @@ class RelayClient:
         if not isinstance(broker_id, str) or not valid_wire_id(broker_id):
             raise ValueError(f"not a broker task id: {broker_id!r:.80}")
         return broker_id
+
+
+#: The names an HTTP error message is written under. The deployed broker uses
+#: the first one (`api/v1.py:461` answers `{"error": "not leased to you"}`);
+#: the rest are what the same message would be called by anything else.
+_ERROR_KEYS = ("error", "detail", "message", "reason", "title")
+
+
+def _says_not_leased(body: Any) -> bool:
+    """Is this 404 the per-task negative, or a route that is not there? (F4)
+
+    Only the body tells them apart, and reading the per-task one as "no route"
+    is what let a single stale lease blind a whole host's `received` state.
+
+    Both readings, on purpose. The raw text first, because that is what the wire
+    carried and it is what a substring match has always seen; then the parsed
+    body's error message, under any of the names one goes by. A sniff that only
+    knew the raw text breaks the day the transport hands this a decoded object
+    instead of a string, and one that only knew `detail` would already be broken
+    against a broker that says `error` — which this one does.
+    """
+    text = body if isinstance(body, str) else ""
+    if "not leased" in text.lower():
+        return True
+    parsed: Any = body
+    if text:
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return False
+    if not isinstance(parsed, Mapping):
+        return False
+    return any("not leased" in parsed[key].lower()
+               for key in _ERROR_KEYS
+               if isinstance(parsed.get(key), str))
 
 
 def _describe(exc: BaseException) -> str:

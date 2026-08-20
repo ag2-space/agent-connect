@@ -39,7 +39,7 @@ SOURCES = sorted(PACKAGE.glob("*.py"))
 ALLOWED = {
     "__future__", "base64", "collections", "contextlib", "dataclasses", "email",
     "errno", "fcntl", "hashlib", "http", "io", "json", "logging", "mimetypes",
-    "os", "pathlib", "queue", "re", "shutil", "socket", "ssl", "stat", "sys",
+    "math", "os", "pathlib", "queue", "re", "shutil", "socket", "ssl", "stat", "sys",
     "tempfile", "threading", "time", "traceback", "types", "typing", "urllib",
     "uuid",
 }

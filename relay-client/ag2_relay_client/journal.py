@@ -33,20 +33,42 @@ smallest window that F5 admits.
 The file is rewritten whole, temp + `os.replace`, on every change: a journal
 that is half-written after a kill is worse than one that is a version behind,
 and this file's whole purpose is to survive exactly that kill.
+
+**Two processes, one file.** The whole-file rewrite is last-writer-wins by
+construction, and that is not hypothetical: a second `Journal` on the same path
+retiring one id, followed by the first one's next write, put the retired id
+back. J1 makes two *pollers* rare and not impossible — a standby exists by
+design, a takeover has both views live at once, and a consumer may answer from
+somewhere else — so every write takes a cross-process lock on a sidecar and
+re-reads the file underneath it first, keeping every id it did not itself
+change. See `_merge_from_disk`.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from .state import write_private_atomic
+from .state import valid_wire_id, write_private_atomic
 
 log = logging.getLogger(__name__)
+
+try:  # POSIX advisory locking; see `_across_processes`.
+    import fcntl
+except ImportError:  # pragma: no cover — non-POSIX
+    fcntl = None  # type: ignore[assignment]
+
+#: How long to wait for the journal's cross-process lock before writing without
+#: it. Bounded because this runs inside the poll iteration and nothing in there
+#: may block unboundedly (F1); short because the critical section is a small
+#: read and a small write.
+LOCK_WAIT_S = 1.0
 
 #: Accepted from the broker; the consumer has it, or is about to.
 ACCEPTED = "accepted"
@@ -80,6 +102,15 @@ class Journal:
         self.done_window = int(done_window)
         self._lock = threading.RLock()
         self._entries: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        #: The ids this instance changed since it last wrote the file. Emptied
+        #: by every successful save, so it holds one mutation's worth — it is
+        #: the merge rule's whole input. See `_merge_from_disk`.
+        self._touched: set = set()
+        #: The sidecar the cross-process lock is taken on. A sidecar and not the
+        #: journal itself because `write_private_atomic` replaces the journal's
+        #: inode, and a lock on an inode that gets swapped is not a lock at all
+        #: — the same reason `singleton.py` writes its record in place.
+        self._lock_path = self.path.parent / (self.path.name + ".lock")
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<Journal {self.path} inflight={self.inflight()}>"
@@ -92,36 +123,54 @@ class Journal:
         A line that will not parse is dropped with a log rather than raising:
         the alternative is a client that cannot start because of one bad
         record, which is a worse failure than losing one id's bookkeeping.
+
+        Every id is re-checked against F8's grammar on the way back in. The
+        file is this library's own, but "our own file" is not a trust boundary
+        a state dir can carry: it syncs, it is restored, and it is editable by
+        anything running as the user. An id read back off disk goes straight
+        onto the wire in a result POST and into a path component, which is the
+        same traversal in both directions the intake check exists to stop, so
+        it is checked in both directions too.
         """
         with self._lock:
             self._entries.clear()
-            try:
-                text = self.path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                return self
-            damaged = 0
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    damaged += 1
-                    continue
-                if not isinstance(record, dict):
-                    damaged += 1
-                    continue
-                wire_id = record.get("id")
-                state = record.get("state")
-                if not isinstance(wire_id, str) or state not in (ACCEPTED, PENDING, DONE):
-                    damaged += 1
-                    continue
-                self._entries[wire_id] = record
-            if damaged:
-                log.warning("%s: skipped %d unreadable journal record(s)",
-                            self.path, damaged)
+            self._touched.clear()
+            entries = self._read_file()
+            if entries is not None:
+                self._entries = entries
         return self
+
+    def _read_file(self) -> "Optional[OrderedDict[str, Dict[str, Any]]]":
+        """The file as entries, or `None` when there is nothing readable."""
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        entries: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        damaged = 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                damaged += 1
+                continue
+            if not isinstance(record, dict):
+                damaged += 1
+                continue
+            wire_id = record.get("id")
+            state = record.get("state")
+            if (not isinstance(wire_id, str) or not valid_wire_id(wire_id)
+                    or state not in (ACCEPTED, PENDING, DONE)):
+                damaged += 1
+                continue
+            entries[wire_id] = record
+        if damaged:
+            log.warning("%s: skipped %d unreadable or unusable journal "
+                        "record(s)", self.path, damaged)
+        return entries
 
     # --- the three facts -------------------------------------------------
 
@@ -143,7 +192,7 @@ class Journal:
                 "ts": time.time(),
             }
             self._entries.move_to_end(wire_id)
-            self._save()
+            self._save(wire_id)
 
     def record_result(self, wire_id: str, payload: Dict) -> None:
         """Attach the answer to an accepted id, durably, before it is POSTed.
@@ -163,13 +212,17 @@ class Journal:
             record["ts"] = time.time()
             self._entries[wire_id] = record
             self._entries.move_to_end(wire_id)
-            self._save()
+            self._save(wire_id)
 
     def retire(self, wire_id: str) -> None:
         """The broker accepted the result: the id becomes dedup memory.
 
         The answer and the room sidecar go with the same write — a successful
         POST is the only thing that retires them (F5, F7).
+
+        The write here is best-effort (see `_save_quietly`): this call runs
+        inside the poll iteration, before `GET /v1/tasks`, and D4 says nothing
+        in there may raise.
         """
         with self._lock:
             record: Dict[str, Any] = self._entries.get(wire_id) or {"id": wire_id}
@@ -180,13 +233,17 @@ class Journal:
             self._entries[wire_id] = record
             self._entries.move_to_end(wire_id)
             self._trim()
-            self._save()
+            self._save_quietly(wire_id)
 
     def drop(self, wire_id: str) -> None:
-        """Forget an id entirely (E3: it can never complete through here)."""
+        """Forget an id entirely (E3: it can never complete through here).
+
+        Best-effort for the same reason as `retire`: the reconciler that calls
+        it runs from the heartbeat, which runs before the poll.
+        """
         with self._lock:
             if self._entries.pop(wire_id, None) is not None:
-                self._save()
+                self._save_quietly(wire_id)
 
     # --- reading -----------------------------------------------------------
 
@@ -253,20 +310,151 @@ class Journal:
         excess = len(done) - self.done_window
         for wire_id in done[:max(0, excess)]:
             self._entries.pop(wire_id, None)
+            # A trim is this instance's own decision, so the merge must not
+            # read the id straight back off disk on the way out.
+            self._touched.add(wire_id)
 
-    def _save(self) -> None:
-        """Whole file, temp + atomic replace, fsynced.
+    def _save(self, *touched: str) -> None:
+        """Whole file, temp + atomic replace, fsynced, under a cross-process lock.
 
         Not an optimization target: this file is small (ids and one pending
         answer at a time), and every alternative — append-and-compact, an
         in-place rewrite — has a window where a kill leaves a record half
         written. The kill is the case this file exists for.
+
+        Raises what the write raises. Callers whose fact can survive a lost
+        write use `_save_quietly`; the two that cannot — `accept` and
+        `record_result` — are the durability F2's ack ordering and F5's
+        retention rest on, and a caller told "durable" has to be told the truth.
         """
-        lines = "".join(
-            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
-            for record in self._entries.values()
-        )
-        write_private_atomic(self.path, lines)
+        self._touched.update(touched)
+        with _across_processes(self._lock_path) as locked:
+            if locked:
+                self._merge_from_disk()
+            lines = "".join(
+                json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                for record in self._entries.values()
+            )
+            write_private_atomic(self.path, lines)
+        self._touched.clear()
+
+    def _save_quietly(self, *touched: str) -> bool:
+        """A save whose failure the caller survives (D4). True if it landed.
+
+        `retire` and `drop`, and nothing else. Both record that an id needs
+        *less* than the file already promises — the result was delivered, the id
+        can never complete — so a write that does not land leaves the journal a
+        version behind in the safe direction: the id is re-POSTed on a later
+        pass and the broker dedups it (`200 {"duplicate": true}`).
+
+        The scar: `write_private_atomic` can raise — ENOSPC, a read-only mount,
+        a state dir removed under a running client — and `retire` runs inside
+        `_drain_results`, which runs inside the poll iteration *before* `GET
+        /v1/tasks`. Reproduced: the result POST succeeded and only the retire
+        failed, so every later pass re-POSTed and re-raised at the same line;
+        the loop backed off to its 60 s cap and never polled again, every
+        in-flight lease expired, and the status file still said `reconnecting`.
+        D4 is explicit that nothing before the GET may raise, and this was the
+        one place it could.
+        """
+        try:
+            self._save(*touched)
+            return True
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            log.warning("could not write the journal at %s (%s) — the change is "
+                        "held in memory and the file is a version behind, in "
+                        "the direction that only costs a duplicate the broker "
+                        "dedups. The poll loop is not interrupted (D4).",
+                        self.path, exc)
+            return False
+
+    def _merge_from_disk(self) -> None:
+        """Fold in what another process changed, before overwriting the file.
+
+        `_save` used to serialise this instance's whole view over whatever was
+        on disk, which is last-writer-wins across processes: reproduced by
+        having a second `Journal` on the same file retire `task-B` and watching
+        the first one's next `record_result` rewrite the file without it. B1 is
+        the same bug with a bigger blast radius — a standby that takes the
+        bearer over writes the journal it loaded at boot and erases everything
+        the previous holder answered while it stood by.
+
+        The merge rule is the smallest one that cannot lose a fact: an id *this*
+        instance changed since its last write is ours to write, and every other
+        id is read back from the file — adopted if it is new there, replaced if
+        it moved on, forgotten if it is gone. It is not a general reconciliation
+        and does not pretend to be; it removes the failure where a write that
+        knew nothing about an id destroyed it.
+        """
+        on_disk = self._read_file()
+        if on_disk is None:
+            return  # no file yet, or nothing readable in it: ours stands
+        for wire_id in list(self._entries):
+            if wire_id in self._touched:
+                continue
+            theirs = on_disk.get(wire_id)
+            if theirs is None:
+                self._entries.pop(wire_id, None)
+            else:
+                self._entries[wire_id] = theirs
+        for wire_id, record in on_disk.items():
+            # `_touched` covers removals too — a `drop` or a `_trim` is this
+            # instance saying an id should be gone, and reading it straight back
+            # off the file would undo the write that is being made.
+            if wire_id not in self._entries and wire_id not in self._touched:
+                self._entries[wire_id] = record
+
+
+@contextlib.contextmanager
+def _across_processes(path: Path) -> Iterator[bool]:
+    """Hold an exclusive lock over one read-merge-write. Yields whether it took.
+
+    Whether, and not an exception, because the merge is a correctness
+    improvement and not a precondition: a state dir on a filesystem with no
+    locking, or a platform with no `fcntl`, must still be able to write its
+    journal. Failing the write there would trade a rare cross-process clobber
+    for a guaranteed local one (D4).
+
+    `LOCK_NB` and a short spin rather than a blocking `flock`, for the reason
+    every wait in this library is bounded: the poll loop is what keeps leases
+    alive, and a call in it that can wait forever is how a client stops
+    delivering without ever looking broken (F1).
+    """
+    if fcntl is None:  # pragma: no cover — non-POSIX
+        yield False
+        return
+    handle = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    log.warning("the journal lock at %s stayed held for %ss — "
+                                "writing without it; a concurrent writer's "
+                                "change to another id may be lost", path,
+                                LOCK_WAIT_S)
+                    yield False
+                    return
+                time.sleep(0.005)
+    except OSError as exc:
+        log.debug("no cross-process journal lock at %s (%s)", path, exc)
+        if handle is not None:
+            os.close(handle)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover — closing releases it anyway
+            pass
+        os.close(handle)
 
 
 class Reconciler:

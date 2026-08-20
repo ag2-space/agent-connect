@@ -110,7 +110,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
           "a token file naming a different gateway is not a rotation — the "
           "client keeps waiting rather than hot-swapping (C5)")
     check(client.credentials.secret == "FIRST", "the running bearer is untouched")
-    check(client.http.base_url.startswith("http://127.0.0.1"),
+    check(client.snapshot()["gateway"].startswith("http://127.0.0.1"),
           "and so is the gateway it talks to")
     check(state_of(client)["state"] == AUTH_WAIT, "the wait continues, visibly")
 

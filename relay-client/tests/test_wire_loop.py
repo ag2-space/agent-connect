@@ -18,9 +18,12 @@ from pathlib import Path
 
 from fake_broker import FakeBroker
 
+from ag2_relay_client import journal as journal_module
 from ag2_relay_client.client import NO_SEND, RelayClient
 from ag2_relay_client.credentials import TokenSource
+from ag2_relay_client.state import StateLayout
 from ag2_relay_client.status import CONNECTED, RECONNECTING
+from ag2_relay_client.transport import RelayHTTP
 
 fails = 0
 
@@ -61,6 +64,36 @@ def client_for(broker, tmp, **kwargs):
     client = RelayClient(TokenSource(token=f"{broker.url}|SECRET"), tmp, **kwargs)
     client.prepare()
     return client
+
+
+class Timeouts:
+    """Every timeout the client asked for, per path.
+
+    A wrapper and not an assertion on the socket, because the fake broker
+    answers instantly: nothing in this suite would notice if the long poll's
+    socket timeout were set to the long-poll window itself, and that is the one
+    value where being wrong turns every idle poll into an error and every idle
+    poll into a lost lease (F1).
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.seen = []
+
+    @property
+    def base_url(self):
+        return self.inner.base_url
+
+    def get(self, path, params=None, timeout=None):
+        self.seen.append((path, timeout))
+        return self.inner.get(path, params=params, timeout=timeout)
+
+    def post(self, path, payload=None, timeout=None):
+        self.seen.append((path, timeout))
+        return self.inner.post(path, payload, timeout=timeout)
+
+    def for_path(self, fragment):
+        return [t for path, t in self.seen if fragment in path]
 
 
 def bury(client):
@@ -121,8 +154,18 @@ class JournalWatchingHTTP:
 
 # --- one task's whole life, and the ordering inside it ---------------------
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
-    client = client_for(broker, tmp)
-    client.http = JournalWatchingHTTP(client.http, client.layout.journal_path)
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    layout = StateLayout(tmp, "test")
+    # Handed in at construction, because `_http` is sealed: a public, writable
+    # `client.http` is `client.http.post("/v1/rooms/X/media", ...)` — every
+    # egress rule bypassed in one line — which is the hatch ticket 04 closed on
+    # `RoomOps` and this closes here.
+    watching = JournalWatchingHTTP(
+        RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), layout.journal_path)
+    client = RelayClient(TokenSource(token=f"{broker.url}|SECRET"), tmp,
+                         instance="test", http=watching)
+    client.prepare()
     broker.on("GET", "/v1/tasks", json={"tasks": [wire_task()]})
     broker.on("POST", "/v1/results", json={"ok": True})
 
@@ -142,7 +185,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     # F2: the ack left AFTER the journal entry was durable, never before. An
     # ack-then-crash the other way round leaves the broker showing "received"
     # for work no surviving process knows about.
-    at_ack = client.http.journal_at("POST", "/ack")
+    at_ack = watching.journal_at("POST", "/ack")
     check(at_ack is not None and "task-1" in at_ack and "accepted" in at_ack,
           "the ack goes out only after the journal entry is durable (F2)")
     check(broker.took("POST", "/v1/tasks/task-1/ack"),
@@ -256,18 +299,85 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
         client.poll_once()
     check(client.journal.is_pending("task-1"),
           "three failed passes later the answer is still owed, not forgotten")
-    check(len(broker.took("POST", "/v1/results")) >= 4,
-          "and every pass tries again")
+    tried = len(broker.took("POST", "/v1/results"))
+    time.sleep(1.05)   # past the first rung of this result's own ladder
+    broker.on("GET", "/v1/tasks", json={"tasks": []})
+    client.poll_once()
+    check(len(broker.took("POST", "/v1/results")) > tried,
+          "and it is tried again — on its own ladder now, not once per pass: a "
+          "result that fails costs its own id a delay, and costs the answers "
+          "behind it nothing")
 
     # A 200 that says the broker did not take it is not a success either.
     broker.on("POST", "/v1/results", json={"ok": False, "error": "busy"})
+    client._result_retry_at.clear()   # its own ladder is not what is under test
     client.poll_once()
     check(client.journal.is_pending("task-1"),
           "a 200 answering ok:false retains the result too")
 
     broker.on("POST", "/v1/results", json={"ok": True})
+    client._result_retry_at.clear()
     client.poll_once()
     check(client.journal.is_done("task-1"), "success, and only success, retires it")
+
+# --- A3: one poisoned result must not sit on every answer behind it --------
+# `pending_results()` is oldest-first, so a `break` on the first failure puts
+# the poisoned answer permanently at the head of the queue: everything behind it
+# is durable, owed, and never sent. It is unreachable by `Reconciler` (which
+# only inspects accepted ids), never re-offered (a redelivery of a pending id is
+# a no-op), and `inflight` only grows — E3's scar, arriving through the front
+# door. The real trigger is a reply large enough to outlast RESULT_TIMEOUT_S,
+# because `add_result` does the room's outbound send inside the request.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    client = client_for(broker, tmp)
+    broker.on("GET", "/v1/tasks",
+              json={"tasks": [wire_task("task-a"), wire_task("task-b")]})
+    client.poll_once()
+    check(len([t for t in iter(lambda: client.next_task(0.1), None)]) == 2,
+          "two tasks are delivered")
+
+    # task-a's answer is the one the broker will not take. task-b's is fine, and
+    # task-b is behind it in the queue.
+    broker.on("POST", "/v1/results", status=500, body="that one, never")
+    client.complete("task-a", "the poisoned answer")
+    broker.forget()
+    broker.on("POST", "/v1/results", json={"ok": True})
+    client.complete("task-b", "the answer behind it")
+
+    posted = [r.json["id"] for r in broker.took("POST", "/v1/results")]
+    check("task-b" in posted,
+          "the answer behind the failing one is POSTed on the same pass — a "
+          "per-result failure is not a broker-wide verdict (A3, F5, E3)")
+    check(client.journal.is_done("task-b"), "and it is retired")
+    check(client.journal.is_pending("task-a"),
+          "while the failing one is retained, not dropped (F5)")
+    check(client.inflight() == ["task-a"],
+          "so the in-flight ledger has a way back down, which is the whole of "
+          "E3: it must not grow monotonically")
+
+    # And again with the poisoned answer *due* rather than merely gated: it is
+    # retried, it fails again, and the queue still moves. A `break` here is what
+    # made the failure permanent — `pending_results()` is oldest-first, so the
+    # poisoned answer is at the head on every pass forever.
+    broker.forget()
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task("task-c")]})
+    client.poll_once()
+    client.next_task(timeout=1)
+    time.sleep(1.05)                  # past the first rung of task-a's ladder
+    broker.on("POST", "/v1/results", status=500, body="that one, never")
+    broker.on("POST", "/v1/results", json={"ok": True})
+    client.complete("task-c", "a third answer, behind the poisoned one")
+    check(client.journal.is_done("task-c"),
+          "an answer behind a due-and-still-failing one is delivered, not "
+          "queued behind it forever (A3)")
+    check(client.journal.is_pending("task-a"), "and the failing one is still owed")
+
+    client._result_retry_at.clear()   # skip its backoff; the ladder is not this
+    broker.on("POST", "/v1/results", json={"ok": True})
+    broker.on("GET", "/v1/tasks", json={"tasks": []})
+    client.poll_once()
+    check(client.journal.is_done("task-a"),
+          "and the head of the queue is still retried, so nothing is lost")
 
 # --- F4: the two things a 404 on the ack route means -----------------------
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
@@ -298,8 +408,19 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(len(broker.took("POST", "/v1/tasks/*/ack")) == 1,
           "and the ones behind it do not — acking is cooled down, not hammered")
     check(client.next_task(timeout=0.1) is not None,
-          "tasks are still delivered while acking is cooled down: the ack is "
-          "informational and gates nothing (F2)")
+          "tasks are still delivered while acking is cooled down: the ack does "
+          "not gate the handoff (F2)")
+    # A2: the cooldown is not free and must not be silent. Against this broker
+    # an un-acked lease is extended on liveness alone twice and then requeued
+    # with `attempt` bumped, so everything accepted inside a 300 s pause is
+    # re-served under a running Turn and eventually dead-lettered. The old
+    # assertion here read "the ack is informational and gates nothing", which is
+    # the belief that hid it.
+    check(json.loads(client.layout.status_path.read_text())["acks_paused_s"] > 0,
+          "and the pause is in the status file, with how much of it is left — a "
+          "delivery outage a supervisor cannot see is the 2026-07-25 shape (D2)")
+    check(sorted(client._ack_owed) == ["task-b", "task-c"],
+          "the acks the pause held back are owed, not thrown away")
 
     # ...and it self-heals. A permanent latch means a broker that GAINS the
     # endpoint in a deploy is never picked up until the worker restarts.
@@ -308,9 +429,15 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
     broker.on("GET", "/v1/tasks", json={"tasks": [wire_task("task-d")]})
     client.poll_once()
-    check(len(broker.took("POST", "/v1/tasks/*/ack")) == 1,
-          "after the cooldown the client asks again, and the deploy is picked up")
-    check(client._ack_disabled_until == 0.0, "a success clears the cooldown entirely")
+    acked = {r.path.rsplit("/", 2)[-2]
+             for r in broker.took("POST", "/v1/tasks/*/ack")}
+    check(acked == {"task-b", "task-c", "task-d"},
+          "after the cooldown the client asks again, and it asks for the ones "
+          "the pause held back too — an un-acked lease is on a clock (A2, F4)")
+    check(client._ack_disabled_until is None,
+          "a success clears the cooldown entirely")
+    check(json.loads(client.layout.status_path.read_text())["acks_paused_s"] == 0.0,
+          "and the status says the pause is over")
 
     # 405 is the other shape of "no such route" — a deployment that answers
     # method-not-allowed rather than not-found says the same thing.
@@ -322,7 +449,8 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     client.poll_once()
     check(len(broker.took("POST", "/v1/tasks/*/ack")) == 1,
           "a 405 cools acking down exactly as a bare 404 does")
-    check(client._ack_disabled_until > 0.0, "with the same time gate on it")
+    check(client._ack_disabled_until is not None,
+          "with the same time gate on it")
 
 # --- G2 through the loop: the block never reaches the consumer -------------
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
@@ -469,6 +597,244 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     time.sleep(0.15)
     check(len(broker.took("GET", "/v1/tasks")) == polls,
           "and stops polling — a poller that outlives its stop double-delivers")
+
+# --- A1: a re-serve of a task the consumer still holds must be re-acked ----
+# The client's model came from WORKER-PROTOCOL.md ("the ack never touches the
+# lease") and the doc is wrong. `take()` re-leases with no `acknowledged_ts`
+# carried over, so every re-serve starts un-acked, and an un-acked lease is
+# extended on liveness alone only twice before it is requeued with `attempt`
+# bumped. A ten-minute Turn under one backoff window therefore burned all five
+# attempts and was dead-lettered at about minute fifteen while the consumer was
+# still working — and the eventual `complete()` POSTed into a broker with no
+# lease and no room for it, which answers 200. The client retired it as
+# delivered and the user's answer was gone, with no error at either end.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    client = client_for(broker, tmp)
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task()]})
+    client.poll_once()
+    held = client.next_task(timeout=1)
+    check(held is not None, "the consumer has the task and has not answered yet")
+
+    broker.forget()
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    # The lease expired under a slow Turn and the broker re-served it: same id,
+    # bumped attempt, a brand new un-acked lease.
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(attempt=2)]})
+    client.poll_once()
+
+    check(len(broker.took("POST", "/v1/tasks/task-1/ack")) == 1,
+          "the re-served task is acked again — that ack is the only thing that "
+          "keeps the new lease alive past the un-acked extend grace (A1)")
+    check(client.next_task(timeout=0.1) is None,
+          "and it is not handed to the consumer a second time (F3)")
+    check(client.inflight() == ["task-1"],
+          "it is still the same one piece of work, owed once")
+
+    # The same holds while the answer is written but the POST has not landed:
+    # the lease is still this client's, still un-acked after the re-serve, and
+    # the drain needs it alive long enough to complete it.
+    broker.forget()
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    broker.on("POST", "/v1/results", status=503, body="later")
+    client.complete("task-1", "the answer, which the broker will not take yet")
+    check(client.journal.is_pending("task-1"), "the answer is owed")
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(attempt=3)]})
+    client.poll_once()
+    check(len(broker.took("POST", "/v1/tasks/task-1/ack")) == 1,
+          "a re-serve of an id whose answer is waiting is re-acked too — that "
+          "lease has to outlive the retries the answer is going through (A1)")
+
+    # The same hole swallowed the per-task `not leased` 404: that ack is skipped
+    # and never retried, so the task went un-acked for its whole life.
+    broker.forget()
+    broker.on("POST", "/v1/tasks/*/ack", status=404,
+              json={"error": "not leased to you"})
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task("task-churn")]})
+    client.poll_once()
+    client.next_task(timeout=1)
+    broker.forget()
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task("task-churn", attempt=2)]})
+    client.poll_once()
+    check(len(broker.took("POST", "/v1/tasks/task-churn/ack")) == 1,
+          "an ack the lease churn refused is asked again on the next re-serve, "
+          "rather than never (F4's per-task 404 is not a permanent skip)")
+
+    # And a re-ack goes out even while F4's cooldown is running: the cooldown is
+    # for a route that is not there, and a re-serve is a live lease about to be
+    # requeued. It is naturally rate-limited — once per visibility window per
+    # task — so it can never become the hammering the cooldown exists to stop.
+    client._ack_disabled_until = time.monotonic() + 300.0
+    broker.forget()
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(attempt=3)]})
+    client.poll_once()
+    check(len(broker.took("POST", "/v1/tasks/task-1/ack")) == 1,
+          "a re-ack is not swallowed by the ack cooldown (A1, A2)")
+
+# --- A4: a journal write that fails must not stop the poll (D4) ------------
+# D4 is explicit: nothing in the poll iteration before the GET may raise.
+# `write_private_atomic` can — ENOSPC, a read-only mount, a state dir removed
+# under a running client — and `_drain_results`'s retire and `_heartbeat`'s
+# reconcile both reach it. Reproduced: the result POST *succeeded* and only the
+# retire failed, so every later pass re-POSTed and re-raised at the same line;
+# the loop backed off to 60 s and never polled again, every in-flight lease
+# expired, and the status file still said `reconnecting`.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    client = client_for(broker, tmp)
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task()]})
+    broker.on("POST", "/v1/results", status=502, body="bad gateway")
+    client.poll_once()
+    client.next_task(timeout=1)
+    client.complete("task-1", "the answer")
+    check(client.journal.is_pending("task-1"), "an answer is owed to the broker")
+
+    def refuse_to_write(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    # The next pass POSTs it successfully and then cannot write the retire —
+    # which is exactly the reproduced shape, and the worst one, because the
+    # answer *did* land and the loop stopped anyway.
+    saved_write = journal_module.write_private_atomic
+    journal_module.write_private_atomic = refuse_to_write
+    client._result_retry_at.clear()   # its own ladder is not what is under test
+    broker.forget()
+    broker.on("POST", "/v1/results", json={"ok": True})
+    broker.on("GET", "/v1/tasks", json={"tasks": []})
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    try:
+        delay = client.poll_once()
+    finally:
+        journal_module.write_private_atomic = saved_write
+
+    check(broker.took("POST", "/v1/results"), "the result POST goes out")
+    check(delay == 0.0,
+          "and the journal write that failed behind it does not back the loop "
+          "off — before this, the loop backed off to 60s and never polled "
+          "again, with every in-flight lease quietly expiring (A4, D4)")
+    check(broker.took("GET", "/v1/tasks"),
+          "the poll itself still goes out, which is the whole of D4's rule: "
+          "nothing before the GET may be what stops delivery")
+    check(json.loads(client.layout.status_path.read_text())["state"] == CONNECTED,
+          "and the status says connected, not a reconnecting it never comes "
+          "back from")
+    check(client.journal.is_done("task-1"),
+          "the retire held in memory, so the id is not re-POSTed forever; the "
+          "file is a version behind in the direction that only costs a "
+          "duplicate the broker dedups")
+
+    # A write that fails while a *task* is being taken in costs that task and
+    # not the batch: the broker re-serves it and F3 absorbs the duplicate.
+    journal_module.write_private_atomic = refuse_to_write
+    broker.forget()
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task("task-x"), wire_task("task-y")]})
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    try:
+        delay = client.poll_once()
+    finally:
+        journal_module.write_private_atomic = saved_write
+    check(delay == 0.0, "a leased task that cannot be journalled does not back "
+                        "the loop off either")
+    check(broker.took("GET", "/v1/tasks"),
+          "and the client keeps polling, which is what keeps the leases it "
+          "already holds alive (F1)")
+
+# --- A5: the ack must not gate delivery, and a batch must not gate the poll -
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    # Every ack costs the fake broker 150 ms. Inline and serialised, ten of them
+    # were 1.5 s of delivery latency before the first Task reached the consumer
+    # — and at the ack's own 10 s timeout, a ten-task batch is 100 s of poll
+    # iteration, which is a lost lease for every task still in flight (F1, F2).
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True}, delay=0.15)
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    client = RelayClient(TokenSource(token=f"{broker.url}|SECRET"), tmp,
+                         instance="test", intake_budget=0.4)
+    client.prepare()
+    broker.on("GET", "/v1/tasks",
+              json={"tasks": [wire_task(f"batch-{n}") for n in range(10)]})
+    started = time.monotonic()
+    client.poll_once()
+    turn = time.monotonic() - started
+
+    delivered = [t.id for t in iter(lambda: client.next_task(0.05), None)]
+    check(len(delivered) == 10, "the whole batch reaches the consumer")
+    check(turn < 1.5,
+          f"and the turn is bounded by the intake budget, not by the batch "
+          f"length ({turn:.2f}s for ten 150ms acks)")
+    acked = len(broker.took("POST", "/v1/tasks/*/ack"))
+    check(0 < acked < 10,
+          f"only what fitted in the budget was acked this turn ({acked} of 10)")
+    check(len(client._ack_owed) == 10 - acked,
+          "and the rest are owed to the next turn, not dropped — 'we will ack "
+          "it eventually' is a real deadline, not bookkeeping")
+
+    broker.on("GET", "/v1/tasks", json={"tasks": []})
+    for _ in range(6):
+        if not client._ack_owed:
+            break
+        client.poll_once()
+    check(not client._ack_owed,
+          "later turns drain the backlog, oldest first")
+
+# --- the socket timeout, which no test used to look at ---------------------
+# The fake broker answers instantly, so setting the long poll's socket timeout
+# to the long-poll window itself left the whole suite green — and in production
+# turns every idle poll into a timeout, every timeout into a backoff, and every
+# backoff into the lost leases F1 is about.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    timeouts = Timeouts(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")))
+    client = RelayClient(TokenSource(token=f"{broker.url}|SECRET"), tmp,
+                         instance="test", http=timeouts)
+    client.prepare()
+    broker.on("GET", "/v1/tasks", json={"tasks": []})
+    client.poll_once()
+    check(timeouts.for_path("/v1/tasks") == [client.poll_wait + client.socket_margin],
+          "the long poll's socket timeout is the window plus the margin — a "
+          "timeout at or below the window makes every idle poll an error (F1)")
+    check(all(t == 10.0 for t in timeouts.for_path("/v1/heartbeat")),
+          "and a side call gets a side call's timeout, so it can never hold up "
+          "the poll behind it")
+
+# --- C2: the authenticated session is not a public escape hatch ------------
+# `RelayHTTP` is a bearer token with a `.post`, and a public attribute holding
+# one is `client.http.post("/v1/rooms/X/media", {"content_b64": ...})` — every
+# rule in `egress.py` bypassed in one line. Ticket 04 sealed the identical hatch
+# on `RoomOps`; this is the same seal. A caller with its own transport hands it
+# in at construction, which is the only supported route.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    client = client_for(broker, tmp)
+    check(not hasattr(client, "http"), "`client.http` is gone")
+    check(not hasattr(client, "__dict__"),
+          "and there is no instance dict for the seal to be walked around")
+    for attempt in ("http", "_http"):
+        refused = None
+        try:
+            setattr(client, attempt, object())
+        except AttributeError as exc:
+            refused = exc
+        check(refused is not None,
+              f"`client.{attempt} = ...` is refused — a session that can be "
+              f"*replaced* is the same hatch with a different spelling")
+    deleted = None
+    try:
+        del client._http
+    except AttributeError as exc:
+        deleted = exc
+    check(deleted is not None, "and it cannot be deleted out of the way either")
+
+# --- A8: the clocks the loop gates on are monotonic -------------------------
+# An NTP step backwards used to extend the ack cooldown by the size of the step
+# and suspend the heartbeat for as long — and against this broker a pause on
+# acking is a pause on delivery. The behaviour is asserted above; this is the
+# fence around it, because `time.time()` is the obvious thing to reach for.
+CLIENT_SOURCE = (Path(_bootstrap.ROOT) / "ag2_relay_client" / "client.py").read_text()
+check("time.time()" not in CLIENT_SOURCE,
+      "no wall clock gates anything in the loop: a duration measured on a "
+      "clock that can step is not a duration (A8)")
 
 # --- F1's other half: never health-probe with the endpoint that leases -----
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:

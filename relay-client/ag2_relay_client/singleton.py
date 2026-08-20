@@ -60,6 +60,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import socket
 import time
@@ -87,21 +88,55 @@ IDLE = "idle"
 #: How old a holder's last "I am alive" may be before another client may take
 #: the guard from it.
 #:
-#: The arithmetic, because it is not a taste question: the holder re-stamps the
-#: record once per turn of its poll loop, and a turn is at worst one long poll
-#: (`wait=25` plus a 10 s socket margin) after a full backoff delay (capped at
-#: 60 s) — ~95 s between two consecutive stamps for a client that is alive and
-#: failing to reach a broker. Anything below that would let a client in deep
-#: backoff lose the guard for being unlucky rather than for being hung. 120 s
-#: leaves that headroom, and is what an unclean kill costs before a replacement
-#: can take over. A clean `stop()` releases and costs nothing.
-STALE_AFTER_S = 120.0
+#: The arithmetic, because it is not a taste question — and because the number
+#: this replaces was arrived at by leaving most of the turn out. The old note
+#: counted "one long poll (35 s) after a full backoff delay (60 s)" and called
+#: it ~95 s, but `_drain_results` (one result timeout *per owed result*) and
+#: `_heartbeat` both run before the poll on every turn. Measured against the
+#: real loop: 125.0 s steady with one owed result and the backoff at its cap,
+#: and 120.9 s with no failure at all — eight answers and a slow `/v1/results`
+#: — at which point a standby took the guard from a holder whose thread was
+#: alive throughout, and the holder's next `_renew` saw a foreign owner and
+#: went DISPLACED permanently. A live holder losing the guard is the exact
+#: inverse of this file's purpose, and it is a J1 fail-*closed*.
+#:
+#: Two things changed, so this window no longer has to bound a whole turn. The
+#: loop now bounds itself (a wall-clock budget on the result drain and on the
+#: acks a batch makes), and it re-stamps this record at every phase boundary
+#: and through the wait between turns (`RelayClient._keep_guard_fresh`). What
+#: has to fit inside the window is therefore the longest single call the loop
+#: can be *inside*, not the sum of the calls it makes:
+#:
+#:     the long poll's socket timeout   35 s   (wait 25 + margin 10; the
+#:                                              longest blocking call there is)
+#:   + the refresh throttle below       20 s   (a stamp skipped a moment before
+#:                                              that call began)
+#:   + one missed stamp                 35 s   (the guard file transiently
+#:                                              unlockable — DEGRADED writes
+#:                                              nothing — so the next chance is
+#:                                              a phase later)
+#:   ------------------------------------------
+#:                                      90 s
+#:
+#: 150 leaves that two thirds of headroom for a slow disk, a stepped clock and
+#: a filesystem that made the stamp slower than the poll. The cost is stated
+#: plainly: it is what an unclean kill costs before a replacement can take
+#: over. A clean `stop()` releases and costs nothing.
+STALE_AFTER_S = 150.0
 
 #: How often the holder rewrites its own record. The claim is checked every turn
 #: — that is how a loss is noticed immediately — but the *write* is throttled to
 #: this, because a fast loop (a test, an instant broker) would otherwise rewrite
-#: the file thousands of times to say the same thing.
+#: the file thousands of times to say the same thing. Never allowed to exceed a
+#: third of the freshness window; see `PollerGuard.__init__`.
 REFRESH_S = 20.0
+
+#: How far ahead of this client's clock a holder's stamp may be and still be
+#: read as a liveness claim. Two processes share a wall clock but never a
+#: perfect one — a few seconds of NTP slew, or two hosts writing one synced
+#: state dir — and that much is ordinary. Anything further ahead is not a
+#: liveness claim at all; see `PollerGuard.acquire`.
+FUTURE_SKEW_S = 5.0
 
 #: How long to wait for the lock itself before giving up and degrading. The
 #: critical sections here are a read and a small write, so contention resolves
@@ -146,7 +181,13 @@ class PollerGuard:
     ):
         self.path = Path(path)
         self.stale_after = float(stale_after)
-        self.refresh_interval = float(refresh_interval)
+        #: Never longer than a third of the window this guard is judged by,
+        #: whatever the caller asked for. A holder that re-stamps less often
+        #: than it is aged out is guaranteed to lose its own guard for being
+        #: punctual — B2 in miniature — and the shape is easy to reach by
+        #: accident, because `stale_after` is a constructor knob and this is
+        #: not.
+        self.refresh_interval = min(float(refresh_interval), self.stale_after / 3.0)
         self.lock_wait = float(lock_wait)
         #: What identifies *this* client in the record. Random per object, not
         #: per pid: a pid is neither unique over time nor unique enough within
@@ -192,6 +233,23 @@ class PollerGuard:
             return LOST
         return self._renew() if self._held else self.acquire()
 
+    def touch(self) -> str:
+        """Say "the loop is still turning" between two of its bounded calls.
+
+        Exactly `claim()`, under a name that says what the caller means. It is
+        not a second liveness channel and must never become one: there is no
+        thread in this module and nothing stamps on a timer, so a stamp only
+        ever happens where the poll loop itself reached, and a loop hung inside
+        any one call reaches no stamp and ages out exactly as it should. That
+        is the property the whole guard rests on.
+
+        It exists because stamping once per turn quietly made the freshness
+        window a bound on the *whole* turn rather than on the longest call in
+        it — see `STALE_AFTER_S`. The verdict is the caller's to ignore here:
+        it is decided once, at the top of the turn.
+        """
+        return self.claim()
+
     def acquire(self) -> str:
         """Take the guard if nobody live holds it."""
         if self._displaced:
@@ -209,6 +267,28 @@ class PollerGuard:
                 if owner == self.owner:  # our own record, from a previous run
                     return self._take(handle, now, "the guard was already ours")
                 age = now - _stamp(record)
+                if age < -FUTURE_SKEW_S:
+                    # A stamp from the future is a clock, not a liveness claim,
+                    # and freshness — the only test this file makes — cannot
+                    # age it out. Unbounded below, `age` stayed negative
+                    # forever: measured, a record one hour ahead answered LOST,
+                    # one year ahead answered LOST, and a JSON `Infinity` (which
+                    # `json.loads` accepts) answered LOST. None of those is
+                    # exotic on a desktop — an RTC ahead of NTP at boot, a VM
+                    # or snapshot restore, a state dir synced or restored from
+                    # another machine, a laptop resume — and every one of them
+                    # silenced every other client on the bearer indefinitely,
+                    # with no error anywhere to fail open on. J1 is explicit
+                    # that a lock bug must never be what silences delivery, so
+                    # this is the fail-OPEN branch: take the guard.
+                    return self._take(
+                        handle, now,
+                        "the record is stamped %.0fs in the FUTURE (pid %s on "
+                        "%s) — a clock, not a liveness claim, and freshness "
+                        "cannot arbitrate against it. Taking the guard rather "
+                        "than standing by forever; if two pollers result, that "
+                        "is the risk J1 chooses over a silenced bearer"
+                        % (-age, record.get("pid"), record.get("host")))
                 if age < self.stale_after:
                     return self._verdict(LOST, _standby_line(record, age))
                 return self._take(
@@ -311,8 +391,19 @@ class PollerGuard:
         """
         payload = json.dumps(record, sort_keys=True).encode("utf-8")
         os.lseek(handle, 0, os.SEEK_SET)
-        os.write(handle, payload)
-        os.ftruncate(handle, len(payload))
+        # `os.write` is allowed to write fewer bytes than it was given, and its
+        # return value used to be thrown away — a short write followed by an
+        # `ftruncate` to the *intended* length leaves NUL padding inside the
+        # JSON, which every reader then treats as an unparseable record, which
+        # reads as a free guard. Fail-open, so it never silenced anything; it is
+        # still a claim quietly evaporating, and it is one line.
+        written = 0
+        while written < len(payload):
+            step = os.write(handle, payload[written:])
+            if step <= 0:  # pragma: no cover — POSIX raises instead
+                raise OSError(f"short write to the guard record at {self.path}")
+            written += step
+        os.ftruncate(handle, written)
         self._last_write = now
 
     @contextlib.contextmanager
@@ -432,9 +523,18 @@ def _stamp(record: Dict[str, Any]) -> float:
     The clock is the wall clock, because it is the only one two processes share.
     A stepped clock can cost one takeover; a monotonic clock would cost every
     comparison, since another process's monotonic reading means nothing here.
+
+    Non-finite values are read as no timestamp at all. `json.loads` accepts
+    `Infinity` and `NaN` and hands back floats for both, and an infinite stamp
+    made `now - stamp` infinitely negative — a claim no clock could ever age
+    out. `NaN` is worse: every comparison against it is False, so the record
+    would have fallen through every branch.
     """
     value = record.get("heartbeat_ts")
-    return float(value) if isinstance(value, (int, float)) else 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    number = float(value)
+    return number if math.isfinite(number) else 0.0
 
 
 def _standby_line(record: Dict[str, Any], age: float) -> str:

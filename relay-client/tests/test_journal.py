@@ -159,5 +159,59 @@ with tempfile.TemporaryDirectory() as tmp:
     check(journal.is_pending("task-answered"),
           "an id with an answer waiting is never reconciled away")
 
+# --- C1: two Journals on one file must not revert each other ---------------
+# The whole-file rewrite is last-writer-wins by construction. Reproduced: a
+# second Journal on the same path retires `task-B`, and the first one's next
+# `record_result` writes the file back without it. J1 makes two pollers rare and
+# not impossible — a standby exists by design, a takeover has both views live at
+# once, and a consumer may answer from another process.
+with tempfile.TemporaryDirectory() as tmp:
+    first = fresh(tmp)
+    first.accept("task-A")
+    first.accept("task-B")
+
+    second = fresh(tmp).load()
+    second.record_result("task-B", {"id": "task-B", "body": "the other answer"})
+    second.retire("task-B")
+    check(second.is_done("task-B"), "the second process retires an id")
+
+    first.record_result("task-A", {"id": "task-A", "body": "an answer"})
+    on_disk = fresh(tmp).load()
+    check(on_disk.is_done("task-B"),
+          "and the first one's next write does not put it back — a write that "
+          "knew nothing about an id must not destroy it (C1)")
+    check(on_disk.is_pending("task-A"),
+          "while the id the first one *did* change is written as it changed it")
+    check(first.is_done("task-B"),
+          "and the first one adopts the fact rather than carrying a stale view "
+          "into its next write")
+
+    # The other direction: an id created entirely by another process survives.
+    third = fresh(tmp).load()
+    third.accept("task-C")
+    first.record_result("task-A", {"id": "task-A", "body": "revised"})
+    check(fresh(tmp).load().is_accepted("task-C"),
+          "an id another process created is adopted, not overwritten away")
+
+# --- F8 on the way back in, not only on the way out ------------------------
+# The journal is this library's own file, but "our own file" is not a trust
+# boundary a state dir can carry: it syncs, it is restored, and anything running
+# as the user can edit it. An id read back off disk goes straight onto the wire
+# in a result POST and into a path component.
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "journal.jsonl"
+    write_private_atomic(path, "".join(json.dumps(record) + "\n" for record in (
+        {"id": "task-ok", "state": "accepted", "room": ""},
+        {"id": "../../etc/passwd", "state": "pending",
+         "result": {"id": "../../etc/passwd", "body": "x"}},
+        {"id": "..", "state": "done"},
+        {"id": "has spaces", "state": "accepted"},
+    )))
+    loaded = Journal(path).load()
+    check([wire_id for wire_id, _ in loaded.pending_results()] == [],
+          "an id that fails F8's grammar is not read back off disk and POSTed")
+    check(loaded.inflight_ids() == ["task-ok"] and not loaded.done_ids(),
+          "only ids this client would have been willing to write survive a load")
+
 print("\n" + ("PASS — journal green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

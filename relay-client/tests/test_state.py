@@ -14,11 +14,14 @@ import os
 import tempfile
 from pathlib import Path
 
+from ag2_relay_client import state as state_module
 from ag2_relay_client.state import (
     StateLayout,
+    fsync_dir,
     redact_url,
     valid_instance_name,
     valid_wire_id,
+    write_private_atomic,
 )
 
 fails = 0
@@ -113,6 +116,60 @@ check("pass" not in bad_port and "token=abc" not in bad_port,
 unparseable = redact_url("http://user:pass@[::1/relay?token=abc")
 check("pass" not in unparseable and "token=abc" not in unparseable,
       "a URL that will not parse at all leaks neither userinfo nor query")
+
+# --- A6: the rename is fsynced too, not only the bytes inside the file ------
+# `os.replace` is atomic, which is what a concurrent reader needs; it is not
+# durable, which is what a crash needs. Without the directory fsync a power cut
+# after the rename can leave the entry still naming the old file — so the bytes
+# were made safe and then the pointer to them was lost. E2 and F7 rest on the
+# whole write surviving, not on half of it, and the journal's own docstring
+# claimed the fsync was what F2's ack ordering rests on.
+#
+# A power cut cannot be run here, so this asserts the call is made: the fsync is
+# taken on a *directory* descriptor, and only the parent of the file just
+# renamed.
+SYNCED = []
+_saved_fsync = state_module.os.fsync
+_saved_open = state_module.os.open
+
+
+def _watch_open(path, flags, *rest):
+    handle = _saved_open(path, flags, *rest)
+    SYNCED.append((handle, str(path)))
+    return handle
+
+
+def _watch_fsync(handle):
+    for opened, path in SYNCED:
+        if opened == handle:
+            SYNCED.append(("fsynced", path))
+    return _saved_fsync(handle)
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    target = Path(tmp) / "nested" / "journal.jsonl"
+    state_module.os.open = _watch_open
+    state_module.os.fsync = _watch_fsync
+    try:
+        write_private_atomic(target, "one line\n")
+    finally:
+        state_module.os.open = _saved_open
+        state_module.os.fsync = _saved_fsync
+    check(target.read_text() == "one line\n", "the write lands")
+    check(("fsynced", str(target.parent)) in SYNCED,
+          "and the directory holding it is fsynced, so the rename survives a "
+          "crash and not only the bytes do (A6)")
+
+    # It is best-effort by contract: not every filesystem lets a directory be
+    # opened for fsync, and a write that already landed must not be failed
+    # because the entry pointing at it could not be flushed (D4).
+    survived = None
+    try:
+        fsync_dir(Path(tmp) / "no-such-directory-at-all")
+        survived = True
+    except OSError:
+        survived = False
+    check(survived, "a directory that cannot be fsynced is not an error")
 
 # --- an explicitly given `~` is a path the caller wrote, not a location guessed
 home = StateLayout("~/state-dir-test", "prod")

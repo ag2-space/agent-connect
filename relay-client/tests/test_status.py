@@ -14,6 +14,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from ag2_relay_client.state import write_private_atomic
 from ag2_relay_client.status import (
     AUTH_WAIT,
     CONNECTED,
@@ -86,10 +87,29 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # And neither does an unwritable file: the status write is best-effort by
     # contract, because it runs inside the poll iteration.
-    unwritable = StatusReporter(Path(tmp) / "no-such-dir" / "x" / "status.json")
-    unwritable.path = Path("/proc/definitely/not/writable/status.json")
+    #
+    # The path here used to be `/proc/definitely/not/writable/status.json`,
+    # which is a guess about the host: on a Mac the write does fail (read-only
+    # APFS root), in a container running as root it may not, and the assertion —
+    # that `update` returned CONNECTED — is satisfied either way. So the test
+    # silently stopped testing the swallow. This makes the failure structural
+    # (the file's own parent is a *file*, which no filesystem lets you write
+    # under) and asserts that it really did fail, not only that nothing raised.
+    blocker = Path(tmp) / "not-a-directory"
+    blocker.write_text("in the way")
+    unwritable = StatusReporter(blocker / "status.json")
+    failed = None
+    try:
+        write_private_atomic(unwritable.path, "{}")
+    except OSError as exc:
+        failed = exc
+    check(failed is not None,
+          "the path chosen for this test really is unwritable — otherwise the "
+          "assertion below passes without exercising anything")
     check(unwritable.update(CONNECTED)["state"] == CONNECTED,
           "a status write that fails is swallowed, never raised into the loop")
+    check(not unwritable.path.exists(),
+          "and nothing was written, which is what was swallowed")
 
 print("\n" + ("PASS — status green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)
