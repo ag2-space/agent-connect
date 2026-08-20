@@ -61,34 +61,20 @@ def child_env(**extra) -> dict:
     return env
 
 
-class QueuedTask(Task):
-    """A delivered Task, with the attachment tuple media ingress will add.
-
-    `Task.__slots__` has no `attachments` yet — transport-seam ticket 03 is
-    where the library grows one, and ticket 08 is where `agent_connect`
-    consumes it properly. The Worker already reads whatever the delivered Task
-    carries, so this subclass is how a fixture hands it some in the meantime.
-    It exists here rather than in the package because it is a stand-in for the
-    library's future shape, and a stand-in that shipped would outlive the thing
-    it stands in for.
-    """
-
-    __slots__ = ("attachments",)
-
-    def __init__(self, *args, attachments=(), **kwargs):
-        super().__init__(*args, **kwargs)
-        self.attachments = tuple(attachments)
-
-
 def task(task_id: str, body: str = "do it", room: str = "", tier: str = "owner",
-         attachments=(), **fields) -> QueuedTask:
+         attachments=(), **fields) -> Task:
     """One Task, as the library would have delivered it.
 
     Built through the library's own `parse_task` wherever the field is a wire
     field, so a fixture cannot quietly describe an envelope the broker could not
     send — a Task whose `access_tier` is `team` is spelled here the way it
-    arrives, and reaches `attested_tier` the way it arrives. `attachments` is
-    the one thing added on top, and `QueuedTask` says why.
+    arrives, and reaches `attested_tier` the way it arrives.
+
+    `attachments` is set on the parsed Task the way media ingress sets it: the
+    marker stage resolves the files after `parse_task` and before delivery, so
+    a fixture that assigned it any other way would be describing a Task the
+    library does not build. (This used to be a `QueuedTask` subclass, back when
+    ticket 03 had not landed and `Task.__slots__` had no `attachments`.)
     """
     raw = {"id": task_id, "task": body, "access_tier": tier}
     if room:
@@ -97,10 +83,8 @@ def task(task_id: str, body: str = "do it", room: str = "", tier: str = "owner",
     parsed = parse_task(raw)
     if parsed is None:
         raise ValueError(f"not a Task the library would deliver: {raw!r}")
-    return QueuedTask(
-        **{name: getattr(parsed, name) for name in Task.__slots__},
-        attachments=attachments,
-    )
+    parsed.attachments = tuple(attachments)
+    return parsed
 
 
 class FakeClient:
