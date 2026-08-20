@@ -32,6 +32,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -132,11 +133,7 @@ class RelayHTTP:
         """
         url = self._url(path, params)
         data = None
-        headers = {
-            "User-Agent": self.user_agent,
-            "Authorization": f"Bearer {self.credentials.secret}",
-            "Accept": "application/json",
-        }
+        headers = self._headers()
         if payload is not None:
             data = json.dumps(payload).encode()
             headers["Content-Type"] = "application/json"
@@ -167,6 +164,62 @@ class RelayHTTP:
                 status, raw, url, f"answer from {url} was not JSON: {raw[:200]}"
             ) from None
 
+    def open_stream(
+        self,
+        path: str,
+        params: Optional[Mapping[str, Any]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        timeout: Optional[float] = None,
+        accept: str = "text/event-stream",
+    ):
+        """A response handed back **still open**, for a body read as it arrives.
+
+        The one caller is the events channel, and it is here rather than there
+        because the last time a streaming call site built its own request it
+        rebuilt everything except the User-Agent — and the edge's bot-fight 403,
+        which that call site classified as fatal, stopped the channel
+        permanently on its first connect against a real gateway (B1). Sharing
+        this method is what makes forgetting impossible: same UA, same bearer
+        read live (C3), same `AuthRejected` class (C8), same refusal to carry
+        this bearer across a redirect.
+
+        `timeout` is the *socket* timeout, so it bounds each read of the open
+        body and not the life of the stream — which is exactly what a channel
+        watching for a black-holed TCP path wants.
+
+        The caller owns the response and MUST close it — `close_stream` below
+        is how, when the reader is parked in another thread.
+        """
+        url = self._url(path, params)
+        request = urllib.request.Request(url, method="GET")
+        for name, value in self._headers(accept).items():
+            request.add_header(name, value)
+        for name, value in (headers or {}).items():
+            request.add_header(name, value)
+
+        try:
+            deadline = self.timeout if timeout is None else timeout
+            return self._opener.open(request, timeout=deadline)
+        except urllib.error.HTTPError as exc:
+            body = _drain(exc)
+            if exc.code in (401, 403):
+                raise AuthRejected(exc.code, body, url) from None
+            raise RelayHTTPError(exc.code, body, url) from None
+
+    def _headers(self, accept: str = "application/json") -> Dict[str, str]:
+        """The three headers every request to this gateway carries.
+
+        One place, because each of them was once per-call-site: the explicit UA
+        the edge requires (B1), and the bearer read through the credential on
+        *every* request rather than captured once, so a rotation applied by auth
+        recovery is on the next call with no restart and no object rebuilt (C3).
+        """
+        return {
+            "User-Agent": self.user_agent,
+            "Authorization": f"Bearer {self.credentials.secret}",
+            "Accept": accept,
+        }
+
     def _url(self, path: str, params: Optional[Mapping[str, Any]] = None) -> str:
         url = f"{self.base_url}{path}"
         if params:
@@ -174,6 +227,34 @@ class RelayHTTP:
             if query:
                 url = f"{url}?{urllib.parse.urlencode(query)}"
         return url
+
+
+def close_stream(response) -> None:
+    """End an open stream, including one another thread is parked in.
+
+    `close()` alone is not enough: it drops this object's handle on the socket
+    file, but a thread already blocked inside `readline()` stays blocked until
+    the socket's own read timeout expires — which for the events channel is
+    120 s, and which would make a `stop()` that "returns promptly" a promise
+    this library could not keep. Shutting the socket down first makes the parked
+    read return EOF at once.
+
+    Every step is defensive on purpose. The attribute chain is CPython's private
+    plumbing (`HTTPResponse.fp` is a buffered reader over a `SocketIO`), so if a
+    future release renames it the channel degrades to waiting out its read
+    timeout rather than raising in the middle of a shutdown.
+    """
+    raw = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:  # already gone; nothing to wake
+            pass
+    try:
+        response.close()
+    except Exception:  # noqa: BLE001 — closing must never raise in its turn
+        pass
 
 
 def _drain(exc: urllib.error.HTTPError) -> str:

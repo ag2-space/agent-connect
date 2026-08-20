@@ -24,6 +24,11 @@ from the rest — which is the whole shape of the ack-404 scar (F4).
 
 The base path (`/relay`) is deliberate: it is where the real deployment lives,
 and it catches a client that builds URLs from the host instead of the base.
+
+One route shape does not fit that request/response mould: the SSE stream, whose
+whole subject is a body that arrives over time. `sse(path, script)` programs one,
+and the script writes frames — good, garbled, keepalive — for as long as it wants
+before ending the connection cleanly or cutting it off.
 """
 from __future__ import annotations
 
@@ -32,10 +37,19 @@ import threading
 import time
 from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, NamedTuple, Optional
+from typing import Callable, Dict, List, NamedTuple, Optional
 from urllib.parse import urlsplit
 
 BASE_PATH = "/relay"
+
+
+class StreamAborted(Exception):
+    """Raised by an SSE script to drop the connection where it stands.
+
+    The difference from returning matters to the client under test: returning
+    ends the response cleanly (EOF), while this closes the socket mid-body, and
+    those reach a stream reader as two different events.
+    """
 
 
 class Recorded(NamedTuple):
@@ -50,6 +64,20 @@ class Recorded(NamedTuple):
     @property
     def json(self):
         return jsonlib.loads(self.body.decode() or "{}")
+
+    def header(self, name: str, default: str = "") -> str:
+        """One header, case-insensitively.
+
+        HTTP has always said the case is not the message, and urllib agrees
+        loudly: it title-cases what it sends, so `Last-Event-ID` leaves as
+        `Last-Event-Id`. A test asserting on the name it wrote would be
+        asserting on urllib's spelling.
+        """
+        wanted = name.lower()
+        for key, value in self.headers.items():
+            if key.lower() == wanted:
+                return value
+        return default
 
 
 class _Answer(NamedTuple):
@@ -70,10 +98,15 @@ class _Handler(BaseHTTPRequestHandler):
         split = urlsplit(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
-        broker.requests.append(Recorded(
+        recorded = Recorded(
             self.command, split.path, split.query,
             {k: v for k, v in self.headers.items()}, body,
-        ))
+        )
+        broker.requests.append(recorded)
+        stream = broker.stream_for(self.command, split.path)
+        if stream is not None:
+            self._serve_stream(stream, recorded)
+            return
         answer = broker.next_answer(self.command, split.path)
         if answer.delay:
             time.sleep(answer.delay)
@@ -83,6 +116,37 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(answer.body)))
         self.end_headers()
         self.wfile.write(answer.body)
+
+    def _serve_stream(self, script, recorded):
+        """A response with no end in sight — `text/event-stream`, chunked.
+
+        Chunked rather than a length, because that is what the broker's
+        `StreamResponse` puts on the wire, and because a length is exactly the
+        thing a stream cannot know. The script writes frames whenever it likes;
+        returning ends the body cleanly, `StreamAborted` cuts it off.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        def write(chunk):
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            self.wfile.write(b"%X\r\n" % len(chunk) + chunk + b"\r\n")
+            self.wfile.flush()
+
+        self.close_connection = True
+        try:
+            script(recorded, write)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except StreamAborted:
+            pass
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            # The client hung up first — the ordinary way a stream test ends.
+            pass
 
     do_GET = do_POST = do_PUT = do_DELETE = _serve
 
@@ -95,7 +159,11 @@ class FakeBroker:
         self.requests: List[Recorded] = []
         self._answers: Dict[tuple, List[_Answer]] = {}
         self._served: Dict[tuple, int] = {}
+        self._streams: Dict[tuple, Callable] = {}
         self._lock = threading.Lock()
+        #: Set on the way out, so a stream script parked in a wait can leave
+        #: rather than hold a handler thread past the end of the test.
+        self.closing = threading.Event()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self._server.broker = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -106,6 +174,7 @@ class FakeBroker:
         return self
 
     def __exit__(self, *exc):
+        self.closing.set()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(5)
@@ -138,6 +207,24 @@ class FakeBroker:
                 self._served[key] = 0
             queued.append(_Answer(status, body, headers or {}, delay))
         return self
+
+    def sse(self, path: str, script: Callable, method: str = "GET") -> "FakeBroker":
+        """Program `path` as a live event stream, served by `script`.
+
+        `script(request, write)` is called once per connection, on the handler's
+        own thread, with the `Recorded` request (so a test can read the
+        `Last-Event-ID` the client resumed with) and a `write(chunk)` that puts
+        bytes on the wire immediately. Returning ends that connection; raising
+        `StreamAborted` cuts it. A test that wants a different script per
+        connection counts connections itself — the same script sees them all.
+        """
+        with self._lock:
+            self._streams[(method.upper(), self.base_path + path)] = script
+        return self
+
+    def stream_for(self, method: str, path: str) -> Optional[Callable]:
+        with self._lock:
+            return self._streams.get((method.upper(), path))
 
     def next_answer(self, method: str, path: str) -> _Answer:
         key = (method.upper(), path)

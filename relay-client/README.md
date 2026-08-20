@@ -22,10 +22,10 @@ URL-encoded separator) had to be learned twice too. They live here once now.
 ## Status
 
 Under construction. What ships today is the whole task path — poll, lease,
-journal, ack, results, heartbeat, auth recovery, status — and the whole outbound
-half: Room Ops, the egress allowlist and the result-marker grammar, all behind
-the seam below. Media ingress (marker resolution on the way in) and the
-singleton-per-bearer guard follow.
+journal, ack, results, heartbeat, auth recovery, status — the whole outbound
+half — Room Ops, the egress allowlist and the result-marker grammar — and the
+optional events channel, all behind the seam below. Media ingress (marker
+resolution on the way in) and the singleton-per-bearer guard follow.
 
 ## The seam
 
@@ -220,6 +220,37 @@ Two properties are worth stating out loud:
 - Calling `prepare` again for the same task — which is what a retried result
   POST does — re-derives the same body and **uploads nothing more**. Call
   `forget(task_id)` when the POST finally succeeds; only success retires an id.
+
+## Events (optional, off unless asked for)
+
+A Server-Sent Events channel on `/v1/events/stream`, for a consumer that wants
+workspace events durably. Nothing in this library starts it and no module here
+imports it — the only way one exists is this call:
+
+```python
+from ag2_relay_client.events import events
+
+channel = events(http, sink)   # starts its own thread
+channel.health()               # {"status": "connected", "last_cursor": 41, ...}
+channel.stop()
+```
+
+`sink` is the consumer's durable store, duck-typed on two methods:
+`durable_cursor()` returns the cursor of the last event that is durable, and
+`commit(event)` **returning** is what makes one durable. Resume uses the durable
+cursor, so a crash between "received" and "durable" replays the event rather
+than losing it — the sink must be idempotent.
+
+The channel is **isolated by construction**: its own thread, connection, backoff
+and cursor, and a loop that swallows everything. A dead network, a revoked
+bearer, a garbled frame, a sink that raises — none of them can reach task
+delivery, which is the whole reason the module is shaped this way. Beyond that:
+a 120 s read timeout, because a black-holed TCP path never says anything;
+unusable frames skipped and not resumed from, because handing one to a sink that
+raises means replaying it forever; `404` fatal and `401`/`403` retryable only
+while a durable token source could still deliver a rotation. The bearer is read
+through the same credential the poll loop rotates, so a rotation reaches the
+stream on its next connect without a restart.
 
 ## License
 
