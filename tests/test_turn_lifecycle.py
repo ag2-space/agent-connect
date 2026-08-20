@@ -23,10 +23,8 @@ import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
 import json
-import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 
 from agent_connect.events import (
     CANCELLED,
@@ -51,8 +49,7 @@ from agent_connect.reporter import (
     LadderSettings,
     TurnReporter,
 )
-from _queue import FakeClient, task
-from agent_connect.roomops import RoomOps
+from _queue import FakeClient, room_ops_at, task
 from agent_connect.worker import handle_one, process_one
 
 ROOM_A = "!alpha:ag2.space"
@@ -111,15 +108,7 @@ class FakeRelay:
 
 def relay_ops():
     relay = FakeRelay()
-    return relay, RoomOps(f"http://127.0.0.1:{relay.server.server_port}", "test-token")
-
-
-def workspace():
-    """The outgoing directory, which is all a workspace is to a Turn now."""
-    tmp = Path(tempfile.mkdtemp())
-    results = tmp / "results"
-    results.mkdir()
-    return results
+    return relay, room_ops_at(f"http://127.0.0.1:{relay.server.server_port}")
 
 
 def ctx_for(room=ROOM_A, task_id="task-1"):
@@ -180,7 +169,6 @@ print("\n-- a second message is queued, announced, and answered afterwards --")
 
 async def _queueing():
     relay, ops = relay_ops()
-    results = workspace()
     client = FakeClient()
     delivered = (task("task-q1", "the long one", room=ROOM_A),
                  task("task-q2", "the follow-up", room=ROOM_A),
@@ -190,7 +178,7 @@ async def _queueing():
     sessions = {}
     running = [
         asyncio.ensure_future(
-            handle_one(one, adapter, "/repo", results, sessions, ops,
+            handle_one(one, adapter, "/repo", sessions, ops,
                        LadderSettings(throttle=0.0), client=client)
         )
         for one in delivered

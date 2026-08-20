@@ -34,7 +34,8 @@ of it behind the seam below; nothing from the ticket list is outstanding here.
 from ag2_relay_client import RelayClient, TokenSource
 
 client = RelayClient(TokenSource(token_file="~/.ag2/relay.env"),
-                     state_dir="~/.ag2/state", instance="prod")
+                     state_dir="~/.ag2/state", instance="prod",
+                     egress_roots=[workspace])   # the only files it may send
 client.start()
 
 task = client.next_task(timeout=30)      # or read client.tasks yourself
@@ -42,10 +43,18 @@ if task:
     client.complete(task.id, my_agent.handle(task.body))
 ```
 
-Two things wide, and that is the whole consumer surface for the inbound half:
-Tasks come out of an in-memory queue, answers go back through `complete` — or
-`reject(id, reason)`, which dead-letters a permanently malformed task instead of
-letting it re-serve five times.
+Two things wide, and that is the whole consumer surface: Tasks come out of an
+in-memory queue, answers go back through `complete` — or `reject(id, reason)`,
+which dead-letters a permanently malformed task instead of letting it re-serve
+five times.
+
+`complete` is not a POST with extra steps. It reads the result-marker grammar
+(below), uploads any file the body names **from an allowlisted path**, appends a
+sentence about any it refused, re-stitches a `[channel:]` redirect for the
+broker's deliverer, and only then journals and POSTs. So a consumer hands over
+the text its agent wrote and never touches a marker, a path this library has not
+judged, or the wire. `base_dir=` is what a relative path in a marker is read
+against; it widens nothing.
 
 The queue is a **handoff, not durability**. What survives a restart is the
 journal under the state dir, and the promise attached to it is worth stating
@@ -157,7 +166,9 @@ aged out.
 
 **The media directory is not auto-allowlisted for egress.** A consumer that
 wants to send back what arrived adds it as an explicit root, so all egress
-policy stays in one place a reviewer can read: the constructor's root list.
+policy stays in one place a reviewer can read: the `egress_roots` list on the
+`RelayClient` constructor, and nothing else. There is no environment variable
+below this line, no default root, and no way to add one after construction.
 
 ## One poller per bearer
 
@@ -266,12 +277,13 @@ and broker task ids are unique only *within* a gateway.
 Speaking in a room *as* the agent identity — post, edit, react, upload:
 
 ```python
-from ag2_relay_client.roomops import RoomOps
-
-rooms = RoomOps(http, allowlist=allowlist)
+rooms = client.room_ops                         # built from `egress_roots`
 event = rooms.message(room_id, "⏳ On it...")   # keep the id; the ladder needs it
 rooms.edit(room_id, event, answer)              # ...then complete with [REPLIED]
 ```
+
+`client.room_ops` is read-only and holds no reachable bearer: four ops, and the
+same allowlist `complete` uploads through — not a second door for a file.
 
 **Nothing here raises into your loop.** A room that cannot be spoken to is a
 room whose answer arrives the plain way, through `POST /v1/results`; losing an
@@ -291,10 +303,13 @@ intake reaction, and a second one is the room seeing double.
 Egress is **paths only**, and the roots are fixed when the client is built:
 
 ```python
-from ag2_relay_client.egress import EgressAllowlist
-
-allowlist = EgressAllowlist([workspace / "results"], max_bytes=24 * 1024 * 1024)
+client = RelayClient(creds, state_dir=..., egress_roots=[workspace],
+                     egress_max_bytes=24 * 1024 * 1024)
 ```
+
+A client built with no roots sends no files, and says so in the answer rather
+than in a log — the fail-closed reading of "nobody configured this", and the
+only safe one.
 
 **There is no bytes-upload API, public or private.** One exists nowhere in this
 package on purpose: a surface that took bytes would make the allowlist
@@ -316,11 +331,13 @@ threat model it mitigates.
 One parser, because every copy of it drifted — and a marker one consumer
 stripped reached users through another as literal text:
 
-```python
-from ag2_relay_client.outbound import Outbound
+`client.complete` runs it; there is nothing to wire up and no second parser to
+write:
 
-prepared = Outbound(rooms).prepare(task_id, room_id, agent_output)
-http.post("/v1/results", {"id": task_id, "body": prepared.body})
+```python
+prepared = client.complete(task.id, agent_output, base_dir=where_it_ran)
+prepared.uploaded          # ("chart.png",)
+prepared.refused           # ("[attachment not sent: … (…)]",)
 ```
 
 `prepare` reads the grammar (skip is terminal; `[dm-only]` is detected anywhere
@@ -335,9 +352,10 @@ Two properties are worth stating out loud:
 - `[no-send]` / `[REPLIED]` / `[deduped: <id>]` **still POST**. They complete
   the lease with no user-visible message; skipping the POST as well leaves the
   lease to expire and the task to be re-served for ever.
-- Calling `prepare` again for the same task — which is what a retried result
-  POST does — re-derives the same body and **uploads nothing more**. Call
-  `forget(task_id)` when the POST finally succeeds; only success retires an id.
+- A **retried result POST uploads nothing more**. The body is re-derived from
+  the same markers and the `(task, path)` ledger answers for the second pass;
+  the ledger is retired by the POST that finally succeeds, because only success
+  may retire one (F5).
 
 ## Events (optional, off unless asked for)
 

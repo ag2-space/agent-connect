@@ -105,7 +105,7 @@ class Bench:
         os.environ["FAKE_ACP_REPORT"] = str(self.report_path)
         try:
             return asyncio.run(asyncio.wait_for(
-                handle_one(task, self.adapter, str(self.repo), self.results),
+                handle_one(task, self.adapter, str(self.repo)),
                 timeout=30,
             ))
         finally:

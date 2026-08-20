@@ -45,7 +45,7 @@ stub = StubAdapter()
 # the shim — but what the adapter is handed, and what comes back as the answer,
 # are unchanged, which is what these assertions are about.
 answer = asyncio.run(process_one(task("task-p1", "do the thing"),
-                                 ShimAdapter("stub", stub), "/repo", results))
+                                 ShimAdapter("stub", stub), "/repo"))
 sent_task, sent_sandbox, _ = stub.calls[0]
 check(sent_sandbox == "workspace-write", "owner task → workspace-write sandbox arg")
 check(sent_task.startswith("[agent-connect: this run's sandbox is 'workspace-write'"),

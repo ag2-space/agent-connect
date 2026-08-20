@@ -36,8 +36,8 @@ try:
     from agent_connect.adapters import acp as acp_adapter
     from agent_connect.adapters.acp import DEFAULT_TIMEOUT, TIMEOUT_ENV, AcpAdapter
     from agent_connect.reporter import NO_SEND, PLACEHOLDER, REPLIED, LadderSettings
-    from agent_connect.roomops import RoomOps
     from agent_connect.sessions import SessionSettings, SessionStore
+    from _queue import room_ops_at
     from _queue import task as queued_task
     from agent_connect.worker import handle_one, process_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
@@ -92,7 +92,7 @@ class FakeRelay:
 
     @property
     def ops_client(self):
-        return RoomOps(f"http://127.0.0.1:{self.server.server_port}", "test-token")
+        return room_ops_at(f"http://127.0.0.1:{self.server.server_port}")
 
     def of(self, kind):
         return [o for o in self.ops if o.get("op") == kind]
@@ -150,7 +150,7 @@ class Bench:
         # Adapter is cheap: what has to survive between Tasks is the store.
         self.adapter = self.adapter_for(task_id)
         return asyncio.run(asyncio.wait_for(
-            handle_one(task, self.adapter, str(self.repo), self.results,
+            handle_one(task, self.adapter, str(self.repo),
                        None, ops, LadderSettings(throttle=0.0)),
             timeout=timeout,
         ))
@@ -227,8 +227,8 @@ async def _two_rooms():
     b = fast.write("f1", "the quick one", ROOM_B)
     sessions = {}
     return await asyncio.gather(
-        process_one(a, slow.adapter_for("s1"), str(slow.repo), slow.results, sessions),
-        process_one(b, fast.adapter_for("f1"), str(fast.repo), fast.results, sessions),
+        process_one(a, slow.adapter_for("s1"), str(slow.repo), sessions),
+        process_one(b, fast.adapter_for("f1"), str(fast.repo), sessions),
     )
 
 

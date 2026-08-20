@@ -94,7 +94,7 @@ class Bench:
         try:
             return asyncio.run(
                 asyncio.wait_for(
-                    handle_one(task, self.adapter, str(self.repo), self.results),
+                    handle_one(task, self.adapter, str(self.repo)),
                     timeout=30,
                 )
             )

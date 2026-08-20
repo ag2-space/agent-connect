@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
+import ast
 import asyncio
 import json
 import tempfile
@@ -39,8 +40,9 @@ from agent_connect.events import (
     TurnContext,
 )
 from agent_connect.reporter import PLACEHOLDER, REPLIED, LadderSettings, TurnReporter
-from agent_connect.roomops import RoomOps, room_ops_from_env
-from _queue import FakeClient, task
+from _queue import FakeClient, room_ops_at, task
+from agent_connect import relay as relay_module
+from agent_connect.roomops import room_ops_for
 from agent_connect.worker import handle_one, process_one
 
 fails = 0
@@ -121,15 +123,7 @@ class FakeRelay:
 
 def relay_ops(**kw):
     relay = FakeRelay(**kw)
-    return relay, RoomOps(relay.url, "test-token")
-
-
-def workspace():
-    """The outgoing directory, which is all a workspace is to a Turn now."""
-    tmp = Path(tempfile.mkdtemp())
-    results = tmp / "results"
-    results.mkdir()
-    return results
+    return relay, room_ops_at(relay.url)
 
 
 def ctx_for(room="!room:ag2.space", prompt="do it"):
@@ -197,8 +191,9 @@ check(PLACEHOLDER not in relay.ops[-1]["body"],
       "and the placeholder copy is gone from it")
 check(body.startswith(REPLIED),
       f"the result body starts with {REPLIED} so the delivery path posts nothing")
-check(all(a == "Bearer test-token" for a in relay.auth),
-      "every Room Op carries the relay bearer token the Worker already holds")
+check(all(a == "Bearer test-secret" for a in relay.auth),
+      "every Room Op carries the relay bearer, read out of the credential by "
+      "the library — this side has not held one since ticket 09")
 relay.stop()
 
 
@@ -472,12 +467,11 @@ relay.stop()
 print("\n-- through the Worker's seam, end to end --")
 
 relay, ops = relay_ops()
-results = workspace()
 client = FakeClient()
 asyncio.run(
     handle_one(task("L1", "summarise worker.py", room="!room:ag2.space",
                     sender_name="Nikita"),
-               work(), "/repo", results, None, ops, LadderSettings(throttle=0.0),
+               work(), "/repo", None, ops, LadderSettings(throttle=0.0),
                client=client)
 )
 result = client.answer("L1")
@@ -491,55 +485,67 @@ check("the answer" in result, "while still archiving what was said")
 relay.stop()
 
 # The Worker's default — no ops passed — is what it was before the Ladder.
-results = workspace()
 plain = asyncio.run(process_one(task("L2", "summarise worker.py", room="!r:ag2.space"),
                                 Scripted(MessageChunk(text="plain"),
                                          Done(reason=COMPLETED, text="plain")),
-                                "/repo", results))
+                                "/repo"))
 check(plain == "plain",
       "a Worker given no relay answers with exactly the answer, as before the Ladder")
 
 
-print("\n-- reading the relay out of the environment --")
+print("\n-- one process, one bearer, one gateway --")
 
-check(room_ops_from_env({}) is None, "no token, no Ladder")
-check(room_ops_from_env({"AGENT_CONNECT_TOKEN": "  "}) is None, "a blank token is no token")
-made = room_ops_from_env({"AGENT_CONNECT_TOKEN": "secret"})
-check(made is not None and made.token == "secret", "the Portal token is the relay credential")
-check(made.url == "https://chat.ag2.space/relay",
-      "and the default gateway is the one the installer wires the relay client to")
-combined = room_ops_from_env({"REMOTE_TASK_TOKEN": "https://relay.example|s3cret"})
-check(combined.url == "https://relay.example" and combined.token == "s3cret",
-      "the combined onboarding token carries its own gateway")
-check(room_ops_from_env({"AGENT_CONNECT_TOKEN": "https://relay.example%7Cs3cret"}).token
-      == "s3cret",
-      "including when the separator is written the encoded way — the split is "
-      "the library's, so it means here what it means on the wire")
+# This section used to test `room_ops_from_env`: a second reading of the token,
+# a second gateway precedence rule, a second literal-`|` split. All three are
+# gone. The Ladder now asks the Relay Client the Worker already built for the
+# Room Ops it already made, so there is nothing left to disagree with — which is
+# the property, and these are the assertions that it holds.
 
-# One process, one gateway. The Ladder and the wire read the same credential and
-# resolve it the same way: the URL that travels *with* a combined token is the
-# one it belongs to, and `REMOTE_TASK_URL` is for a bare secret that carries
-# none. This side used to let the environment outrank the token, which put the
-# room ops on one gateway and every Task on another, with a log line about it.
-elsewhere = room_ops_from_env(
-    {"AGENT_CONNECT_TOKEN": "https://relay.example|s3cret",
-     "REMOTE_TASK_URL": "https://other.example/relay/"}
+check(room_ops_for(None) is None,
+      "no client, no Ladder — a workspace driven by hand answers in the result")
+
+built = relay_module.from_env(
+    Path(tempfile.mkdtemp()),
+    {"AGENT_CONNECT_TOKEN": "https://relay.example/relay|s3cret",
+     "REMOTE_TASK_URL": "https://other.example/relay/"},
 )
-check(elsewhere.url == "https://relay.example",
-      "a combined token's own gateway outranks REMOTE_TASK_URL, exactly as it "
-      "does for the client that pulls the Tasks")
-check(room_ops_from_env({"AGENT_CONNECT_TOKEN": "s3cret",
-                         "REMOTE_TASK_URL": "https://other.example/relay/"}).url
-      == "https://other.example/relay",
-      "and a bare secret is what REMOTE_TASK_URL is for, trailing slash and all")
+ladder = room_ops_for(built)
+check(ladder is not None and ladder.ops is built.room_ops,
+      "the Ladder speaks through the very object the wire speaks through: not a "
+      "copy of the bearer, not a second resolution of the gateway — the same one")
+check("relay.example" in repr(built) and "other.example" not in repr(built),
+      "and the gateway is the combined token's own, not REMOTE_TASK_URL's — the "
+      "split that used to live in roomops.py put the Ladder on one gateway and "
+      "every Task on another, with a log line about it")
 
-# F6: the documented name outranks the one README calls "the old name". A
-# `REMOTE_TASK_TOKEN` left behind in a launchd plist used to beat a token the
-# operator had just rotated, silently.
-both = room_ops_from_env({"REMOTE_TASK_TOKEN": "https://old.example|stale",
-                          "AGENT_CONNECT_TOKEN": "https://new.example|fresh"})
-check((both.token, both.url) == ("fresh", "https://new.example"),
+check(relay_module.from_env(Path(tempfile.mkdtemp()), {}) is None,
+      "no token, no client, and therefore no Ladder")
+check(relay_module.from_env(Path(tempfile.mkdtemp()),
+                            {"AGENT_CONNECT_TOKEN": "  "}) is None,
+      "a blank token is no token")
+
+# The documented name outranks the one README calls "the old name": a
+# `REMOTE_TASK_TOKEN` left in a launchd plist used to beat a freshly rotated one.
+both = relay_module.from_env(
+    Path(tempfile.mkdtemp()),
+    {"REMOTE_TASK_TOKEN": "https://old.example/relay|stale",
+     "AGENT_CONNECT_TOKEN": "https://new.example/relay|fresh"})
+check("new.example" in repr(both),
       "AGENT_CONNECT_TOKEN wins over the legacy name where both are set")
+
+# I3, on this side of the seam: there is no gateway written down here at all.
+# Read past the module docstring, which is allowed to *describe* what was taken
+# out — the fence is around the code, and `test_no_wire.py` puts one around the
+# whole package.
+LADDER_CODE = ast.parse(
+    (_bootstrap.ROOT / "agent_connect" / "roomops.py").read_text())
+LADDER_CODE.body = [n for n in LADDER_CODE.body
+                    if not (isinstance(n, ast.Expr)
+                            and isinstance(n.value, ast.Constant))]
+LADDER_SOURCE = ast.dump(LADDER_CODE)
+check("chat.ag2.space" not in LADDER_SOURCE and "urllib" not in LADDER_SOURCE,
+      "no base URL and no HTTP client survive in agent_connect/roomops.py (I3)")
+
 
 print("\n" + ("PASS — the Ladder green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

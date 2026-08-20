@@ -844,5 +844,111 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(not broker.took("GET", "/v1/tasks"),
           "without leasing a single task (F1)")
 
+# --- the outbound half, reachable at last ----------------------------------
+# `Outbound`, `RoomOps`, `egress` and `markers` shipped complete and *unwired*:
+# `complete` POSTed a raw `{"id", "body"}`, so the marker grammar this library
+# owns was applied by nobody and a `[file:]` an agent wrote travelled to the
+# room as literal text naming a local path. These are the four joins that make
+# the outbound half part of the client rather than beside it.
+
+check("egress_roots" in CLIENT_SOURCE and "Outbound(" in CLIENT_SOURCE,
+      "the client builds its own allowlist and its own Outbound — the "
+      "outbound half is reachable by consuming the client, not by wiring it up")
+
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    workspace = Path(tmp) / "work"
+    workspace.mkdir()
+    (workspace / "report.md").write_text("# what I found\n")
+    (Path(tmp) / "secret.key").write_text("-----BEGIN PRIVATE KEY-----\n")
+
+    client = client_for(broker, Path(tmp) / "state", egress_roots=[workspace])
+
+    # Construction is the whole of the egress policy (the spec's enumerated
+    # surface: "egress allowlist roots, immutable after construction").
+    check(client.room_ops.allowlist.roots == (str(workspace.resolve()),),
+          "the roots the client was built with are the roots it may send from")
+    try:
+        client.room_ops.allowlist._roots = ("/",)  # noqa: SLF001 — the attack
+        widened = True
+    except AttributeError:
+        widened = False
+    check(not widened, "and nothing widens them afterwards")
+    try:
+        client._room_ops = None  # noqa: SLF001 — nor replaces the holder
+        replaced = True
+    except AttributeError:
+        replaced = False
+    check(not replaced, "nor replaces the object that holds them")
+
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(
+        "task-out", source_event_id="$intake")]})
+    broker.on("POST", "/v1/rooms/*/media", json={"mxc": "mxc://ag2/1"})
+    broker.on("POST", "/v1/results", json={"ok": True})
+    client.poll_once()
+
+    # I2: the wire loop is what tells Room Ops which events it was served, and
+    # the only caller of `note_intake_event` used to be a test. Both halves are
+    # asserted — a refusal that came from the op failing anyway would prove
+    # nothing, so the working case is right beside it.
+    broker.on("POST", "/v1/room", json={"ok": True})
+    broker.on("POST", "/v1/room", json={"ok": True})
+    check(client.room_ops.react("!room:ag2.space", "$something-else", "👍") is True,
+          "a reaction the consumer asks for on its own account goes")
+    check(client.room_ops.react("!room:ag2.space", "$intake", "🫡") is False,
+          "but an event this client was *served* is never reacted to — the "
+          "broker already put the intake reaction on it, and a second one is "
+          "the room seeing double (I2)")
+    check(len(broker.took("POST", "/v1/room")) == 1,
+          "and the refused one never reached the wire at all")
+
+    prepared = client.complete(
+        "task-out", "Here it is.\n\n[file: report.md]", base_dir=workspace)
+    uploads = broker.took("POST", "/v1/rooms/%21room%3Aag2.space/media")
+    check(len(uploads) == 1 and uploads[0].json.get("filename") == "report.md",
+          "a file the answer names is uploaded from an allowlisted path, in "
+          "this process, before the result POST")
+    posted = [r.json for r in broker.took("POST", "/v1/results")]
+    check(len(posted) == 1 and posted[0]["body"] == "Here it is.",
+          "and the marker is gone from the body: the room reads prose")
+    check(prepared.uploaded == ("report.md",),
+          "what went is reported back to the consumer")
+
+    # The regression this ticket exists to close, from the other direction.
+    prepared = client.complete(
+        "task-out", "Sure.\n\n[file: %s]" % (Path(tmp) / "secret.key"),
+        base_dir=workspace)
+    check(not broker.took("POST", "/v1/rooms/%21room%3Aag2.space/media")[1:],
+          "a path outside every root is refused in-process — nothing is "
+          "uploaded and no bytes are read")
+    seen = [r.json for r in broker.took("POST", "/v1/results")]
+    body = (seen[-1] if seen else {}).get("body", "")
+    check("secret.key" in body and "attachment not sent" in body,
+          "and the refusal is in the result body, so the room is told by name")
+    check("[file:" not in body,
+          "with no marker left to reach the room as literal text — which is "
+          "exactly what the retired staging protocol did")
+
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    # F6: a result POST that fails and is retried must not re-upload.
+    workspace = Path(tmp) / "work"
+    workspace.mkdir()
+    (workspace / "chart.png").write_bytes(b"chart")
+    client = client_for(broker, Path(tmp) / "state", egress_roots=[workspace])
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task("task-f6")]})
+    broker.on("POST", "/v1/rooms/*/media", json={"mxc": "mxc://ag2/2"})
+    broker.on("POST", "/v1/results", status=500, body=b"nope")
+    client.poll_once()
+    client.complete("task-f6", "Chart.\n[file: chart.png]", base_dir=workspace)
+    client._result_retry_at.clear()          # skip the per-result backoff gate
+    broker.on("POST", "/v1/results", json={"ok": True})
+    client._drain_results()
+    check(len(broker.took("POST", "/v1/rooms/%21room%3Aag2.space/media")) == 1,
+          "a retried result POST re-derives the same body and uploads nothing "
+          "more — one chart in the room, not two (F6)")
+    check(client.outbound.already_sent("task-f6") == (),
+          "and the ledger is retired by the POST that finally succeeded, "
+          "because only success may retire one (F5)")
+
+
 print("\n" + ("PASS — wire loop green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

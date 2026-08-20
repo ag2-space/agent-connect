@@ -160,7 +160,7 @@ results = outgoing()
 
 async def _one_pass(relay, adapter, until):
     """Run the drain loop until `until()` is true, then stop it."""
-    loop = asyncio.ensure_future(serve(adapter, "/repo", results, relay, 0.02))
+    loop = asyncio.ensure_future(serve(adapter, "/repo", relay, 0.02))
     for _ in range(400):
         await asyncio.sleep(0.01)
         if until():
@@ -180,7 +180,7 @@ async def _second_pass(relay, http, adapter, raw):
     that is what is asserted: the second Task is delivered after the first has
     been answered, through the same running loop.
     """
-    loop = asyncio.ensure_future(serve(adapter, "/repo", results, relay, 0.02))
+    loop = asyncio.ensure_future(serve(adapter, "/repo", relay, 0.02))
     for _ in range(400):
         await asyncio.sleep(0.01)
         if http.results():

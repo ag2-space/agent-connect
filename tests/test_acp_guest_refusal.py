@@ -38,8 +38,8 @@ try:
     from agent_connect.adapters.acp import REFUSAL, AcpAdapter
     from agent_connect.reporter import PLACEHOLDER, REPLIED, STOP_LINES, LadderSettings
     from agent_connect.events import REFUSED
-    from agent_connect.roomops import RoomOps
     from agent_connect.sessions import SessionStore
+    from _queue import room_ops_at
     from _queue import task as queued_task
     from agent_connect.worker import GUEST, OWNER, handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
@@ -125,7 +125,7 @@ class Bench:
         self.script_path.write_text(json.dumps(script))
         self.report_path = base / "report.json"
         self.relay = FakeRelay() if relay else None
-        self.ops = RoomOps(self.relay.url, "test-token") if relay else None
+        self.ops = room_ops_at(self.relay.url) if relay else None
         self.adapter = AcpAdapter(
             command=[sys.executable, FAKE, str(self.script_path)],
             store=SessionStore(base / "sessions.json"),
@@ -143,7 +143,7 @@ class Bench:
         os.environ["FAKE_ACP_REPORT"] = str(self.report_path)
         try:
             return asyncio.run(asyncio.wait_for(
-                handle_one(task, self.adapter, str(self.repo), self.results,
+                handle_one(task, self.adapter, str(self.repo),
                            {}, self.ops, LadderSettings(live=True, throttle=0.0)),
                 timeout=30,
             ))
