@@ -19,7 +19,8 @@ from pathlib import Path
 from fake_broker import FakeBroker
 
 from ag2_relay_client.credentials import TokenSource
-from ag2_relay_client.transport import AuthRejected, RelayHTTP, RelayHTTPError
+from ag2_relay_client.transport import (AuthRejected, RelayHTTP, RelayHTTPError,
+                                        under_base)
 from ag2_relay_client.resolver import BoundedResolver
 
 fails = 0
@@ -199,6 +200,30 @@ with FakeBroker() as broker, FakeBroker() as elsewhere:
           "the host the redirect named was never contacted at all")
     check(not any(r.header("Authorization") for r in elsewhere.requests),
           "so the bearer never left for it")
+
+# --- a dot segment never rides under the base path (G4, review 2026-08-20) --
+# urllib sends the path as written, but a normalising reverse proxy (nginx, by
+# default, before location matching) routes `/relay/../relay-evil/x` to the
+# sibling app — and hands it the relay bearer. The broker's own marker minter
+# interpolates the mxc server and media id into that path WITHOUT percent-
+# encoding, and `content.url` is sender-controlled, so the segments come off
+# the wire. Refused rather than normalised: what is judged must be the bytes
+# that are sent.
+BASE = "https://gw.example/relay"
+for escape in ("https://gw.example/relay/../relay-evil/x",
+               "https://gw.example/relay/./../relay-evil/x",
+               "https://gw.example/relay//../relay-evil/x",
+               "https://gw.example/relay/a/../../etc/passwd",
+               "https://gw.example/relay/v1/media/a/../../../../_matrix/client/v3/account/whoami"):
+    check(not under_base(escape, BASE),
+          f"a dot segment is refused, never blessed: {escape.split('/relay')[1][:40]}")
+
+check(under_base("https://gw.example/relay/v1/media/server/mediaid", BASE),
+      "an ordinary media URL is still under the base")
+check(under_base("https://gw.example/relay", BASE),
+      "and so is the base path itself")
+check(not under_base("https://gw.example/relay-evil/x", BASE),
+      "while the look-alike sibling is still refused")
 
 print("\n" + ("PASS — transport green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

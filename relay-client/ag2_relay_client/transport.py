@@ -153,6 +153,19 @@ def under_base(url: str, base: str) -> bool:
     `https://host/relay` does not vouch for `https://host/relay-evil/…`, and the
     boundary that tells those apart is a real `/`. Same guard as `same_origin`:
     malformed is False, never an exception.
+
+    **A dot segment is refused, not normalised** (2026-08-20 review). urllib
+    sends the path exactly as written, but a reverse proxy normalises before it
+    routes — nginx does, by default — so `…/relay/../relay-evil/x` is judged
+    here as under `/relay` and *delivered* to `/relay-evil`, carrying the
+    bearer. The broker's own marker minter interpolates the mxc server and
+    media id into that path without percent-encoding, and `content.url` is
+    sender-controlled, so the segments arrive from the wire.
+
+    Refusing beats normalising for a reason worth keeping: what is judged has
+    to be the same bytes as what is sent, and normalising here would judge one
+    string and hand urllib another. A legitimate media URL never carries a dot
+    segment.
     """
     if not base or not same_origin(url, base):
         return False
@@ -160,6 +173,10 @@ def under_base(url: str, base: str) -> bool:
         base_path = urllib.parse.urlsplit(base).path.rstrip("/")
         path = urllib.parse.urlsplit(url).path
     except ValueError:  # pragma: no cover — same_origin already parsed both
+        return False
+    # An empty segment (`//`) is refused with the dot segments: it is the other
+    # spelling a proxy may collapse, and no real path needs one.
+    if any(seg in ("", ".", "..") for seg in path.split("/")[1:]):
         return False
     return path == base_path or path.startswith(base_path + "/")
 

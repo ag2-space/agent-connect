@@ -113,6 +113,14 @@ MARKER_TAG = "ag2space-media"
 #: and there is nothing this parser can do about it.
 MARKER_RE = re.compile(r"\s*\[" + re.escape(MARKER_TAG) + r":([^\]]*)\]")
 
+#: An *unterminated* marker — `[ag2space-media:` with no closing `]` before the
+#: end of the body. `MARKER_RE` cannot match it, so before this existed the
+#: whole tail (URL included) reached the consumer verbatim, in a body any room
+#: member can write. The same hole the room-ops metadata stripper had; found in
+#: both by review on 2026-08-20. Anchored to end-of-string: a `[` that is later
+#: closed is an ordinary marker and belongs to `MARKER_RE`.
+UNTERMINATED_RE = re.compile(r"\s*\[" + re.escape(MARKER_TAG) + r":[^\]]*\Z")
+
 #: The gateway's own ceiling on the media route (25 MiB), so this client refuses
 #: what the broker would refuse anyway — and refuses it before reading it.
 CAP_BYTES = 25 * 1024 * 1024
@@ -225,7 +233,10 @@ def strip_markers(body: str) -> Tuple[str, Tuple[Marker, ...]]:
             found.append(marker)
     # The strip is unconditional: a marker with nothing usable inside it names
     # no attachment and is still a marker, so it still must not reach anyone.
-    return MARKER_RE.sub("", body).strip(), tuple(found)
+    # The unterminated tail goes second, after the well-formed markers are out,
+    # so a body carrying one of each loses both.
+    stripped = UNTERMINATED_RE.sub("", MARKER_RE.sub("", body))
+    return stripped.strip(), tuple(found)
 
 
 def _read_marker(inner: str) -> Optional[Marker]:
