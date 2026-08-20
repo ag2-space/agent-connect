@@ -101,6 +101,20 @@ _DMONLY_STRIP_RE = re.compile(
 #: document order.
 _ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
 
+#: An **unterminated** marker: an opening tag with no closing `]` before the end
+#: of the body. `_ATTACH_RE` cannot match one, so without this the tail — an
+#: absolute local path, usually — falls through both the detection and the strip
+#: and is delivered to the room verbatim. That is the "neither" case the
+#: invariant at the top of this file forbids, and it is the third place this
+#: exact hole has been found: `media.py` (`2d9635c`) and `envelope.py` had it
+#: too, both fixed the same way. A body is truncated for ordinary reasons — a
+#: token limit, a crashed generation — so this is not an attack shape, it is
+#: Tuesday. Anchored to `\Z`: a tag that *is* closed later belongs to the
+#: regexes above and must not be eaten here.
+_UNTERMINATED_RE = re.compile(
+    r"\[(?:file|send|attach|channel|deduped):[^\]]*\Z"
+)
+
 _FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
 
 #: A run of N backticks closed by the same run. Matching the *span* rather than
@@ -231,9 +245,17 @@ def parse(text: Optional[str]) -> ParseResult:
 
     body = _ATTACH_RE.sub(
         lambda m: m.group(0) if in_code(m.start()) else "", body
-    ).strip()
+    )
 
-    return ParseResult(body=body, actions=tuple(actions))
+    # 5. UNTERMINATED — an opening tag the body ran out before closing. It named
+    # nothing this client can act on, so there is no action to add; what matters
+    # is that it does not reach the room. Masked bodies are left alone: inside a
+    # fence it is being shown, not issued.
+    unterminated = _UNTERMINATED_RE.search(body)
+    if unterminated is not None and not in_code(unterminated.start()):
+        body = body[: unterminated.start()]
+
+    return ParseResult(body=body.strip(), actions=tuple(actions))
 
 
 def restitch(body: str, redirect: str) -> str:

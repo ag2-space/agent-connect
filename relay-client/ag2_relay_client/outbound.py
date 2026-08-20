@@ -120,6 +120,30 @@ class Outbound:
     still lands, which is the same degradation Room Op failure gets (I1).
     """
 
+    #: `room_ops` carries the egress allowlist, so replacing it replaces the
+    #: policy. Sealed after construction the way `RoomOps` and `EgressAllowlist`
+    #: seal theirs — otherwise sealing them was pointless, because this object
+    #: is the handle every caller already has. `__slots__` closes the cheap
+    #: `__dict__` route; `object.__setattr__` stays open and is unclosable in
+    #: Python, which `egress.py` says out loud rather than pretending otherwise.
+    __slots__ = ("room_ops", "max_files", "_ledger", "_ledger_tasks", "_lock")
+
+    _SEALED = frozenset({"room_ops"})
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self._SEALED and hasattr(self, name):
+            raise AttributeError(
+                f"{name} is fixed when this Outbound is built: it carries the "
+                "egress allowlist, and an allowlist that can be swapped at "
+                "runtime is one an attacker only has to reach once"
+            )
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in self._SEALED:
+            raise AttributeError(f"{name} cannot be removed once built")
+        object.__delattr__(self, name)
+
     def __init__(
         self,
         room_ops: Optional[RoomOps] = None,

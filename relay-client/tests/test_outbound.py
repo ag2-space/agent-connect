@@ -279,5 +279,28 @@ check(out.prepare("task-80", ROOM, "").body == "",
       "hands the result across, not here")
 check(out.prepare("task-80", ROOM, None).body == "", "and None does not raise")
 
+# --- the seal is only as good as the handle callers already hold ------------
+# `RelayClient` seals `_room_ops`, and `RoomOps` seals its allowlist — but
+# `Outbound` *carries* the RoomOps, so leaving it writable left the whole thing
+# one assignment wide (review 2026-08-20). Swapping in an Outbound built with
+# wider roots uploads anything on the machine.
+sealed = Outbound(None)
+for how, attempt in (
+    ("attribute", lambda: setattr(sealed, "room_ops", "WIDER")),
+    ("__dict__", lambda: sealed.__dict__.__setitem__("room_ops", "WIDER")),
+    ("delete", lambda: delattr(sealed, "room_ops")),
+):
+    refused = False
+    try:
+        attempt()
+    except AttributeError:
+        refused = True
+    except TypeError:
+        refused = True  # __slots__: there is no __dict__ to write into
+    check(refused, f"room_ops cannot be replaced by {how} — it holds the allowlist")
+
+check(not hasattr(sealed, "__dict__"),
+      "and there is no instance dict to go round the seal with")
+
 print("\n" + ("PASS — outbound green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

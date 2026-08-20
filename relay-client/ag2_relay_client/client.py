@@ -258,7 +258,14 @@ class RelayClient:
     #: the reason `RoomOps` seals its own two: it holds the allowlist, and an
     #: allowlist that refuses to be widened is worth nothing if the object
     #: carrying it can be replaced by one built with wider roots.
-    _SEALED = frozenset({"_http", "_room_ops"})
+    #:
+    #: `outbound` is sealed for exactly the same reason, one layer out, and was
+    #: missed at first (review 2026-08-20): it *holds* the `RoomOps`, so leaving
+    #: it writable left the whole seal one assignment wide —
+    #: `client.outbound = Outbound(RoomOps(http, EgressAllowlist(["/"])))` and a
+    #: `[file:]` marker uploads anything on the machine. A seal with a door in
+    #: it is not a seal.
+    _SEALED = frozenset({"_http", "_room_ops", "outbound"})
 
     def __init__(
         self,

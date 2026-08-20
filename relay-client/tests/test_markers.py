@@ -193,5 +193,31 @@ check(markers.parse("just an answer").body == "just an answer",
 check(markers.parse("[unknown-marker] hello").body == "[unknown-marker] hello",
       "an unknown marker is not a marker — it is text, and stays text")
 
+# --- an UNTERMINATED marker is the "neither" case (review 2026-08-20) -------
+# `_ATTACH_RE` needs a closing `]`, so a body that ran out before one — a token
+# limit, a crashed generation, a truncated line — fell through both detection
+# and stripping and was delivered verbatim. The tail is an absolute local path.
+# Third place this exact hole was found: `media.py` and `envelope.py` had it too.
+r = markers.parse("Here you go.\n\n[file: /home/nikita/.ssh/id_rsa")
+check(r.body == "Here you go.", "an unterminated attach marker is cut, not delivered")
+check(".ssh" not in r.body, "so no local path reaches the room")
+check(r.actions == (), "it named nothing actionable — there is no action to take")
+
+r = markers.parse("talk [channel: !room")
+check(r.body == "talk", "an unterminated channel marker goes the same way")
+r = markers.parse("x [deduped: abc")
+check(r.body == "x", "and an unterminated deduped marker too")
+
+r = markers.parse("ok [file: /tmp/a.png] done")
+check(len(r.actions) == 1 and r.body == "ok  done",
+      "a marker that IS closed still parses — \\Z anchoring eats nothing early")
+
+fenced = "see:\n```\n[file: /tmp/x\n```"
+check(markers.parse(fenced).body == fenced,
+      "inside a fence it is being shown, not issued — left untouched")
+
+r = markers.parse("[file: /tmp/only")
+check(r.body == "", "a body that is only an unterminated marker degrades to empty")
+
 print("\n" + ("PASS — markers green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)
