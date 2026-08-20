@@ -25,6 +25,13 @@ already answered means re-complete, never re-execute. The reconnect replays of
 2026-06-30 and 2026-07-01 were 500 historical tasks each, and without that check
 every one of them ran again.
 
+**Media is resolved before delivery, off this thread.** A task body can carry an
+`[ag2space-media:]` marker, which is a URL and not a file; the stage in
+`media.py` turns it into a local path between the poll and the queue, so a
+consumer reads `task.attachments` and never a marker. The fetch has its own
+thread for one reason: a 25 MiB download on this one is a stalled loop, and a
+stalled loop is duplicate delivery.
+
 **Never health-probe with `GET /v1/tasks`** — it leases tasks. `healthz()` is
 here so the question has an answer that costs nothing.
 """
@@ -41,6 +48,7 @@ from .backoff import Backoff
 from .credentials import TokenSource
 from .envelope import Task, parse_task
 from .journal import Journal, Reconciler
+from .media import MediaIngress, MediaStore
 from .resolver import BoundedResolver
 from .state import StateLayout, valid_wire_id
 from .status import (
@@ -114,6 +122,10 @@ class RelayClient:
     restart is the journal under the state dir, and the consumer's contract is
     that every Task it takes is eventually answered with `complete` or
     `reject`.
+
+    `media_dir` is where inbound attachments are fetched to (the state dir by
+    default), and `media_retention_s` opts out of deleting them when the task is
+    answered — for a consumer whose own archives point at those paths.
     """
 
     def __init__(
@@ -121,6 +133,8 @@ class RelayClient:
         credentials: TokenSource,
         state_dir,
         instance: str = "default",
+        media_dir=None,
+        media_retention_s: Optional[float] = None,
         http: Optional[RelayHTTP] = None,
         resolver: Optional[BoundedResolver] = None,
         poll_wait: int = POLL_WAIT_S,
@@ -160,6 +174,20 @@ class RelayClient:
         #: make a slow consumer able to block the poll thread, and a blocked
         #: poll thread is lost leases and duplicate delivery (F1).
         self.tasks: "queue.Queue[Task]" = queue.Queue()
+
+        #: The stage between the poll and that queue: it strips media markers
+        #: from every body and, for the few tasks that carry one, fetches the
+        #: bytes on its own thread before delivering. Nothing a consumer takes
+        #: out of `tasks` has ever carried a marker or a URL. The media
+        #: directory is **not** added to any egress allowlist here — a consumer
+        #: that wants to re-upload what arrived says so with an explicit root,
+        #: so egress policy stays in one visible place.
+        self.media = MediaIngress(
+            self.http,
+            MediaStore(media_dir or self.layout.media_path, media_retention_s),
+            deliver=self.tasks.put,
+            on_auth_rejected=self._defer_auth,
+        )
 
         self._reconciler = Reconciler(self.journal)
         #: Ids accepted by *this* run. The journal knows which ids are owed an
@@ -202,6 +230,13 @@ class RelayClient:
         """
         self.layout.ensure()
         self.journal.load()
+        # Before the first poll: the media directory exists, and whatever an
+        # earlier run left in it is swept. Those files belonged to Tasks that
+        # were sitting in an in-memory queue when their process ended, so no
+        # live task can ever claim them (the age-based opt-out sweeps only what
+        # has aged out — a consumer whose archives point at those paths said so
+        # at construction).
+        self.media.start()
         log.info("relay client %r on %s — connection status in %s",
                  self.layout.instance, self.status.snapshot().get("gateway"),
                  self.layout.status_path)
@@ -221,6 +256,11 @@ class RelayClient:
         thread, self._thread = self._thread, None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
+        # After the poll thread, so nothing is still being handed to it. A
+        # download in flight is not waited out — `stop()` returning promptly
+        # matters more, and a late fetch can only put a Task on a queue nobody
+        # is reading and leave a file for the next run's sweep.
+        self.media.stop()
         self._update_status(STOPPED)
 
     def _run(self) -> None:
@@ -328,7 +368,12 @@ class RelayClient:
         self._ack(wire_id)
         if task.metadata_stripped:
             log.info("stripped unsigned room-ops metadata from task %s", wire_id)
-        self.tasks.put(task)
+        # Delivery goes through the media stage, which strips any
+        # `[ag2space-media:]` marker here and now — a regex, on this thread —
+        # and hands the task to its own thread only when there are bytes to
+        # fetch. Nothing that reaches `self.tasks` has ever carried a marker,
+        # and nothing on this thread ever waits for a download (F1).
+        self.media.accept(task)
         return 1
 
     def _dead_letter_unusable(self, raw: Any) -> None:
@@ -453,6 +498,11 @@ class RelayClient:
                         "broker will ignore it if it is not waiting on it", wire_id)
         self.journal.record_result(wire_id, payload)
         self._live.discard(wire_id)
+        # The consumer is done with this Task, so its fetched attachments are
+        # done too — under the default retention they are deleted now, and the
+        # answer is on disk before they go. A consumer that opted out keeps
+        # them, which is what "my archives point at those paths" means.
+        self.media.release(wire_id)
         self._drain_results()
 
     def _drain_results(self) -> int:

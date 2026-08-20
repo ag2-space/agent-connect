@@ -22,10 +22,11 @@ URL-encoded separator) had to be learned twice too. They live here once now.
 ## Status
 
 Under construction. What ships today is the whole task path — poll, lease,
-journal, ack, results, heartbeat, auth recovery, status — the whole outbound
-half — Room Ops, the egress allowlist and the result-marker grammar — and the
-optional events channel, all behind the seam below. Media ingress (marker
-resolution on the way in) and the singleton-per-bearer guard follow.
+journal, ack, results, heartbeat, auth recovery, status — media in both
+directions, with inbound markers resolved to local files before delivery — the
+whole outbound half — Room Ops, the egress allowlist and the result-marker
+grammar — and the optional events channel, all behind the seam below. The
+singleton-per-bearer guard follows.
 
 ## The seam
 
@@ -88,6 +89,62 @@ once (a rotation may already have happened), and otherwise the loop holds at a
 slow cadence, saying so every pass, until one lands — then resumes live, no
 restart. A token file that starts naming a *different* gateway is a
 reconfiguration and is refused.
+
+## Receiving a file
+
+The broker sends **no attachments field**. Media rides inside the task text as a
+marker — `[ag2space-media: <url> mime= name= size= kind=]` — and a client that
+waits for a header waits for ever. The library resolves it before the Task is
+delivered, so a consumer reads paths:
+
+```python
+client = RelayClient(creds, state_dir="~/.ag2/state",
+                     media_dir="~/.ag2/media")       # optional; state dir by default
+
+task = client.next_task(timeout=30)
+for got in task.attachments:                          # 0..N, already resolved
+    if got.ok:
+        my_agent.read(got.path, got.mime)             # a local file, on disk
+    else:
+        say(f"I couldn't read {got.name or 'the attachment'}: {got.reason}")
+```
+
+**The consumer never sees a marker or a URL** — not on a success, not on a
+failure, not when the URL was nonsense. What crosses the seam is a path or a
+reason.
+
+- **The mime comes from the fetch's `Content-Type`.** The marker's is a hint,
+  and so are `name` and `kind`: nothing in the marker is escaped, so a filename
+  with a space truncates `name=` at the space and one with a `]` truncates the
+  whole marker. `name` is never used to name the file on disk.
+- **A failed fetch never blocks the Task.** One budgeted retry, then the Task is
+  delivered with that attachment marked failed and the reason carried. It is not
+  held — the gateway's media route answers `502` for *every* cause, membership
+  refusals included, so waiting for a good answer can wait for ever — and it is
+  not auto-rejected, because an agent that can say "I couldn't read that" is
+  more use than a dead-lettered task.
+- **The fetch runs off the poll thread.** Cadence is correctness, and a 25 MiB
+  download on the poll thread is a stalled loop. A task with nothing to fetch is
+  never queued behind one that has; a task with media is delivered when its
+  bytes are.
+- **The bearer goes only to the gateway's own URLs**: exact parsed origin, at or
+  under the base path with a real `/` boundary — `relay.example.evil` and
+  `/relay-evil/` are both a no. No redirect is followed, so a gateway-written URL
+  cannot bounce this bearer to a third-party host; `cap + 1` bytes are read
+  against a 25 MiB ceiling, so a lying `Content-Length` cannot OOM anything; and
+  a URL that will not parse is a failed attachment, never an exception out of
+  task intake.
+
+Fetched files are **deleted when the task is answered**, and anything an earlier
+run left behind is swept when the next one starts — those Tasks were sitting in
+an in-memory queue, so no live task can claim their bytes. A consumer whose own
+archives reference the paths opts out at construction with
+`media_retention_s=<seconds>`, which keeps the files and sweeps only what has
+aged out.
+
+**The media directory is not auto-allowlisted for egress.** A consumer that
+wants to send back what arrived adds it as an explicit root, so all egress
+policy stays in one place a reviewer can read: the constructor's root list.
 
 ## Credentials
 

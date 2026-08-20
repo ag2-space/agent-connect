@@ -177,6 +177,17 @@ class StateLayout:
         return self.root / "connection-status.json"
 
     @property
+    def media_path(self) -> Path:
+        """Where fetched attachments land when the consumer named no directory.
+
+        Under the instance root for the same reason everything else is: two
+        clients on one host must share no path. A consumer with archives that
+        reference those files points somewhere of its own — this default is a
+        working directory, and its default retention mode deletes from it.
+        """
+        return self.root / "media"
+
+    @property
     def singleton_path(self) -> Path:
         """The singleton-per-bearer guard's file (J1)."""
         return self.root / "poller.lock"
