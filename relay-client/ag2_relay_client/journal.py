@@ -455,11 +455,20 @@ def _across_processes(path: Path) -> Iterator[bool]:
 
 
 def _flock_within(handle: int, path: Path) -> bool:
-    """Take the exclusive lock inside `LOCK_WAIT_S`, or say it could not be."""
+    """Take the exclusive lock inside `LOCK_WAIT_S`, or say it could not be.
+
+    `lock` is bound locally so the platform check reads as one to a type
+    checker as well as to a human: `fcntl` is `None` on a platform that has no
+    such module, and a caller's guard three frames up is not something a reader
+    of this function can see.
+    """
+    lock = fcntl
+    if lock is None:  # pragma: no cover — non-POSIX; the caller guards too
+        return False
     deadline = time.monotonic() + LOCK_WAIT_S
     while True:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock.flock(handle, lock.LOCK_EX | lock.LOCK_NB)
             return True
         except OSError:
             if time.monotonic() >= deadline:

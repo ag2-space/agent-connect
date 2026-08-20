@@ -437,11 +437,20 @@ class PollerGuard:
         `LOCK_NB` and a short spin rather than a blocking `flock`: the poll loop
         is the thing that keeps leases alive, and a call in it that can wait
         forever is how a client stops delivering without ever looking broken.
+
+        `lock` is bound locally so the platform check reads as one here too:
+        `_locked` refuses a platform without `fcntl` before it ever calls this,
+        and a guard in the caller is not visible to a reader — or to a type
+        checker — standing in this function.
         """
+        lock = fcntl
+        if lock is None:  # pragma: no cover — non-POSIX; `_locked` refuses first
+            raise GuardUnavailable(
+                "this platform has no fcntl; there is no atomic guard to take")
         deadline = time.monotonic() + self.lock_wait
         while True:
             try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock.flock(handle, lock.LOCK_EX | lock.LOCK_NB)
                 return
             except OSError as exc:
                 if time.monotonic() >= deadline:
