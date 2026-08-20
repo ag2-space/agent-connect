@@ -16,12 +16,15 @@ Run: python3 tests/test_roomops.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
 import base64
+import errno
+import logging
 import tempfile
 import urllib.parse
 from pathlib import Path
 
 from fake_broker import FakeBroker
 
+from ag2_relay_client import egress as egress_module
 from ag2_relay_client import roomops as roomops_module
 from ag2_relay_client.credentials import TokenSource
 from ag2_relay_client.egress import EgressAllowlist
@@ -263,14 +266,170 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(swapped is not None,
           "the allowlist is read-only on the client too — one that can be "
           "REPLACED at runtime is one an attacker only has to reach once")
+
+    # A property with no setter stops exactly one spelling. These are the other
+    # two, and an EgressAllowlist that refuses to be widened is worth nothing if
+    # the reference TO it can simply be repointed one layer up.
+    swapped = None
+    try:
+        rooms._allowlist = EgressAllowlist([top])
+    except AttributeError as exc:
+        swapped = exc
+    check(swapped is not None,
+          "the private name is sealed too — the same attack with four more "
+          "characters is the same attack")
+    check(not hasattr(rooms, "__dict__"),
+          "RoomOps carries no instance dict, so there is no third spelling")
+    swapped = None
+    try:
+        rooms.__dict__["_allowlist"] = EgressAllowlist([top])
+    except (AttributeError, TypeError) as exc:
+        swapped = exc
+    check(swapped is not None, "and nothing to write straight into")
+    swapped = None
+    try:
+        del rooms._allowlist
+    except AttributeError as exc:
+        swapped = exc
+    check(swapped is not None, "and it cannot be deleted out of the way either")
+
     check(not rooms.upload(ROOM, outside / "id_rsa").ok,
-          "so the outside file is still refused after the attempt")
+          "so the outside file is still refused after every one of those")
+
+    # --- and there is no raw authenticated escape hatch on the object. With a
+    # public session attribute, the bytes API this library refuses to have is
+    # one dot away: `ops.http.post(MEDIA, {"content_b64": ...})` puts anything
+    # on disk into a room, past every check in egress.py.
+    before = len(broker.requests)
+    posters = [name for name in dir(rooms)
+               if not name.startswith("_")
+               and hasattr(getattr(rooms, name, None), "post")]
+    check(posters == [],
+          "no public attribute of RoomOps carries an authenticated `.post`: "
+          + repr(posters))
+    check(not hasattr(rooms, "http"), "in particular, `ops.http` is gone")
+    check(len(broker.requests) == before, "and looking for one sent nothing")
 
     # --- an upload the broker refuses is a Room Op failure like any other
     broker.on("POST", MEDIA, status=500, body="nope")
     result = rooms.upload(ROOM, chart)
     check(not result.ok and not rooms.available,
           "a failed upload degrades and trips the cooldown, without raising")
+
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    # --- I1 is absolute: not even the filesystem may raise into the loop.
+    #
+    # `EgressRefused` was caught here from the first line; nothing guarded the
+    # read underneath it. An outbox on an NFS or cloud-sync mount — the
+    # deployment egress.py explicitly blesses — answers ESTALE mid-read whenever
+    # it likes, and that exception went straight through `upload`, through
+    # `prepare`, and into the loop that holds the lease. The scar is a bearer's
+    # only poller dying over an attachment.
+    top = Path(tmp).resolve()
+    root = top / "outbox"
+    root.mkdir()
+    chart = root / "chart.png"
+    chart.write_bytes(b"\x89PNG fake bytes")
+
+    http = RelayHTTP(TokenSource(token=f"{broker.url}|SECRET"))
+    rooms = RoomOps(http, allowlist=EgressAllowlist([root]), clock=Clock())
+    broker.on("POST", MEDIA, json={"ok": True, "mxc": "mxc://ag2.space/abc"})
+
+    def stale_read(fd, size):
+        raise OSError(errno.ESTALE, "Stale file handle")
+
+    real_read, egress_module.os.read = egress_module.os.read, stale_read
+    raised, result = None, None
+    try:
+        result = rooms.upload(ROOM, chart)
+    except BaseException as exc:  # noqa: BLE001 — the whole point is there is none
+        raised = exc
+    finally:
+        egress_module.os.read = real_read
+    check(raised is None,
+          "a read that fails mid-upload raises NOTHING into the consumer's loop")
+    check(result is not None and not result.ok and result.reason,
+          "it degrades to a failed UploadResult with a sentence for the room: "
+          + repr(result.reason if result else raised))
+    check(rooms.available,
+          "and this machine failing is not the broker failing — no cooldown")
+
+    # The same for the encode that follows the read: base64 of a 24 MiB file on
+    # a small host is a MemoryError, and a MemoryError is an Exception.
+    def out_of_memory(raw):
+        raise MemoryError("cannot allocate")
+
+    real_b64 = roomops_module.base64.b64encode
+    roomops_module.base64.b64encode = out_of_memory
+    raised, result = None, None
+    try:
+        result = rooms.upload(ROOM, chart)
+    except BaseException as exc:  # noqa: BLE001
+        raised = exc
+    finally:
+        roomops_module.base64.b64encode = real_b64
+    check(raised is None and result is not None and not result.ok,
+          "a MemoryError encoding the file costs the attachment, not the poller")
+
+    # --- a file that GROWS between the fstat and the read is refused, not sent.
+    # The size the allowlist approved is the only size anything judged; a file
+    # longer than that is a different file wearing its name. Reading against the
+    # cap instead of against that size let a 40-byte approval carry 9 MB.
+    class GrowsAfterApproval:
+        """A real allowlist, with the race between fstat and read made exact."""
+
+        def __init__(self, inner, path):
+            self._inner = inner
+            self._path = path
+
+        @property
+        def max_bytes(self):
+            return self._inner.max_bytes
+
+        def open(self, path, base_dir=None):
+            approved = self._inner.open(path, base_dir=base_dir)
+            with open(str(self._path), "ab") as handle:
+                handle.write(b"x" * 4096)
+            return approved
+
+    racing = RoomOps(
+        http, allowlist=GrowsAfterApproval(EgressAllowlist([root]), chart),
+        clock=Clock(),
+    )
+    before = len(broker.requests)
+    result = racing.upload(ROOM, chart)
+    check(not result.ok and "grew" in result.reason,
+          "a file that grew after it was judged is refused: " + repr(result.reason))
+    check(len(broker.requests) == before,
+          "and no bytes nothing had measured reach the room")
+
+    # --- mentions handed over as a generator are walked once
+    class Caught(logging.Handler):
+        def __init__(self):
+            logging.Handler.__init__(self)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    caught = Caught()
+    room_log = logging.getLogger("ag2_relay_client.roomops")
+    room_log.addHandler(caught)
+    was_level = room_log.level
+    room_log.setLevel(logging.INFO)  # setLevel, not `.level`: it clears the cache
+    try:
+        broker.on("POST", "/v1/room", json={"event_id": "$g"})
+        rooms.message(ROOM, "hi",
+                      mentions=(m for m in ["@alice:ag2.space", "not-an-mxid"]))
+    finally:
+        room_log.removeHandler(caught)
+        room_log.setLevel(was_level)
+    sent = broker.took("POST", "/v1/room")[-1].json
+    check(sent.get("mentions") == ["@alice:ag2.space"],
+          "a generator of mentions still notifies the right person")
+    check(any("dropped 1 mention" in line for line in caught.lines),
+          "and the drop is counted from a list, not walked out of an exhausted "
+          "iterator as a negative number: " + repr(caught.lines))
 
 print("\n" + ("PASS — roomops green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

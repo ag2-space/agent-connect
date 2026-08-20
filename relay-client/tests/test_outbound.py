@@ -22,6 +22,7 @@ Run: python3 tests/test_outbound.py
 import _bootstrap  # noqa: F401 — distribution root on sys.path
 import base64
 import tempfile
+import threading
 import urllib.parse
 from pathlib import Path
 
@@ -199,6 +200,30 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check("not configured to send files" in prepared.body,
           "and the room is told why nothing arrived")
 
+    # --- I1 at the seam the consumer actually calls. `prepare` says "Never
+    # raises", and a docstring is not an enforcement mechanism: the layer under
+    # it reads files off a mount that is allowed to fail. This is the last frame
+    # before a bearer's only poller.
+    class Exploding:
+        """A room-ops layer that forgot it must not raise."""
+
+        available = True
+
+        def upload(self, *args, **kwargs):
+            raise OSError(5, "Input/output error")
+
+    raised, prepared = None, None
+    try:
+        prepared = Outbound(Exploding()).prepare(
+            "task-90", ROOM, f"the chart [file: {chart}]")
+    except BaseException as exc:  # noqa: BLE001 — there must not be one
+        raised = exc
+    check(raised is None,
+          "an upload that raises reaches nothing above it (I1)")
+    check(prepared is not None and prepared.body.startswith("the chart")
+          and prepared.refused,
+          "and the answer still lands, with the file's absence explained")
+
     # --- a marker shown in a code fence is not an upload instruction
     sent_before = len(broker.requests)
     prepared = out.prepare(
@@ -207,6 +232,45 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
           "a marker inside a code fence sends nothing — on this transport that "
           "is an egress guard, not a formatting nicety")
     check("[file:" in prepared.body, "and stays visible in the answer")
+
+# --- the F6 ledger, read from a status call while a delivery writes to it. The
+# spec has agent-connect calling this library from an executor, so both happen at
+# once. This does NOT go red without the lock on a GIL-bearing CPython — each
+# ledger operation was one dict operation, and the interpreter does not let go
+# inside one. That is the point: the safety was the interpreter's, not this
+# module's, and a free-threaded build hands it back. The lock states it, and this
+# says what "stated" has to mean — no exception out of a status read, and nothing
+# lost. The ledger is what is raced, so the ledger is what is touched directly.
+racy = Outbound()
+stop = threading.Event()
+crash = []
+
+
+def fill():
+    for n in range(20000):
+        racy._remember("task-race", f"/outbox/f{n}.png", f"f{n}.png")
+    stop.set()
+
+
+def poll():
+    while not stop.is_set():
+        try:
+            racy.already_sent("task-race")
+        except Exception as exc:  # noqa: BLE001 — the crash is the finding
+            crash.append(exc)
+            return
+
+
+writer = threading.Thread(target=fill)
+reader = threading.Thread(target=poll)
+writer.start()
+reader.start()
+writer.join()
+reader.join()
+check(not crash,
+      "reading the ledger while it is written does not raise: " + repr(crash[:1]))
+check(len(racy.already_sent("task-race")) == 20000,
+      "and everything written is still there")
 
 # --- an empty answer is still an empty answer: this module does not invent one
 out = Outbound()

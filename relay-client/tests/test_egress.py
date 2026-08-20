@@ -13,6 +13,7 @@ Read it as the threat model, not as coverage. Each block names what an attacker
 Run: python3 tests/test_egress.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
+import errno
 import inspect
 import os
 import stat
@@ -271,6 +272,22 @@ with tempfile.TemporaryDirectory() as tmp:
     except AttributeError as exc:
         widened = exc
     check(widened is not None, "and so is deleting it")
+
+    # The route PAST `__setattr__` rather than through it. `object.__setattr__`
+    # cannot be closed in this language, so this is defence in depth and says so
+    # — but `al.__dict__["_roots"] = (...)` is a one-liner an attacker trips
+    # over, and `__slots__` is what there is no instance dict to write into.
+    check(not hasattr(allowlist, "__dict__"),
+          "the allowlist carries no instance dict at all")
+    widened = None
+    try:
+        allowlist.__dict__["_roots"] = (str(top),)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError) as exc:
+        widened = exc
+    check(widened is not None,
+          "so writing straight into it — the cheap way around __setattr__, which "
+          "is never called on that path — has nowhere to land")
+
     refused(allowlist, outside / "loot.txt",
             "after all that, the outside file is still refused")
 
@@ -293,10 +310,105 @@ with tempfile.TemporaryDirectory() as tmp:
     allowed(by_link, real_root / "note.md",
             "and the original root still works, unaffected")
 
+    # --- the same attack one level up: a symlink that is an ANCESTOR of the
+    # root. The whole chain above the root is spent at construction, so there is
+    # no live link left in it to swap afterwards.
+    holder = top / "holder"
+    (holder / "notes").mkdir(parents=True)
+    (holder / "notes" / "note.md").write_text("note")
+    via = top / "via"
+    os.symlink(str(holder), str(via))
+    through = EgressAllowlist([via / "notes"])
+    check(through.roots == (str(holder / "notes"),),
+          "a root reached through a symlinked ANCESTOR is stored fully resolved")
+    allowed(through, holder / "notes" / "note.md",
+            "and a file under it is sendable")
+    decoy_holder = top / "decoy-holder"
+    (decoy_holder / "notes").mkdir(parents=True)
+    (decoy_holder / "notes" / "loot.txt").write_text("loot")
+    os.remove(str(via))
+    os.symlink(str(decoy_holder), str(via))
+    refused(through, via / "notes" / "loot.txt",
+            "repointing that ancestor afterwards reaches nothing")
+    allowed(through, holder / "notes" / "note.md",
+            "while the root it was built with keeps working")
+
     # --- duplicate and unusable roots do not confuse the resolution
     doubled = EgressAllowlist([root, root, "", None, str(root) + "/"])
     check(doubled.roots == (str(root),),
           "duplicate, empty and trailing-slash roots collapse to one")
+
+    # --- two root shapes that resolve cleanly, look valid, and then refuse
+    # EVERYTHING for ever. Both fail closed, which is the right direction and
+    # the wrong moment: `sendable_roots` exists so a typo shows up at startup
+    # rather than as a sentence in a room three days later, and it reported both
+    # of these as perfectly good roots.
+    check(EgressAllowlist(["/"]).roots == (),
+          "`/` is not an allowlist, it is the absence of one — it is dropped, "
+          "not honoured, so a consumer that typed it by accident is told")
+    check(egress.sendable_roots(["/"]) == (),
+          "and config validation sees it gone rather than sees it as valid")
+    check(egress.sendable_roots(["/", root]) == (str(root),),
+          "while the roots beside it survive")
+
+    (top / "outbox").mkdir()
+    (top / "outbox" / "chart.png").write_bytes(b"PNG-ish")
+    check(egress.sendable_roots([top / "OUTBOX"]) == (),
+          "a root spelled in a case the filesystem does not use is dropped: on a "
+          "case-insensitive volume it resolves happily, no child's real path "
+          "starts with it, and every upload is refused without ever saying why")
+    check(egress.sendable_roots([top / "outbox"]) == (str(top / "outbox"),),
+          "spelled the way the directory is, it is a root like any other")
+
+with tempfile.TemporaryDirectory() as tmp:
+    # --- the mount failing underneath us. An outbox on NFS or a cloud-sync
+    # mount is the deployment the module docstring explicitly blesses, and such
+    # a mount answers ESTALE mid-read or EIO on a stat whenever it likes. Those
+    # have to leave here as `EgressRefused` like every other refusal: a caller
+    # that must catch `EgressRefused` AND `OSError` will one day catch only one
+    # of them, and I1 names what that costs — the bearer's only poller, over an
+    # attachment.
+    top = Path(tmp).resolve()
+    root = top / "allowed"
+    root.mkdir()
+    target = root / "report.txt"
+    target.write_text("the report")
+    allowlist = EgressAllowlist([root])
+
+    def stale_read(fd, size):
+        raise OSError(errno.ESTALE, "Stale file handle")
+
+    def broken_fstat(fd):
+        raise OSError(errno.EIO, "Input/output error")
+
+    real_read, egress.os.read = egress.os.read, stale_read
+    raised = None
+    try:
+        approved = allowlist.open(target)
+        try:
+            approved.read(64)
+        except BaseException as exc:  # noqa: BLE001 — the type is the assertion
+            raised = exc
+        approved.close()
+    finally:
+        egress.os.read = real_read
+    check(isinstance(raised, EgressRefused),
+          "a read that fails on the mount comes back as EgressRefused, not as a "
+          "bare OSError (got " + type(raised).__name__ + ")")
+
+    real_fstat, egress.os.fstat = egress.os.fstat, broken_fstat
+    raised = None
+    try:
+        allowlist.open(target).close()
+    except BaseException as exc:  # noqa: BLE001
+        raised = exc
+    finally:
+        egress.os.fstat = real_fstat
+    check(isinstance(raised, EgressRefused),
+          "and so does an fstat that fails on a descriptor whose mount went "
+          "away (got " + type(raised).__name__ + ")")
+    allowed(allowlist, target, "and the allowlist still works afterwards")
+
 
 # --- the shape of the surface: no bytes go in anywhere.
 #

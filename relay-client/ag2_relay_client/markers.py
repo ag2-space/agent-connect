@@ -32,7 +32,18 @@ The precedence rules are part of the grammar, not of any consumer:
   indented blocks and inline code spans are masked before attachment markers are
   collected, so an answer explaining `[file: /etc/passwd]` does not try to send
   it. On this transport that is not a formatting nicety: the attach marker is
-  the entrance to egress.
+  the entrance to egress. The mask covers *stripping* as well as detection: an
+  answer whose code block demonstrates `[dm-only]` gets that block back with the
+  line still in it, because emptying somebody's example is the same silent
+  rewrite the standalone-only rule above exists to prevent.
+
+The masking has one invariant, and it is the one worth checking a change
+against: **a marker is either issued and stripped, or masked and left visible —
+never neither.** "Neither" is how a marker reaches the user as literal text,
+which is the scar at the top of this file. That is why the code-span and
+indented-block rules below are written to be *narrow*: a mask that over-reaches
+does not merely decline to act, it hides a marker in a body it then delivers
+verbatim.
 
 Not implemented here, deliberately: sutando's `**[core: N]**` reply header peel.
 That header is a pool-core prose convention, not something that exists on this
@@ -61,8 +72,20 @@ _SKIP_PATTERNS = (
     (re.compile(r"^\s*\[deduped:\s*([^\]]+)\]\s*", re.IGNORECASE), SKIP_DEDUPED),
 )
 
+#: What a room id may look like — the one definition in this library. `roomops`
+#: imports it: the id it puts in a URL path segment and the id read out of a
+#: `[channel:]` redirect are the same thing, and two spellings of one grammar is
+#: the drift this module exists to have stopped.
+ROOM_ID_RE = re.compile(r"^[!#][^\s/\x00-\x1f\x7f]{1,254}$")
+
 #: The redirect marker, on the first non-empty line. `.match()` anchors at the
 #: string start on its own, so no MULTILINE flag is wanted here.
+#:
+#: The value is caught loosely and judged afterwards, on purpose. Tightening the
+#: capture instead would leave `[channel: <two lines>]` unrecognised, and an
+#: unrecognised marker is delivered as literal text — the failure this module is
+#: named after. Recognised-and-stripped-without-acting is the fail-safe corner:
+#: nothing is redirected, and nothing leaks.
 _REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]+)\]\s*\n?")
 
 #: Detected anywhere — that is what makes the guard order-independent.
@@ -82,7 +105,16 @@ _FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
 
 #: A run of N backticks closed by the same run. Matching the *span* rather than
 #: the characters beside a marker is what catches one in the middle of a span.
-_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\1).)+?\1(?!`)", re.DOTALL)
+#:
+#: A span may cross a line, and may **not** cross a blank line — that is
+#: CommonMark, and here it is load-bearing rather than pedantic. Without the
+#: guard one stray backtick anywhere in a reply pairs with the next one however
+#: far away, and every marker between them is masked: not issued, and therefore
+#: not stripped, and therefore delivered to the user as literal `[file: …]`
+#: text. Over-masking is not the safe direction. It is the leak.
+_SPAN_RE = re.compile(
+    r"(?<!`)(`+)(?!`)(?:(?!\1)(?!\n[ \t]*(?:\n|\Z)).)+?\1(?!`)", re.DOTALL
+)
 
 #: What a redirect looks like when it is put back on the wire (H3).
 CHANNEL_FORM = "[channel: {room}]"
@@ -163,28 +195,35 @@ def parse(text: Optional[str]) -> ParseResult:
             return ParseResult(body="", actions=(Action("skip", reason, extra),))
 
     # 2. DM-ONLY — before redirect, because it suppresses one.
+    #
+    # Detection is unmasked: a `[dm-only]` shown inside a code fence still turns
+    # the privacy guard on, because over-detecting costs a redirect and
+    # under-detecting costs the privacy. Stripping is masked, because a code
+    # block is being shown and emptying it is a silent rewrite of the owner's
+    # own text — the same asymmetry as the standalone-only rule, one level down.
     dm_only = bool(_DMONLY_RE.search(body))
     if dm_only:
         actions.append(Action("dm-only", ""))
-        body = _DMONLY_STRIP_RE.sub("", body)
+        outside_code = _mask(body)
+        body = _DMONLY_STRIP_RE.sub(
+            lambda m: m.group(0) if outside_code(m.start()) else "", body
+        )
 
     # 3. REDIRECT — first non-empty line. Under dm-only the marker is still
     # *stripped* (so it cannot leak into the room as literal text) but no
     # redirect action is emitted: stripping without acting is the fail-safe
-    # direction, and acting on it is the leak.
+    # direction, and acting on it is the leak. A value that is not a room id
+    # lands in the same corner, for the same reason: it cannot be delivered to,
+    # and it must not be repeated at the user.
     found = _REDIRECT_RE.match(body)
     if found:
-        if not dm_only:
-            actions.append(Action("redirect", found.group(1).strip()))
+        named = found.group(1).strip()
+        if not dm_only and ROOM_ID_RE.match(named):
+            actions.append(Action("redirect", named))
         body = body[found.end():]
 
     # 4. ATTACH — anywhere, document order, code regions masked.
-    shown = _code_regions(body)
-
-    def in_code(position: int) -> bool:
-        if body.count("\n", 0, position) in shown[0]:
-            return True
-        return any(start <= position < end for start, end in shown[1])
+    in_code = _mask(body)
 
     for found in _ATTACH_RE.finditer(body):
         if not in_code(found.start()):
@@ -209,6 +248,11 @@ def restitch(body: str, redirect: str) -> str:
     room = (redirect or "").strip()
     if not room:
         return body
+    if not ROOM_ID_RE.match(room):
+        # A "first line" with a newline in it is not a first line, and the
+        # deliverer would read the remainder as the body's opening. `parse`
+        # never yields one; a consumer that assembled a redirect by hand can.
+        return body
     return CHANNEL_FORM.format(room=room) + "\n" + (body or "")
 
 
@@ -217,22 +261,56 @@ def is_skip(text: Optional[str]) -> bool:
     return bool(parse(text).skip)
 
 
+def _mask(text: str):
+    """A `position -> bool` predicate: is this offset inside markdown code?
+
+    Built once per body and closed over the body it was built from, because the
+    body is rewritten between steps and an offset into the old one means
+    nothing. Everything that masks — detection and stripping alike — asks this.
+    """
+    lines_in_code, spans = _code_regions(text)
+
+    def inside(position: int) -> bool:
+        if text.count("\n", 0, position) in lines_in_code:
+            return True
+        return any(start <= position < end for start, end in spans)
+
+    return inside
+
+
 def _code_regions(text: str):
     """`(line indices inside code blocks, inline-span character ranges)`.
 
     An unclosed fence swallows the rest of the body on purpose: the alternative
     is treating shown-but-unterminated example text as a live directive, and on
     this transport a live `[file:]` directive is an upload.
+
+    An indented line is only a code block when it does not interrupt a
+    paragraph — CommonMark's rule, and the one that keeps a wrapped list item
+    out of here. `"- item\n    [file: X]"` is a continuation line of the list
+    item, indented for readability, and reading it as code masks a live marker
+    into a body that then delivers it as literal text. The blank line before an
+    indented block is what makes it a block.
     """
     lines = text.split("\n")
     marked = set()
     fenced = False
+    in_paragraph = False
     for index, line in enumerate(lines):
         if _FENCE_RE.match(line):
             fenced = not fenced
             marked.add(index)
+            in_paragraph = False
             continue
-        if fenced or line.startswith(("    ", "\t")):
+        if fenced:
             marked.add(index)
+            continue
+        if not line.strip():
+            in_paragraph = False
+            continue
+        if line.startswith(("    ", "\t")) and not in_paragraph:
+            marked.add(index)
+            continue
+        in_paragraph = True
     spans = [(m.start(), m.end()) for m in _SPAN_RE.finditer(text)]
     return marked, spans

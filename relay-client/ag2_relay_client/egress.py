@@ -55,6 +55,16 @@ world says yes. Refusing `st_nlink > 1` closes it. The cost is that a
 legitimately hard-linked file is refused with a sentence in the room, which is
 the direction this module fails in on purpose.
 
+`st_nlink` closes the hard-link route; it is not an enumeration of every way one
+inode gets a second real path. A bind mount, an overlay mount or a second mount
+of the same filesystem gives a file a path inside an allowed root while
+`st_nlink` stays `1`, and nothing here can see that — the link count is a
+property of the inode, and the second name is a property of the mount table.
+Read the clause as "a second *name on this filesystem* is refused", not as "a
+file inside a root is reachable only through that root". A deployment that
+bind-mounts something sensitive under an egress root has widened the allowlist,
+and this module will not notice.
+
 Special files are refused by the same `fstat`: `/dev/zero` is not a regular
 file, and a FIFO cannot even stall the open, because it is opened `O_NONBLOCK`.
 """
@@ -138,13 +148,24 @@ class ApprovedFile:
         """At most `limit` bytes from the judged descriptor.
 
         `limit` is a ceiling the caller sets and this reads *past* on purpose:
-        a caller asking for `cap + 1` is asking "did this grow since it was
+        a caller asking for `size + 1` is asking "did this grow since it was
         measured?", and gets an answer.
+
+        A read that fails comes back as an `EgressRefused`, not as an `OSError`.
+        The outbox is allowed to be an NFS or cloud-sync mount — the module
+        docstring blesses exactly that deployment — and such a mount answers
+        `ESTALE` or `EIO` mid-read whenever it feels like it. A caller that has
+        to catch `EgressRefused` *and* `OSError` will catch one of them, and I1
+        says which failure that costs: the bearer's only poller, over an
+        attachment.
         """
         chunks = []
         remaining = int(limit)
         while remaining > 0:
-            block = os.read(self.fd, min(remaining, 1 << 20))
+            try:
+                block = os.read(self.fd, min(remaining, 1 << 20))
+            except OSError as exc:
+                raise EgressRefused(_unreadable(exc), self.path) from None
             if not block:
                 break
             chunks.append(block)
@@ -154,10 +175,7 @@ class ApprovedFile:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            try:
-                os.close(self.fd)
-            except OSError:  # pragma: no cover — already gone is close enough
-                pass
+            _shut(self.fd)
 
 
 class EgressAllowlist:
@@ -168,6 +186,16 @@ class EgressAllowlist:
     that configured no roots meant.
     """
 
+    #: The `__setattr__` below refuses a write; `__slots__` refuses the way
+    #: around it. Without slots an instance carries a `__dict__`, and
+    #: `al.__dict__["_roots"] = (...)` widens the allowlist without ever
+    #: calling `__setattr__` — a one-liner, in a language where the expensive
+    #: bypass (`object.__setattr__`) cannot be closed at all. Closing the cheap
+    #: route is not a guarantee, it is the difference between an attacker
+    #: needing to mean it and an attacker tripping over it. `ApprovedFile` next
+    #: door has had slots all along; this class is the one that decides.
+    __slots__ = ("_roots", "_max_bytes", "_sealed")
+
     def __init__(
         self,
         roots: Iterable[object] = (),
@@ -176,7 +204,9 @@ class EgressAllowlist:
         resolved = []
         for root in roots or ():
             real = _real(root)
-            if real and real not in resolved:
+            if not real or not _usable_root(real, root):
+                continue
+            if real not in resolved:
                 resolved.append(real)
         self._roots = tuple(resolved)
         self._max_bytes = max(0, int(max_bytes))
@@ -259,7 +289,14 @@ class EgressAllowlist:
 
         fd = self._open_within(root, real, shown)
         try:
-            info = os.fstat(fd)
+            try:
+                info = os.fstat(fd)
+            except OSError as exc:
+                # A descriptor on a mount that went away between the open and
+                # the stat. `EgressRefused` rather than `OSError` for the same
+                # reason `read` converts: one exception type out of this module,
+                # or I1 is one `except` clause away from being breached.
+                raise EgressRefused(_unreadable(exc), shown) from None
             if not stat.S_ISREG(info.st_mode):
                 raise EgressRefused(NOT_REGULAR, shown)
             if info.st_nlink > 1:
@@ -267,8 +304,8 @@ class EgressAllowlist:
                 raise EgressRefused(MULTI_LINKED, shown)
             if self._max_bytes and info.st_size > self._max_bytes:
                 raise EgressRefused(_too_big(info.st_size, self._max_bytes), shown)
-        except Exception:
-            os.close(fd)
+        except BaseException:
+            _shut(fd)
             raise
         return ApprovedFile(fd, real, info.st_size)
 
@@ -325,10 +362,10 @@ class EgressAllowlist:
                 last = index == len(parts) - 1
                 flags = os.O_RDONLY | nofollow | nonblock | (0 if last else directory)
                 nxt = _open(part, flags, shown, dir_fd=fd, traversing=not last)
-                os.close(fd)
+                _shut(fd)
                 fd = nxt
-        except Exception:
-            os.close(fd)
+        except BaseException:
+            _shut(fd)
             raise
         return fd
 
@@ -351,6 +388,70 @@ def _open(target: object, flags: int, shown: str, dir_fd: Optional[int] = None,
         raise EgressRefused(
             f"it could not be opened ({exc.strerror or exc})", shown
         ) from None
+
+
+def _shut(fd: int) -> None:
+    """Close a descriptor and say nothing about it.
+
+    Closing is cleanup, and cleanup that raises replaces the failure being
+    handled with a less interesting one. On the paths that call this, the
+    interesting failure is already on its way to the room.
+    """
+    try:
+        os.close(fd)
+    except OSError:  # pragma: no cover — already gone is close enough
+        pass
+
+
+def _unreadable(exc: OSError) -> str:
+    """A room-facing sentence for a file the filesystem would not hand over."""
+    return f"it could not be read ({exc.strerror or exc})"
+
+
+def _usable_root(real: str, given: object) -> bool:
+    """Would this root ever match anything? Say so now, not at the first upload.
+
+    Two root shapes resolve cleanly, look valid in `sendable_roots`, and then
+    refuse every file for ever. Both fail closed, which is the right direction
+    and the wrong moment — a typo belongs at startup, in the consumer's config
+    validation, not in a sentence in a room three days later.
+
+    - **The filesystem root.** `/` is not an allowlist; it is the absence of
+      one, spelled in a way that reads like a value. It is refused rather than
+      honoured: a consumer that means "send anything" has no business holding
+      this object, and a consumer that typed `/` by accident gets told.
+    - **A root spelled in the wrong case.** On a case-insensitive filesystem —
+      macOS's default, and every SMB mount — `realpath` resolves `…/Outbox`
+      when the directory on disk is `outbox`, and stores the spelling it was
+      given. No child's real path then starts with it, so the root matches
+      nothing at all. Checking each component against the directory that holds
+      it is what catches it, on every platform, and catches a plain misspelling
+      with the same reading.
+
+    A component we cannot list is not a component we may condemn: an
+    unreadable parent directory answers "cannot tell", and the root is kept.
+    """
+    if real == os.sep:
+        log.warning(
+            "egress root %r is the whole filesystem, which is not an allowlist "
+            "— dropping it", str(given),
+        )
+        return False
+    parent, name = os.path.split(real)
+    while name:
+        try:
+            present = name in os.listdir(parent)
+        except OSError:
+            return True  # Cannot tell. Not grounds for narrowing the allowlist.
+        if not present:
+            log.warning(
+                "egress root %r does not name a directory on this filesystem "
+                "(%r is not in %r) — dropping it, because it would refuse every "
+                "file and never say why", str(given), name, parent,
+            )
+            return False
+        parent, name = os.path.split(parent)
+    return True
 
 
 def _real(path: object) -> str:
@@ -379,5 +480,11 @@ def _mb(count: int) -> str:
 
 def sendable_roots(roots: Sequence[object]) -> Tuple[str, ...]:
     """The roots as an allowlist would resolve them — for a consumer's config
-    validation, so a typo shows up at startup rather than at the first upload."""
+    validation, so a typo shows up at startup rather than at the first upload.
+
+    A root that is missing from what comes back is a root that would have sent
+    nothing: it did not resolve, it was the filesystem root, or it is spelled in
+    a case this filesystem does not use. Each one is logged as it is dropped.
+    Comparing lengths is the check a consumer wants at startup.
+    """
     return EgressAllowlist(roots).roots

@@ -57,6 +57,7 @@ from collections import OrderedDict
 from typing import Callable, Dict, NamedTuple, Optional, Sequence
 
 from .egress import ApprovedFile, EgressAllowlist, EgressRefused
+from .markers import ROOM_ID_RE
 from .transport import AuthRejected, RelayHTTP
 
 log = logging.getLogger(__name__)
@@ -81,9 +82,11 @@ MAX_MENTIONS = 10
 #: A hand-typed mxid in body text does not notify anyone; only this field does.
 _MXID_RE = re.compile(r"^@[^\s:@]+:[^\s:@/]+$")
 
-#: A room id is broker-supplied, but it is also about to be a URL path segment
-#: and a JSON value, so it is checked rather than trusted.
-_ROOM_ID_RE = re.compile(r"^[!#][^\s/\x00-\x1f\x7f]{1,254}$")
+# A room id is broker-supplied, but it is also about to be a URL path segment
+# and a JSON value, so it is checked rather than trusted — against
+# `markers.ROOM_ID_RE`, imported above. That is where a room id is also *read*,
+# out of a `[channel:]` redirect, and the two are the same grammar. A second
+# copy of it here is precisely the drift H2 is a scar about.
 
 #: How many intake event ids to remember. Bounded because it is a guard, not a
 #: ledger: the ids that matter are the recent ones.
@@ -111,7 +114,28 @@ class RoomOps:
     Shared across tasks — the cooldown is why. A broker that is not doing room
     ops for one task is not doing them for the next one either, and finding that
     out per task costs every answer the timeout.
+
+    **Two attributes are sealed, and the object has no `__dict__`.** The
+    allowlist is one of them: an `EgressAllowlist` that refuses to be widened is
+    worth nothing if the reference *to* it is a plain attribute, because then
+    the attacker does not widen the allowlist, they replace it — one assignment,
+    same result, one layer up. The authenticated HTTP session is the other:
+    `RelayHTTP` is a bearer token with a `.post`, and reaching it from here
+    would be the bytes API this library refuses to have, spelled
+    `ops.http.post("/v1/rooms/X/media", {"content_b64": ...})`. So it is private
+    and it is sealed, and the only route to a room's media is `upload`, which
+    goes through the allowlist.
     """
+
+    #: Slots, so the seal below has no `__dict__` to be walked around.
+    __slots__ = (
+        "_http", "_allowlist", "cooldown_s", "timeout", "_clock",
+        "_on_auth_rejected", "_blocked_until", "_intake",
+    )
+
+    #: Written once, in `__init__`, and never again. The rest of the state here
+    #: is ordinary — the cooldown deadline moves by design.
+    _SEALED = frozenset({"_http", "_allowlist"})
 
     def __init__(
         self,
@@ -122,7 +146,7 @@ class RoomOps:
         clock: Callable[[], float] = time.monotonic,
         on_auth_rejected: Optional[Callable[[AuthRejected], None]] = None,
     ):
-        self.http = http
+        self._http = http
         self._allowlist = allowlist
         self.cooldown_s = float(cooldown_s)
         self.timeout = float(timeout)
@@ -134,6 +158,19 @@ class RoomOps:
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<RoomOps available={self.available}>"
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in self._SEALED and hasattr(self, name):
+            raise AttributeError(
+                f"{name} is fixed at construction; build another RoomOps rather "
+                f"than repointing this one"
+            )
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in self._SEALED:
+            raise AttributeError(f"{name} is fixed at construction")
+        object.__delattr__(self, name)
+
     @property
     def allowlist(self) -> Optional[EgressAllowlist]:
         """Egress runs through this or not at all — and it is read-only.
@@ -143,6 +180,12 @@ class RoomOps:
         one. Read-only for the same reason the roots inside it are fixed at
         construction — an allowlist that can be *replaced* at runtime is an
         allowlist an attacker only has to reach once.
+
+        Read-only means the private name too. A property with no setter stops
+        `ops.allowlist = wider` and nothing else; `ops._allowlist = wider` is
+        the same attack with four more characters, and `ops.__dict__[...]` is
+        the same attack again. The class seals the private name and carries
+        `__slots__` so there is no third spelling.
         """
         return self._allowlist
 
@@ -255,6 +298,11 @@ class RoomOps:
         judged. Nothing in this library — public or private — accepts bytes to
         upload, because a surface that did would let any caller read a file the
         allowlist would have refused and hand the contents over anyway.
+
+        Like everything else here it raises nothing (I1). Not an `OSError` from
+        a mount that went away mid-read, not a `MemoryError` from base64'ing 24
+        MiB on a small host: an attachment is worth an attachment, never the
+        consumer's loop, and the failure is said out loud in the answer instead.
         """
         if self._allowlist is None:
             return UploadResult(False, reason=_NO_ALLOWLIST)
@@ -268,34 +316,54 @@ class RoomOps:
         except EgressRefused as refusal:
             log.info("egress refused %r: %s", str(path)[:200], refusal.reason)
             return UploadResult(False, reason=refusal.reason)
+        except Exception:  # noqa: BLE001 — I1: nothing here reaches the loop
+            log.exception("egress raised judging %r", str(path)[:200])
+            return UploadResult(False, reason=_UNREADABLE)
 
-        with approved:
-            encoded = _encode(approved, self._allowlist.max_bytes)
-            if encoded is None:
-                return UploadResult(
-                    False, path=approved.path,
-                    reason="it grew while it was being read, so it was not sent",
-                )
-            filename = _filename(approved)
-            payload: Dict[str, object] = {
-                "content_b64": encoded, "filename": filename,
-            }
-            if caption:
-                payload["caption"] = caption
-            answer = self._call(
-                payload, path=MEDIA_PATH.format(room=_quote(room_id)), op="upload",
-            )
+        try:
+            return self._put_media(room_id, approved, caption)
+        except EgressRefused as refusal:
+            # The descriptor was judged and then would not read — a stale NFS
+            # handle, a device error. Room-facing sentence, no cooldown: the
+            # broker did not fail, this machine did.
+            log.info("egress refused %r mid-read: %s", approved.path, refusal.reason)
+            return UploadResult(False, path=approved.path, reason=refusal.reason)
+        except Exception:  # noqa: BLE001 — I1 again, and this one is the scar
+            log.exception("room op: %s failed on its way to the room", approved.path)
+            return UploadResult(False, path=approved.path, reason=_UNREADABLE)
+        finally:
+            approved.close()
 
+    # -- internals ----------------------------------------------------------
+
+    def _put_media(
+        self,
+        room_id: str,
+        approved: ApprovedFile,
+        caption: Optional[str],
+    ) -> UploadResult:
+        """The upload proper, on a descriptor the allowlist has already judged.
+
+        Split out of `upload` so the `try` that keeps I1 can wrap all of it —
+        the encode, the read underneath the encode, and the call — rather than
+        the one line anybody remembers to guard.
+        """
+        encoded = _encode(approved)
+        if encoded is None:
+            return UploadResult(False, path=approved.path, reason=_GREW)
+        filename = _filename(approved)
+        payload: Dict[str, object] = {"content_b64": encoded, "filename": filename}
+        if caption:
+            payload["caption"] = caption
+        answer = self._call(
+            payload, path=MEDIA_PATH.format(room=_quote(room_id)), op="upload",
+        )
         if answer is None:
-            return UploadResult(
-                False, filename=filename, path=approved.path,
-                reason="this client could not reach the room to send it",
-            )
+            return UploadResult(False, filename=filename, path=approved.path,
+                                reason=_UNREACHABLE)
         mxc = answer.get("mxc") if isinstance(answer, dict) else ""
         return UploadResult(True, mxc=str(mxc or ""), filename=filename,
                             path=approved.path)
-
-    # -- internals ----------------------------------------------------------
 
     def _call(self, payload: Dict[str, object], path: str = ROOM_PATH,
               op: str = "") -> Optional[dict]:
@@ -306,7 +374,7 @@ class RoomOps:
                       name, self.cooldown_remaining)
             return None
         try:
-            answer = self.http.post(path, payload, timeout=self.timeout)
+            answer = self._http.post(path, payload, timeout=self.timeout)
             return answer if isinstance(answer, dict) else {}
         except AuthRejected as exc:
             # Not raised (I1) and not swallowed either (C8): auth recovery is
@@ -334,17 +402,30 @@ _NO_ALLOWLIST = (
     "this client is not configured to send files, so nothing was attached"
 )
 _NO_ROOM = "this client does not know which room to send it to"
-_COOLING = "this client could not reach the room to send it"
+_UNREACHABLE = "this client could not reach the room to send it"
+#: Cooling down reads to the room as unreachable, because that is what it is.
+_COOLING = _UNREACHABLE
+_GREW = "it grew while it was being read, so it was not sent"
+#: For a file this machine could not hand over. Deliberately vague about why:
+#: an errno is for the log, and the room gets a sentence.
+_UNREADABLE = "this client could not read it, so it was not sent"
 
 
-def _encode(approved: ApprovedFile, cap: int) -> Optional[str]:
-    """The judged descriptor's bytes, base64'd — or `None` if it outgrew its cap.
+def _encode(approved: ApprovedFile) -> Optional[str]:
+    """The judged descriptor's bytes, base64'd — or `None` if it outgrew its size.
 
-    Reads `cap + 1` for the same reason the media *ingress* does: the size that
-    was checked came from an `fstat` taken a moment ago, and a file that has
-    been growing since should be refused rather than truncated into the room.
+    Reads `size + 1` for the same reason the media *ingress* does: the size came
+    from an `fstat` taken a moment ago, and a file that has been growing since
+    should be refused rather than truncated into the room.
+
+    The measurement to read against is **the judged size, not the cap**. Reading
+    `cap + 1` says it refuses growth and does not: a file that was 40 bytes when
+    the allowlist approved it and 9 MB by the time it was read is well under a
+    24 MiB cap, so all 9 MB go into the room, unmeasured by anything. The cap
+    answers "may a file this big be sent"; only the `fstat` answers "is this
+    still the file that was approved", and this is the second question.
     """
-    limit = cap if cap else approved.size
+    limit = approved.size
     raw = approved.read(limit + 1)
     if len(raw) > limit:
         return None
@@ -378,7 +459,7 @@ def _quote(room_id: str) -> str:
 
 
 def _valid_room(room_id: object) -> bool:
-    return isinstance(room_id, str) and bool(_ROOM_ID_RE.match(room_id))
+    return isinstance(room_id, str) and bool(ROOM_ID_RE.match(room_id))
 
 
 def _mentions(mentions: Optional[Sequence[str]]) -> list:
@@ -387,13 +468,19 @@ def _mentions(mentions: Optional[Sequence[str]]) -> list:
     Over the cap the extras are dropped rather than the op refused. A message
     that lands and notifies nine of ten people is a better outcome than one that
     does not land at all — and the drop is logged so it is not a silence.
+
+    Materialised once, first. A caller handing over a generator is handing over
+    something that can be walked exactly one time, and the old code walked it
+    three: the mxids came out, and then the count of what was dropped came out
+    of an exhausted iterator as a negative number in the log.
     """
-    if not mentions:
+    named = list(mentions or ())
+    if not named:
         return []
-    good = [m for m in mentions if isinstance(m, str) and _MXID_RE.match(m)]
-    if len(good) != len(list(mentions)):
+    good = [m for m in named if isinstance(m, str) and _MXID_RE.match(m)]
+    if len(good) != len(named):
         log.info("room op: dropped %d mention(s) that were not full mxids",
-                 len(list(mentions)) - len(good))
+                 len(named) - len(good))
     if len(good) > MAX_MENTIONS:
         log.info("room op: %d mentions asked for, the broker stamps %d",
                  len(good), MAX_MENTIONS)

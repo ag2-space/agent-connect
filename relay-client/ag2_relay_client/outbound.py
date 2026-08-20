@@ -24,6 +24,24 @@ is to skip the POST as well, since nothing will be rendered; doing that leaves
 the lease to expire and the task to be re-served, for ever. So a skip body goes
 on the wire **verbatim** — the deliverer reads the marker and posts nothing.
 
+**The ledger is guarded by a lock, and the lock claims less than it looks.** The
+spec has agent-connect calling this library from an executor, so two threads can
+be inside `prepare` at once. On today's CPython the unlocked version happened to
+be safe — every operation on the ledger was one dict operation, and the GIL does
+not let go inside one — which is a property of an interpreter, not of this code,
+and it is the property a free-threaded build removes. The lock buys the
+guarantee outright, costs an uncontended acquire twice per upload, and means
+nobody has to re-derive that argument when they add the third ledger operation.
+
+What it deliberately does **not** do is hold across an upload. Two *genuinely
+overlapping* `prepare` calls for one `(task, path)` still both miss the ledger
+and both upload. That overlap is not F6's scar — F6 is a failed POST retried
+afterwards, in sequence — and the wire loop leases a task to one worker at a
+time, so reaching it means the consumer prepared one task twice at once.
+Serialising every upload behind one lock to close it would make one slow
+attachment delay every other task's answer: a worse trade than a duplicate
+nobody has seen.
+
 **H3 — the redirect goes back on.** The parser strips `[channel: <room>]` for
 the consumer's benefit; the broker's deliverer is what actually performs the
 move, so it is re-stitched onto the first line of the POSTed body. Unless
@@ -36,6 +54,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from collections import OrderedDict
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -111,6 +130,8 @@ class Outbound:
         self.max_files = int(max_files)
         self._ledger: OrderedDict[str, Dict[str, str]] = OrderedDict()
         self._ledger_tasks = int(ledger_tasks)
+        #: Guards the ledger's shape, not the uploads. See the module docstring.
+        self._lock = threading.Lock()
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<Outbound {len(self._ledger)} task(s) with media>"
@@ -179,28 +200,39 @@ class Outbound:
         Only success retires an id (F5), so only success may forget what it
         uploaded. Forgetting on failure is precisely the bug F6 describes.
         """
-        self._ledger.pop(task_id, None)
+        with self._lock:
+            self._ledger.pop(task_id, None)
 
     def already_sent(self, task_id: str) -> Tuple[str, ...]:
         """What this task has already put in its room. For tests and status."""
-        return tuple(sorted(set(self._ledger.get(task_id, {}).values())))
+        with self._lock:
+            return tuple(sorted(set(self._ledger.get(task_id, {}).values())))
 
     # -- internals ----------------------------------------------------------
 
     def _send(self, task_id, room_id, named, base_dir):
         """Upload one named path, once. Returns `(filename, "")` or `("", why)`."""
-        sent = self._ledger.get(task_id) or {}
         key = _key(named)
-        if key in sent:
+        with self._lock:
+            already = (self._ledger.get(task_id) or {}).get(key)
+        if already:
             # The retry case. The file is in the room; saying so again is the
             # duplicate this ledger exists to prevent.
             log.debug("task %s: %s already sent, not uploading again", task_id, key)
-            return sent[key], ""
+            return already, ""
 
         if self.room_ops is None:
             return "", _NO_ROOM_OPS
 
-        result = self.room_ops.upload(room_id, named, base_dir=base_dir)
+        try:
+            result = self.room_ops.upload(room_id, named, base_dir=base_dir)
+        except Exception:  # noqa: BLE001 — the last frame before the consumer
+            # `RoomOps.upload` promises not to raise (I1) and this is what makes
+            # the promise's failure cost an attachment rather than the poller.
+            # `prepare` says "Never raises" in its docstring; a docstring is not
+            # an enforcement mechanism, and the loop above is a bearer's only one.
+            log.exception("room op: upload raised for %r", str(named)[:200])
+            return "", _UPLOAD_RAISED
         if not result.ok:
             return "", result.reason
         self._remember(task_id, key, result.filename)
@@ -211,16 +243,18 @@ class Outbound:
         return result.filename, ""
 
     def _remember(self, task_id: str, key: str, filename: str) -> None:
-        sent = self._ledger.get(task_id)
-        if sent is None:
-            sent = {}
-            self._ledger[task_id] = sent
-            while len(self._ledger) > self._ledger_tasks:
-                self._ledger.popitem(last=False)
-        sent[key] = filename
+        with self._lock:
+            sent = self._ledger.get(task_id)
+            if sent is None:
+                sent = {}
+                self._ledger[task_id] = sent
+                while len(self._ledger) > self._ledger_tasks:
+                    self._ledger.popitem(last=False)
+            sent[key] = filename
 
 
 _NO_ROOM_OPS = "this client is not configured to send files"
+_UPLOAD_RAISED = "this client could not send it"
 
 
 def _key(named: str) -> str:

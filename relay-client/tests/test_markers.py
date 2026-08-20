@@ -79,6 +79,33 @@ standalone = "before\n[dm-only]\nafter"
 check(markers.parse(standalone).body == "before\nafter",
       "a standalone [dm-only] is stripped")
 
+# ...and the code mask covers the STRIP, not only the detection. An answer whose
+# fence demonstrates the marker had that fence silently emptied — the same
+# rewrite of the owner's own text that the standalone-only rule above exists to
+# prevent, in the one form the checks above never tried.
+demo = "to keep an answer private write:\n\n```\n[dm-only]\n```\n\nand it stays a DM"
+parsed = markers.parse(demo)
+check(parsed.dm_only,
+      "a [dm-only] shown inside a fence still ARMS the guard — over-detecting "
+      "costs a redirect, under-detecting costs the privacy")
+check(parsed.body == demo,
+      "but the fence comes back with its line still in it: " + repr(parsed.body))
+
+# --- the redirect's value is a room id, not "anything without a `]`"
+twoline = markers.parse("[channel: !a:b\nsecond line]\nthe answer")
+check(twoline.redirect == "",
+      "a [channel:] value carrying a newline names no room, so nothing acts on it")
+check("[channel:" not in twoline.body,
+      "but it is still stripped — recognised-and-not-acted-on is the fail-safe "
+      "corner, and unrecognised is the leak this module is named after")
+check(markers.parse("[channel: not-a-room]\nthe answer").redirect == "",
+      "and a value with no room sigil is not a room either")
+check(markers.restitch("the answer", "!a:b\nx") == "the answer",
+      "restitch will not build a first line with a newline in it — the deliverer "
+      "would read the remainder as the body's opening")
+check(markers.restitch("the answer", "!ok:ag2.space")
+      == "[channel: !ok:ag2.space]\nthe answer", "a real room id restitches")
+
 # --- redirect (H3): stripped for the consumer, re-stitched for the wire
 parsed = markers.parse("[channel: !other:ag2.space]\nthe answer")
 check(parsed.redirect == "!other:ag2.space", "the redirect names its room")
@@ -131,6 +158,32 @@ check(parsed.attachments == ("/a/real.png",),
       "a live marker beside a shown one: only the live one is acted on")
 check("/etc/passwd" in parsed.body and "/a/real.png" not in parsed.body,
       "and only the live one is stripped")
+
+# --- the mask must be NARROW. A mask that over-reaches does not decline to act,
+# it hides a marker in a body it then delivers verbatim — which is exactly the
+# "literal marker text reaches the user" scar, arrived at from the other side.
+stray = "a ` b\n\nc [file: /tmp/a.png] d ` e\n[file: /tmp/b.png]"
+parsed = markers.parse(stray)
+check(parsed.attachments == ("/tmp/a.png", "/tmp/b.png"),
+      "one loose backtick does not pair across a blank line — a code span cannot "
+      "contain one, and pretending otherwise masks every marker in between: "
+      + repr(parsed.attachments))
+check("[file:" not in parsed.body,
+      "so both are stripped, and neither is delivered as literal marker text")
+
+wrapped = "a `span that\nwraps one line [file: /etc/passwd]` still masks"
+check(markers.parse(wrapped).attachments == (),
+      "while a span crossing a SINGLE newline still masks — that much is "
+      "CommonMark, and the narrowing does not reach it")
+
+listy = "- item\n    [file: /tmp/a.png]"
+parsed = markers.parse(listy)
+check(parsed.attachments == ("/tmp/a.png",),
+      "a four-space continuation of a list item is a continuation, not an "
+      "indented code block: indented code cannot interrupt a paragraph")
+check("[file:" not in parsed.body, "so its marker is stripped, not left as text")
+check(markers.parse("    [file: /etc/passwd]\nafter").attachments == (),
+      "while an indented block that opens the body still issues nothing")
 
 # --- nothing at all
 check(markers.parse("").body == "" and markers.parse(None).actions == (),
