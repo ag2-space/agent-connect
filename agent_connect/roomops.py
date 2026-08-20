@@ -28,6 +28,11 @@ import urllib.error
 import urllib.request
 from typing import Mapping, Optional
 
+from ag2_relay_client.credentials import parse_onboarding_token
+
+from .relay import URL_ENV
+from .relay import token as relay_token
+
 #: The relay's room-op endpoint (`docs/adr/0002`).
 ROOM_PATH = "/v1/room"
 
@@ -124,22 +129,29 @@ def _event_id(reply: dict) -> str:
 def room_ops_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[RoomOps]:
     """The relay to speak to, or `None` when this Worker holds no token.
 
-    The credential is the one the Worker already has: `AGENT_CONNECT_TOKEN` from
-    the Agent Portal, which the relay client reads as `REMOTE_TASK_TOKEN`. Both
-    names are accepted because the launcher sets the second only for the relay
-    client's own process. The onboarding string may carry its gateway with it in
-    the combined `https://gateway|secret` form, which is why the URL is read out
-    of the token before any default applies.
+    The credential is the one the Worker already has, read by
+    `agent_connect.relay.token` and by nothing of this module's own: one reader,
+    so the Ladder and the wire cannot end up pointed at two different bearers.
+
+    **The gateway is chosen the way the library chooses it**, and for the same
+    reason: the URL that travels inside a combined `https://gateway|secret`
+    token *is* the gateway that credential belongs to, and `REMOTE_TASK_URL` is
+    for a bare secret that carries none. This module used to let the environment
+    outrank the token, so a stale `REMOTE_TASK_URL` beside a combined token
+    produced one process talking to two gateways — the wire at the token's, the
+    Ladder at the environment's, with only a log line about it. The split itself
+    is the library's `parse_onboarding_token`, so `%7C` and a bearer containing
+    a pipe mean here exactly what they mean there.
 
     No token means no Ladder — a workspace driven by hand, or a test, keeps the
     plain behaviour where the answer travels as the Task's result.
     """
     env = os.environ if env is None else env
-    raw = (env.get("REMOTE_TASK_TOKEN") or env.get("AGENT_CONNECT_TOKEN") or "").strip()
+    raw = relay_token(env)
     if not raw:
         return None
-    url_from_token, _, token = raw.partition("|") if "|" in raw else ("", "", raw)
-    url = (env.get("REMOTE_TASK_URL") or url_from_token or DEFAULT_URL).strip()
+    url_from_token, token = parse_onboarding_token(raw)
+    url = (url_from_token or env.get(URL_ENV) or DEFAULT_URL).strip()
     if not token or not url:
         return None
     return RoomOps(url, token)

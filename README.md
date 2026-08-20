@@ -284,7 +284,7 @@ order the agent named them.
 
 **The route matters more than the feature.** A file goes out by being placed in
 the **outgoing directory** — `<workspace>/results/`, the one directory the send
-allowlist on the other side of the transport trusts. The worker
+allowlist on the other side of the relay client trusts. The worker
 posts no media itself, and that is deliberate: the allowlist is what stops an
 agent from being talked into attaching a private key or somebody's tax return to
 a chat message, and a worker that uploaded files directly would turn any message
@@ -394,7 +394,7 @@ nothing in the plist.)
 
 **The launch unit is one worker plus one relay client, pointed at one config
 file.** That is the contract a supervisor builds on, and it is deliberately not
-a process count or a transport: today the installer's `launch.sh` starts both
+a process count or a wire: today the installer's `launch.sh` starts both
 halves, and what a supervisor should depend on is the pair, named by the config
 file it was given.
 
@@ -431,7 +431,7 @@ a supervisor watching several of them tells one worker's state from another's.
 `~/.agent-connect/workspace/status.json`, or wherever `AGENT_CONNECT_STATUS_FILE`
 says. This is part of the service contract: anything watching a worker (the
 desktop app's badge first, `cat` second) reads that file and needs to know
-nothing about the transport underneath.
+nothing about the relay client underneath.
 
 ```json
 {
@@ -457,6 +457,9 @@ nothing about the transport underneath.
     "gateway": "https://chat.ag2.space/relay",
     "last_ok_ts": 1755600120.0,
     "backoff_s": 0.0,
+    "recheck_s": 0.0,
+    "acks_paused_s": 0.0,
+    "singleton": "held",
     "error": null,
     "inflight": 0,
     "pending_results": 0,
@@ -468,15 +471,31 @@ nothing about the transport underneath.
 **The file is layered, and the layers are two different facts.** `state`,
 `adapter` and `agent` are the worker's own account of itself — what is
 configured, and whether the local agent behind the identity answered its
-preflight. `relay` is the transport's, read off the relay client's status hook:
+preflight. `relay` is the connection's, read off the relay client's status hook:
 whether the broker is reachable (`connected`, `state` is one of `connected`,
-`reconnecting`, `auth-wait`, `fatal`, `stopped`), when it last was
-(`last_ok_ts`), how long the client is waiting before its next attempt
-(`backoff_s`), how many tasks it has accepted and not yet answered (`inflight`),
-and how many answers it is still trying to hand back (`pending_results`). The
-gateway URL is redacted before it is ever written. `relay` is `null` before the
-transport is constructed — "no relay" and "a relay that is offline" are
-different facts about a worker.
+`reconnecting`, `auth-wait`, `fatal`, `standby`, `displaced`, `stopped`), when
+it last was (`last_ok_ts`), how long the client is waiting before its next
+attempt (`backoff_s`), how many tasks it has accepted and not yet answered
+(`inflight`), and how many answers it is still trying to hand back
+(`pending_results`). The gateway URL is redacted before it is ever written.
+`relay` is `null` before the relay client is constructed — "no relay" and "a
+relay that is offline" are different facts about a worker.
+
+Three of those need a sentence of their own, because they are the ones an
+observer misreads. **`standby`** is not an outage: another poller holds this
+bearer's guard, so this client is deliberately not polling and is asking again
+every `recheck_s` — one bearer tolerates exactly one poller, and two would
+double-deliver every message. It is also the state a *restarted* worker sits in
+for up to two and a half minutes when its predecessor was killed rather than
+stopped. **`displaced`** is terminal: this client held the guard and another
+poller took it, so it has stopped for good and only a restart changes it.
+**`acks_paused_s`** is seconds left of the ack cooldown, and non-zero means
+tasks accepted right now are having their leases requeued underneath running
+turns — the number that tells "quiet" apart from "everything is being retried".
+**`singleton`** is the guard's own verdict — `held`, `lost`, `degraded` (it
+could not be read, so the client polls anyway), `idle` or `off` — because
+"polling with the guard held" and "polling anyway with a guard nobody could
+read" look identical from outside and are not the same situation.
 
 **The relay block does not beat.** `updated_at` is refreshed by the worker's own
 heartbeat and by nothing else, so it goes on meaning exactly one thing: this
@@ -484,7 +503,14 @@ process's event loop is turning. The relay client's status hook runs on its own
 polling thread, and a live polling thread proves nothing about a wedged event
 loop — so the hook writes the connection through without touching either clock.
 The block carries the client's own `updated_ts`, for a reader who wants to know
-whether the *transport's* view is current.
+whether the *relay client's* view is current.
+
+**The block is a projection, and the list above is all of it.** The worker
+copies exactly those fields out of the client's snapshot rather than passing the
+snapshot through, because this file is a contract with an outside reader and a
+block that silently gained whatever the library added next would be a contract
+nobody wrote down. `tests/test_worker_queue.py` fails when the two lists drift
+apart.
 
 **Four states, and that is all of them:** `starting` (the file exists before
 anything can go wrong, so a worker that dies in preflight still leaves the
@@ -613,9 +639,15 @@ Other adapters:
 | `AGENT_CONNECT_KILO_BIN` | path to the `kilo` binary | `kilo` |
 
 `REMOTE_TASK_TOKEN` and `REMOTE_TASK_URL` are the names the old two-process
-launcher exported for the transport's own process. Both are still read, and mean
-what they always meant: the same credential under its other name, and a gateway
-for a bare secret that does not carry one. `AGENT_CONNECT_TASK_DIR`,
+launcher exported for the relay client's own process. Both are still read, and
+mean what they always meant: the same credential under its other name, and a
+gateway for a bare secret that does not carry one. **`AGENT_CONNECT_TOKEN` wins
+where both are set** — the setting this document calls the setting outranks the
+one it calls the old name, so a `REMOTE_TASK_TOKEN` forgotten in an old launchd
+plist cannot quietly beat a token you have just rotated. And a gateway that
+travels *inside* a combined token wins over `REMOTE_TASK_URL`, for the wire and
+for the room ops alike: the URL that arrived with a credential is the one that
+credential belongs to. `AGENT_CONNECT_TASK_DIR`,
 `AGENT_CONNECT_RESULT_DIR` and `AGENT_CONNECT_STATE_DIR` are `ag2-sparrow`'s and
 are read by nothing in this package.
 
@@ -641,7 +673,7 @@ agent and return its output." Ships with:
 
 **Auth model — two independent layers:** (1) agent identity → AG2 Space (a relay token we issue); (2) the agent's own tool auth (its login / provider API key), which AG2 Space never sees. `ollama` needs no provider auth (the model is local).
 
-The framework is agent-agnostic; the transport + onboarding + access-tiers are shared.
+The framework is agent-agnostic; the relay client + onboarding + access-tiers are shared.
 
 ## Quick start (MVP)
 

@@ -3,7 +3,7 @@
 Nothing here imports the Worker to ask it how it feels. A real `python3 -m
 agent_connect` is started, the file at the documented path is read from outside
 the process, and the assertions are on what it says — which is the whole claim:
-a Worker's state is its own to report, and an observer needs no transport
+a Worker's state is its own to report, and an observer needs no relay
 knowledge and no cooperation from anything but the file.
 
 Including the case that matters most. A Worker killed with `SIGKILL` writes
@@ -19,6 +19,8 @@ from __future__ import annotations
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import signal
@@ -149,13 +151,13 @@ check(later["heartbeat_seconds"] == 0.2,
 check(not is_stale(later), "a Worker that is serving is not stale")
 
 
-print("\n-- and it carries the transport's state beside its own --")
+print("\n-- and it carries the Relay Client's state beside its own --")
 
 # Layered status (transport-seam spec): the Worker's own facts — which Adapter,
 # which Local Agent answered preflight — and the connection state read off the
 # Relay Client's hook, in one file under one name. This child is pointed at a
 # port nothing is listening on, which is the interesting case: an unreachable
-# broker is a fact about the transport, and a Worker that is otherwise perfectly
+# broker is a fact about the Relay Client, and a Worker that is otherwise perfectly
 # healthy must not report it as its own death.
 relay = worker.wait_for(SERVING).get("relay") or {}
 check(set(relay) == set(RELAY_FIELDS),
@@ -178,7 +180,7 @@ def relay_of(w):
     return (w.doc().get("relay") or {})
 
 
-# The transport's clock and the Worker's are separate on purpose. The hook runs
+# The Relay Client's clock and the Worker's are separate on purpose. The hook runs
 # on the library's poll thread, and a live poll thread says nothing about a
 # wedged event loop — so it must not be able to refresh `updated_at`, which is
 # the third way that promise could have been defeated.
@@ -206,7 +208,7 @@ check(after["state"] == SERVING,
       "and it says nothing about the Worker's own state, which is not its news")
 frozen.relay(None)
 check(json.loads((tmp / "layered" / "status.json").read_text())["relay"] is None,
-      "no transport at all is null rather than absent — 'no relay' and 'a relay "
+      "no Relay Client at all is null rather than absent — 'no relay' and 'a relay "
       "that is offline' are different facts about a Worker")
 
 
@@ -286,10 +288,25 @@ clock = [1000.0]
 blocked = tmp / "a-file"
 blocked.write_text("not a directory\n")
 status = StatusFile(blocked / "status.json", 1.0, lambda: clock[0])
-status.starting()
-status.serving()
-check(True, "a status file that cannot be written raises nothing at all — an "
-            "observer falls back on staleness, and no Task pays for it")
+said = io.StringIO()
+raised = ""
+try:
+    with contextlib.redirect_stderr(said):
+        status.starting()
+        status.serving()
+        status.beat(tasks_running=1)
+        status.relay({name: "x" for name in RELAY_FIELDS})
+        status.error("something else went wrong too")
+except BaseException as exc:  # noqa: BLE001 — the whole claim is that this is unreachable
+    raised = f"{type(exc).__name__}: {exc}"
+check(not raised,
+      f"a status file that cannot be written raises nothing at all — an "
+      f"observer falls back on staleness, and no Task pays for it (got {raised!r})")
+check(not (blocked / "status.json").exists() and blocked.read_text() == "not a directory\n",
+      "nothing is written, and whatever was in the way is left exactly as it was")
+check(said.getvalue().count("cannot write the status file") == 1,
+      "and it is complained about once rather than once per write — a Worker "
+      "whose workspace went away must not fill the log with the same line")
 
 path = tmp / "beat" / "status.json"
 status = StatusFile(path, heartbeat=10.0, clock=lambda: clock[0])
@@ -363,9 +380,35 @@ doc = worker.wait_for(SERVING)
 check(doc.get("instance") == "scratch",
       "AGENT_CONNECT_INSTANCE is carried into the file, so a supervisor can "
       "match N status files to its own N rows without recognising a path")
+check((worker.dir / "ws" / "relay" / "scratch").is_dir(),
+      "and it is the same name the relay client's state is kept under")
 worker.stop()
 check(instance_name({}) == "" and instance_name({"AGENT_CONNECT_INSTANCE": " a "}) == "a",
       "and it is just a name — unset is empty, not an error")
+
+# The document says what the Worker is actually called. An unnamed one used to
+# write `""` here while its state sat in `<workspace>/relay/default/`, which a
+# supervisor holding `""` cannot map onto anything on disk.
+worker = Worker()
+doc = worker.wait_for(SERVING)
+check(doc.get("instance") == "default",
+      "a Worker nobody named says `default` rather than an empty string")
+check((worker.dir / "ws" / "relay" / doc.get("instance", "")).is_dir(),
+      "which is, again, exactly the directory its relay state lives in")
+worker.stop()
+
+# A name outside the grammar is refused rather than mangled — two instances
+# quietly sharing one sanitised name would share one journal. It is reported
+# *before* the missing credential: a setting that is wrong outranks one that is
+# absent, and hearing about the token first cost the operator a second run to
+# find out about the name.
+worker = Worker(**{"AGENT_CONNECT_INSTANCE": "two words/here",
+                   "AGENT_CONNECT_TOKEN": ""})
+doc = worker.wait_for(ERROR)
+check(doc.get("state") == ERROR and "AGENT_CONNECT_INSTANCE" in (doc.get("detail") or ""),
+      "a Worker with a mistyped instance name and no token at all is told "
+      "about the name, which is the one that is wrong")
+worker.stop()
 
 
 print("\n-- an ending that is a number is not an explanation --")

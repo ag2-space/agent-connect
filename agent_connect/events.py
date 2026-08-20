@@ -46,7 +46,7 @@ class Attachment:
     The Relay Client resolves the wire's media markers and downloads whatever
     someone attached *before* the Task is delivered, so `locator` is a local
     path and nothing on this side of the boundary fetches anything over the
-    network. Everything else here is what the transport was *told* about the
+    network. Everything else here is what the Relay Client was *told* about the
     file by the platform it came from: `mime` and `filename` are labels, not
     facts, and neither decides what bytes are read.
 

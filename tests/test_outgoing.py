@@ -186,7 +186,7 @@ def answers(text):
 
 
 def workspace():
-    """A repo the agent works in and a results dir the transport reads."""
+    """A repo the agent works in and a results dir the Relay Client reads."""
     tmp = Path(tempfile.mkdtemp())
     repo, results = tmp / "repo", tmp / "results"
     for d in (repo, results):
@@ -467,7 +467,7 @@ check(named == [(results / "outgoing" / "already.txt").resolve()],
       "a file already in the outgoing directory is left where it is, not copied")
 check(len(list(results.rglob("already*.txt"))) == 1, "so there is one of it, not two")
 
-# Markers, recognised the way the transport recognises them.
+# Markers, recognised the way the Relay Client recognises them.
 check(carries_files("see [send: /x] here") and carries_files("[attach: /x]")
       and carries_files("[file: /x]"),
       "all three spellings the delivery path reads are read here too")
@@ -476,7 +476,7 @@ check(not carries_files("no files here") and not carries_files(""),
 check(Delivery(text="hi").asked is False and Delivery(refused=("x",)).asked is True,
       "a Turn asked to send something even when nothing went")
 
-# Staged copies do not accumulate for ever in a directory the transport trusts.
+# Staged copies do not accumulate for ever in a directory the Relay Client trusts.
 old = results / outgoing.STAGING / "task-ancient"
 old.mkdir(parents=True)
 (old / "leftover.txt").write_text("stale")
@@ -535,11 +535,11 @@ check(not sent.uploads, "nothing is uploaded")
 check("/etc/hosts" in sent.posted and "not be sent" in sent.posted,
       "and the room is told, by name, in the reply it did get")
 check("[attachment not sent" not in sent.posted,
-      "the transport never has to refuse it: the Worker did not offer it one")
+      "the Relay Client never has to refuse it: the Worker did not offer it one")
 
 print("\n-- another Task's archived reply is not a file this Task may send --")
 
-# The results directory is the transport's own sendable root, and it holds every
+# The results directory is the Relay Client's own sendable root, and it holds every
 # other Task's archived answer. Only the *staging* subdirectory inside it is the
 # permitted area, or one room could ask for another room's reply by name and the
 # allowlist — which trusts that directory — could not tell the difference.

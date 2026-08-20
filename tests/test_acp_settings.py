@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
+import ast
 import re
 from pathlib import Path
 
@@ -70,8 +71,11 @@ check("AGENT_CONNECT_ACP_BRIDGE_SPEC" in section,
       "the installer-only bridge-spec override is documented in the same place")
 
 # The old second list is gone rather than left to rot: worker.py must not carry
-# an `Env:` block of its own again.
-worker_doc = (HERE / "agent_connect" / "worker.py").read_text()[:2000]
+# an `Env:` block of its own again. Read as the docstring rather than as the
+# first two thousand characters of the file, which made an edit to a *different*
+# paragraph able to fail this by pushing the pointer past the cut.
+worker_doc = ast.get_docstring(
+    ast.parse((HERE / "agent_connect" / "worker.py").read_text())) or ""
 check("Env:" not in worker_doc,
       "worker.py no longer keeps a rival list of environment variables")
 check("README.md" in worker_doc,

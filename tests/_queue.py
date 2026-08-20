@@ -30,7 +30,9 @@ from typing import Optional
 
 import _bootstrap
 from ag2_relay_client import Task
+from ag2_relay_client.client import STOP_JOIN_S, _error_code
 from ag2_relay_client.envelope import parse_task
+from ag2_relay_client.state import valid_wire_id
 
 #: A credential a child Worker can be started with. Combined and well-formed —
 #: the onboarding token carries its own gateway and the library has no default
@@ -90,10 +92,16 @@ def task(task_id: str, body: str = "do it", room: str = "", tier: str = "owner",
 class FakeClient:
     """The Relay Client's consumer surface, in memory.
 
-    Records what it was told rather than posting it, and refuses what the real
-    one refuses: an empty result body is "not ready", not an answer (H5), and a
-    test that let one through would be testing a `complete` the library would
-    have raised on.
+    Records what it was told rather than posting it, and **refuses what the real
+    one refuses**: an empty result body is "not ready", not an answer (H5), and
+    an id that is not a broker task id is refused at egress as well as at intake
+    (F8). A fixture that accepts what the real client raises on is a test that
+    proves nothing, so the checks are not reimplemented here — the library's own
+    `valid_wire_id` and `_error_code` are imported, and the join default is read
+    off `STOP_JOIN_S` rather than written down a second time. Each of those was
+    drift: this file said `40.0` for a default the library had moved to `5.0`,
+    took ids the real client rejects, and recorded a reject reason raw where the
+    real one coerces it to an error code.
     """
 
     def __init__(self):
@@ -106,6 +114,8 @@ class FakeClient:
         self.hook = None
         self.started = 0
         self.stopped = 0
+        #: The `timeout=` of every `stop` this client was asked for.
+        self.stop_timeouts: list = []
 
     # -- what a test does to it ---------------------------------------------
 
@@ -140,7 +150,10 @@ class FakeClient:
         self.started += 1
         return self
 
-    def stop(self, timeout: float = 40.0) -> None:
+    def stop(self, timeout: float = STOP_JOIN_S) -> None:
+        #: What the Worker asked for, so a test can assert it waited long enough
+        #: to be able to release the singleton guard.
+        self.stop_timeouts.append(timeout)
         self.stopped += 1
 
     def next_task(self, timeout=None):
@@ -150,17 +163,28 @@ class FakeClient:
             return None
 
     def complete(self, broker_id: str, body: str) -> None:
+        wire_id = self._wire_id(broker_id)
         if not isinstance(body, str) or not body.strip():
-            raise ValueError(f"refusing an empty result for {broker_id}")
-        self.completed.append((broker_id, body))
+            raise ValueError(f"refusing an empty result for {wire_id}")
+        self.completed.append((wire_id, body))
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:
-        self.rejected.append((broker_id, reason))
+        # Coerced, as the real one coerces it: free text degrades to the schema
+        # code rather than travelling to the broker as one.
+        self.rejected.append((self._wire_id(broker_id), _error_code(reason)))
 
     def on_status(self, hook) -> None:
         self.hook = hook
 
     def snapshot(self) -> dict:
         return {"state": "connected", "connected": True, "gateway": "",
-                "last_ok_ts": 0.0, "backoff_s": 0.0, "error": None,
+                "last_ok_ts": 0.0, "backoff_s": 0.0, "recheck_s": 0.0,
+                "acks_paused_s": 0.0, "singleton": "held", "error": None,
                 "inflight": 0, "pending_results": 0, "updated_ts": 0.0}
+
+    @staticmethod
+    def _wire_id(broker_id) -> str:
+        """The real client's egress check, borrowed rather than imitated."""
+        if not isinstance(broker_id, str) or not valid_wire_id(broker_id):
+            raise ValueError(f"not a broker task id: {broker_id!r:.80}")
+        return broker_id

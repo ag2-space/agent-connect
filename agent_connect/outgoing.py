@@ -10,7 +10,7 @@ a yes to the second, so the guards are not shared and neither is the module.
 
 Files do not go out because the Worker uploads them. They go out because they are
 placed in the **outgoing result directory** and named by a marker in the result
-body, and the transport does the rest. That route is not ours to choose — it is
+body, and the Relay Client does the rest. That route is not ours to choose — it is
 the relay client's, read from its own source rather than invented here:
 
 * `ag2_sparrow/result_markers.py` recognises `[file: <path>]`, `[send: <path>]`
@@ -32,7 +32,7 @@ close: a chat message that can name any path becomes a chat message that can tak
 any file off the machine. Owner-tier restriction narrows who can try it; it does
 not close it, because the owner in a room is not necessarily the person sitting
 at this keyboard. So the only thing this module does is **stage** a file into the
-directory the allowlist already trusts, and let the transport decide at its own
+directory the allowlist already trusts, and let the Relay Client decide at its own
 sink. If sending from somewhere else is ever wanted, the extension mechanism is
 `register_extra_roots()`, not a second route.
 
@@ -61,10 +61,10 @@ Everything else here is the same shape as the incoming side: resolve before
 judging, judge the **open descriptor** rather than the path, refuse anything that
 is not a regular file, and bound the size (`AGENT_CONNECT_OUTGOING_MAX_BYTES`,
 defaulting to the relay's own 25 MB upload cap so the refusal arrives here, with
-a sentence, instead of at the transport with a log line).
+a sentence, instead of at the Relay Client with a log line).
 
 Staged copies live under `<results>/outgoing/<task id>/` and are swept after a
-day: they sit in a directory the transport trusts, so leaving them there for ever
+day: they sit in a directory the Relay Client trusts, so leaving them there for ever
 would slowly turn a delivery mechanism into a store of sendable files.
 """
 from __future__ import annotations
@@ -102,7 +102,7 @@ STAGING = "outgoing"
 #: The delivery path's marker, exactly as `ag2_sparrow/result_markers.py` reads
 #: it: three spellings, anywhere in the body, case-sensitive, `]`-terminated.
 #: Ours is the same expression so that what this module recognises and what the
-#: transport recognises cannot drift apart.
+#: Relay Client recognises cannot drift apart.
 MARKER = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
 
 #: Which of the three spellings we *write*. Any of them would do; one of them

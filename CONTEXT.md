@@ -41,9 +41,16 @@ _Avoid_: driver, plugin, connector, integration
 **Relay Client**:
 What speaks to the broker over HTTP on behalf of one Agent Identity: pulls Tasks,
 acknowledges them, returns results, sends heartbeats, and performs [[Room Op]]s. It is
-the Worker's own — the transport is not a separate process. Contrast [[Room Op]], which
-names the *action*; this names the *speaker*.
+the Worker's own — a library this repository owns and this process runs, not a separate
+process. Contrast [[Room Op]], which names the *action*; this names the *speaker*.
 _Avoid_: bridge, gateway, sparrow, transport
+
+> **On "transport".** It is on the avoid list as a name for *this* — "the transport"
+> meaning the Relay Client — because it names a layer where the thing is a component,
+> and it reads as a foreign process, which this stopped being. The word is still the
+> right one for a layer that really is one: another protocol's (ACP's stdio transport,
+> base64 as a transport encoding), and the seam between this package and the library,
+> which the tickets that built it are named after.
 
 **Agent Identity**:
 The addressable participant an AG2 Space room mentions (`!codex …`). It is issued in

@@ -3,7 +3,7 @@
 Two halves. The first is the header format — the one-line JSON array
 `ag2-sparrow`'s `format_attachments` used to write — decoded the way its own
 `parse_attachments` decoded it, tolerantly. **No such header reaches the Worker
-any more**: the transport is a library in-process, it resolves the wire's media
+any more**: the Relay Client is a library in-process, it resolves the wire's media
 markers itself and delivers local paths, and transport-seam ticket 08 is where
 this parser goes with the header it read. It is kept and tested until then
 because deleting a decoder and its replacement in one change leaves nothing to

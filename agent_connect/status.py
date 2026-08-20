@@ -5,11 +5,11 @@ Anything watching a Worker — the desktop supervisor's badge first, an operator
 last, and whether it is still alive. None of those are answerable from outside.
 A process table says a PID exists, not that it is serving; a task queue says
 work arrived, not that anything is reading it; and asking the relay would make
-every observer a client of the transport, which is exactly the coupling that
-would have to be rebuilt the next time the transport changes.
+every observer a client of the Relay Client, which is exactly the coupling that
+would have to be rebuilt the next time the wire changes.
 
 So each Worker writes a small JSON file at a documented path and keeps it
-current. The file is the contract; the transport underneath it is not.
+current. The file is the contract; the Relay Client underneath it is not.
 
 ## The file
 
@@ -24,7 +24,7 @@ current. The file is the contract; the transport underneath it is not.
       "agent": "acp: Claude Code 2.1.0",
       "repo": "/Users/me/agents",
       "workspace": "/Users/me/.agent-connect/workspace",
-      "instance": "scratch",           // AGENT_CONNECT_INSTANCE, or ""
+      "instance": "scratch",           // AGENT_CONNECT_INSTANCE, or "default"
       "tasks_running": 0,
       "oldest_task_seconds": 0.0,      // age of the longest-running Turn
       "started_at": 1755600000.0,      // unix seconds, this process's start
@@ -32,13 +32,20 @@ current. The file is the contract; the transport underneath it is not.
       "uptime_seconds": 123.0,         // monotonic, immune to clock steps
       "heartbeat_seconds": 15.0,
       "last_error": {"at": 1755600100.0, "message": "..."} | null,
-      "relay": {                       // the transport, or null before it starts
+      "relay": {                       // the Relay Client, or null before it starts
         "state": "connected",          // connected | reconnecting | auth-wait
-                                       // | fatal | stopped
+                                       // | fatal | standby | displaced | stopped
         "connected": true,
         "gateway": "https://chat.ag2.space/relay",   // redacted by the library
         "last_ok_ts": 1755600120.0,    // unix seconds of the last healthy poll
-        "backoff_s": 0.0,
+        "backoff_s": 0.0,              // waiting because something FAILED
+        "recheck_s": 0.0,              // waiting because another poller holds
+                                       // the bearer — a standby, not an outage
+        "acks_paused_s": 0.0,          // seconds left of the ack cooldown:
+                                       // non-zero means leases are being
+                                       // requeued under running Turns
+        "singleton": "held",           // the poller guard's verdict: held |
+                                       // lost | degraded | idle | off
         "error": null,
         "inflight": 0,                 // Tasks accepted and not yet answered
         "pending_results": 0,          // answers written and not yet POSTed
@@ -50,7 +57,7 @@ current. The file is the contract; the transport underneath it is not.
 
 `state`, `adapter`, `agent` and `repo` are the Worker's own account of itself:
 what is configured, and whether the Local Agent behind the Agent Identity
-answered its preflight. `relay` is the transport's, copied out of the Relay
+answered its preflight. `relay` is the connection's, copied out of the Relay
 Client's status snapshot through the change hook it offers — the library also
 writes its own connection-only file under its state dir, so observability
 survives a consumer that never reads the hook, and this block is the richer
@@ -66,14 +73,15 @@ defeat staleness, after `AGENT_CONNECT_POLL` and the missing beat before
 `serving`. So the hook rewrites the document with the new connection facts and
 leaves both clocks exactly where the last beat left them. The block carries the
 library's own `updated_ts` instead, so a reader who wants to know whether the
-*transport's* view is current has it without borrowing this file's clock.
+*Relay Client's* view is current has it without borrowing this file's clock.
 
 **One file per instance.** The path hangs off the workspace, and a workspace
 belongs to exactly one Worker (`README.md` § Running more than one agent on one
 machine), so N instances write N status files without being told to. `instance`
-carries `AGENT_CONNECT_INSTANCE` — the name whoever started this Worker gave it
-— so a supervisor can match its own N rows to the N files it is reading without
-having to recognise a workspace path.
+carries `AGENT_CONNECT_INSTANCE` — the name whoever started this Worker gave it,
+or `default` when nobody did, which is also the directory component the Relay
+Client's state lives under — so a supervisor can match its own N rows to the N
+files it is reading without having to recognise a workspace path.
 
 **Freshness is stated, not assumed.** `updated_at` is refreshed every
 `heartbeat_seconds / 2` while the Worker is running, and the file carries that
@@ -135,6 +143,13 @@ STATUS_ENV = "AGENT_CONNECT_STATUS_FILE"
 HEARTBEAT_ENV = "AGENT_CONNECT_STATUS_HEARTBEAT"
 INSTANCE_ENV = "AGENT_CONNECT_INSTANCE"
 
+#: What a Worker nobody named is called. Written into the document rather than
+#: `""`, because the name is also the directory component the Relay Client's
+#: state lives under (`<workspace>/relay/default/`) — a supervisor reading `""`
+#: has a name it cannot map onto anything on disk. `agent_connect.relay` reads
+#: it from here, and checks it against the grammar the library enforces.
+DEFAULT_INSTANCE = "default"
+
 #: The file, under the workspace the Worker already has.
 STATUS_NAME = "status.json"
 
@@ -164,9 +179,15 @@ VERSION = 1
 #: whole of it. A projection rather than the snapshot itself: this file is a
 #: service contract with an outside reader, and a block that silently gained
 #: whatever the library added next would be a contract nobody wrote down. A
-#: field the library grows and this file should carry is a line added here.
+#: field the library grows and this file should carry is a line added here —
+#: a promise that was not kept when `recheck_s`, `acks_paused_s` and
+#: `singleton` arrived, so
+#: `test_worker_queue.py` now fails when the two lists drift apart instead of
+#: leaving it to somebody to remember. Everything the snapshot carries is here
+#: except `instance`, which this document already says under its own name.
 RELAY_FIELDS = ("state", "connected", "gateway", "last_ok_ts", "backoff_s",
-                "error", "inflight", "pending_results", "updated_ts")
+                "recheck_s", "acks_paused_s", "singleton", "error", "inflight",
+                "pending_results", "updated_ts")
 
 
 def status_path(env: Optional[Mapping[str, str]] = None) -> Path:
@@ -272,10 +293,10 @@ class StatusFile:
             "tasks_running": 0,
             "oldest_task_seconds": 0.0,
             "last_error": None,
-            #: Null until the transport is constructed. "No relay block" and "a
+            #: Null until the Relay Client is constructed. "No relay block" and "a
             #: relay block saying reconnecting" are different facts, and a
             #: reader that could not tell them apart would report a Worker with
-            #: no transport at all as one that is merely offline.
+            #: no Relay Client at all as one that is merely offline.
             "relay": None,
         }
 
@@ -303,7 +324,7 @@ class StatusFile:
             self._write(ERROR, detail=str(message), **facts)
 
     def relay(self, snapshot: Optional[Mapping] = None) -> None:
-        """The transport's connection state, as the library just reported it.
+        """The Relay Client's connection state, as the library just reported it.
 
         Written for `RelayClient.on_status`, and called from the library's poll
         thread — so it says nothing about the Worker's own state and does not
@@ -360,7 +381,7 @@ class StatusFile:
             if beat:
                 # The two clocks advance together, and only for a writer that
                 # is the Worker itself. `beat=False` is the status hook, which
-                # runs on the transport's thread and has nothing to say about
+                # runs on the Relay Client's thread and has nothing to say about
                 # whether this process's event loop is still turning.
                 self._doc["updated_at"] = self._clock()
                 self._doc["uptime_seconds"] = self._monotonic() - self._booted
@@ -383,8 +404,15 @@ class StatusFile:
 
 
 def from_env(env: Optional[Mapping[str, str]] = None) -> StatusFile:
-    """The status file this Worker owns, at the documented path."""
+    """The status file this Worker owns, at the documented path.
+
+    The instance is written as the Worker is actually known — the name that was
+    given, or `default`, which is the one the Relay Client's state directory is
+    spelled with. An unnamed Worker used to write `""` here while its state sat
+    in `<workspace>/relay/default/`, and a supervisor holding `""` could not map
+    the file onto the directory.
+    """
     env = os.environ if env is None else env
     status = StatusFile(status_path(env), heartbeat_seconds(env))
-    status._doc["instance"] = instance_name(env)
+    status._doc["instance"] = instance_name(env) or DEFAULT_INSTANCE
     return status

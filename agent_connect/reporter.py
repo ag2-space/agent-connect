@@ -192,7 +192,7 @@ class TurnReporter:
         self.ops = ops
         self.settings = settings or LadderSettings()
         self._clock = clock
-        #: Where a file the agent produced is staged so the transport's send
+        #: Where a file the agent produced is staged so the Relay Client's send
         #: allowlist can see it. Built on demand, because a Turn that names no
         #: file must not touch the filesystem to find that out.
         self.outbox = outbox
@@ -345,7 +345,7 @@ class TurnReporter:
 
         The Worker never uploads anything itself: a file leaves this machine by
         being placed in the outgoing result directory, which is the one place the
-        transport's send allowlist trusts. See `agent_connect.outgoing` for why
+        Relay Client's send allowlist trusts. See `agent_connect.outgoing` for why
         the route matters more than the feature.
         """
         if not carries_files(answer):

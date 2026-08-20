@@ -1,6 +1,6 @@
 """The Relay Client, built from this Worker's settings.
 
-The transport is no longer a foreign process writing files into a directory —
+The Relay Client is no longer a foreign process writing files into a directory —
 it is a library this repository owns, running inside the Worker
 (`docs/adr/0001` in the workspace: *agent-connect owns its Relay Client*). This
 module is the whole of the wiring between the two: it turns the settings an
@@ -14,9 +14,10 @@ construction facts the library asks for and cannot guess:
 
 * **the credential**, which carries its own gateway. The onboarding token is the
   combined `https://gateway|secret` form, and the split belongs to the library
-  (`ag2_relay_client.credentials`) — the naive literal-`|` split that
-  `roomops.py` still carries is the fourth copy of that parse in this workspace,
-  and transport-seam ticket 09 is where it dissolves.
+  (`ag2_relay_client.credentials`). `roomops.py` used to carry a naive
+  literal-`|` copy of that parse *and* a different precedence for the gateway,
+  which is how one process ended up speaking to two of them; it now asks the
+  library, and transport-seam ticket 09 is where the module itself dissolves.
 * **the state directory**, `<workspace>/relay/`. It hangs off the workspace
   because everything else the Worker owns on disk already does, and because a
   Worker's durable state should not need a setting of its own to be found. The
@@ -45,12 +46,18 @@ from typing import Mapping, Optional
 from ag2_relay_client import RelayClient, TokenSource
 from ag2_relay_client.state import valid_instance_name
 
+from .status import DEFAULT_INSTANCE as status_default_instance
 from .status import INSTANCE_ENV, instance_name
 
 #: The token an operator gets from the Agent Portal. `REMOTE_TASK_TOKEN` is the
 #: name the old two-process launcher exported for the relay client's own
 #: process, and it is still accepted: one credential, under either name it has
 #: ever had, so an existing install keeps working across the swap.
+#:
+#: The documented name wins where both are set. It used to be the other way
+#: round, which meant a `REMOTE_TASK_TOKEN` left in an old launchd plist
+#: silently outranked a freshly rotated `AGENT_CONNECT_TOKEN` — the setting
+#: README calls *the* setting losing to the one it calls "the old name".
 TOKEN_ENV = "AGENT_CONNECT_TOKEN"
 LEGACY_TOKEN_ENV = "REMOTE_TASK_TOKEN"
 
@@ -62,16 +69,22 @@ URL_ENV = "REMOTE_TASK_URL"
 #: The library's state, under the workspace the Worker already owns.
 STATE_NAME = "relay"
 
-#: The instance name used when the operator named none. It is the library's own
-#: default too, and it is a real name rather than an empty string because it
-#: becomes a directory component.
-DEFAULT_INSTANCE = "default"
+#: The instance name used when the operator named none. Defined beside the
+#: setting that carries it (`status.DEFAULT_INSTANCE`) so the status file and
+#: the state directory cannot disagree about what an unnamed Worker is called;
+#: it is a real name rather than an empty string because it becomes a directory
+#: component, and it is the library's own default too.
+DEFAULT_INSTANCE = status_default_instance
 
 
 def token(env: Optional[Mapping[str, str]] = None) -> str:
-    """The onboarding token as written, under either of its names."""
+    """The onboarding token as written, under either of its names.
+
+    The **one** reader of the credential in this package: `roomops.py` asks here
+    too, so the Ladder and the wire cannot end up holding two different bearers.
+    """
     env = os.environ if env is None else env
-    return (env.get(LEGACY_TOKEN_ENV) or env.get(TOKEN_ENV) or "").strip()
+    return (env.get(TOKEN_ENV) or env.get(LEGACY_TOKEN_ENV) or "").strip()
 
 
 def state_dir(workspace: Path) -> Path:
@@ -87,6 +100,11 @@ def instance(env: Optional[Mapping[str, str]] = None) -> str:
     so it has a grammar, and a name outside it is refused rather than mangled:
     two instances quietly sharing one sanitised name would share one journal,
     which is the failure this namespacing exists to prevent.
+
+    The grammar lives here because this is where the library that enforces it is
+    imported. `worker.main` asks before it asks for anything else, so a name it
+    would refuse is refused while the operator is still reading the first error
+    rather than after they have fixed a second one.
     """
     name = instance_name(env)
     if not name:

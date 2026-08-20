@@ -511,12 +511,35 @@ check(made.url == "https://chat.ag2.space/relay",
 combined = room_ops_from_env({"REMOTE_TASK_TOKEN": "https://relay.example|s3cret"})
 check(combined.url == "https://relay.example" and combined.token == "s3cret",
       "the combined onboarding token carries its own gateway")
-explicit = room_ops_from_env(
-    {"REMOTE_TASK_TOKEN": "https://relay.example|s3cret",
+check(room_ops_from_env({"AGENT_CONNECT_TOKEN": "https://relay.example%7Cs3cret"}).token
+      == "s3cret",
+      "including when the separator is written the encoded way — the split is "
+      "the library's, so it means here what it means on the wire")
+
+# One process, one gateway. The Ladder and the wire read the same credential and
+# resolve it the same way: the URL that travels *with* a combined token is the
+# one it belongs to, and `REMOTE_TASK_URL` is for a bare secret that carries
+# none. This side used to let the environment outrank the token, which put the
+# room ops on one gateway and every Task on another, with a log line about it.
+elsewhere = room_ops_from_env(
+    {"AGENT_CONNECT_TOKEN": "https://relay.example|s3cret",
      "REMOTE_TASK_URL": "https://other.example/relay/"}
 )
-check(explicit.url == "https://other.example/relay",
-      "an explicit REMOTE_TASK_URL wins, trailing slash and all")
+check(elsewhere.url == "https://relay.example",
+      "a combined token's own gateway outranks REMOTE_TASK_URL, exactly as it "
+      "does for the client that pulls the Tasks")
+check(room_ops_from_env({"AGENT_CONNECT_TOKEN": "s3cret",
+                         "REMOTE_TASK_URL": "https://other.example/relay/"}).url
+      == "https://other.example/relay",
+      "and a bare secret is what REMOTE_TASK_URL is for, trailing slash and all")
+
+# F6: the documented name outranks the one README calls "the old name". A
+# `REMOTE_TASK_TOKEN` left behind in a launchd plist used to beat a token the
+# operator had just rotated, silently.
+both = room_ops_from_env({"REMOTE_TASK_TOKEN": "https://old.example|stale",
+                          "AGENT_CONNECT_TOKEN": "https://new.example|fresh"})
+check((both.token, both.url) == ("fresh", "https://new.example"),
+      "AGENT_CONNECT_TOKEN wins over the legacy name where both are set")
 
 print("\n" + ("PASS — the Ladder green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

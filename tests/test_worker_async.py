@@ -336,6 +336,116 @@ check(answered == "ok" and client.answer("e3") == "ok",
 check(len(client.completed) + len(client.rejected) == 3,
       "three Tasks off the queue, three answers to the broker — no silent drops")
 
+# An upload with no caption is not an empty Task. Element sends `caption ==
+# filename` for one, so the body the broker forwards is only a media marker,
+# and the library empties such a body by design — "the attachment tuple is
+# where that task's content is". Judged on the body alone it reads as empty,
+# and empty is *terminal*: the broker parks it, posts a failure notice, and no
+# retry can recover it, for a screenshot somebody dropped into a room.
+results = workspace()
+client = FakeClient()
+shot = task("e4", "", attachments=(ev.Attachment(
+    locator="/tmp/nothing/Screenshot.png", filename="Screenshot.png",
+    mime="image/png"),))
+looked = NativeStub()
+body = asyncio.run(handle_one(shot, looked, "/repo", results, client=client))
+check(client.refusal("e4") is None,
+      "a Task carrying a file is never dead-lettered for having no words in it")
+check(client.answer("e4") == body and body,
+      "it is completed, like any other Task")
+check(len(looked.seen) == 1 and "Screenshot.png" in looked.seen[0].prompt,
+      "the Adapter is asked about the file by name — an upload with no caption "
+      "is still a question, and this is the only place that knows what it is")
+check(looked.seen and looked.seen[0].attachments == shot.attachments,
+      "and the file travels beside the prompt, never folded into it")
+
+still_empty = task("e5", "")
+asyncio.run(handle_one(still_empty, looked, "/repo", results, client=client))
+check(client.refusal("e5") == EMPTY_TASK,
+      "a Task with neither text nor files is still the reject — emptiness is "
+      "judged on both, and `reject` stays reserved for genuinely nothing")
+
+
+# -- a cancelled Turn answers neither, on purpose --------------------------------
+
+# `CancelledError` is a `BaseException`, so it goes straight through the guard
+# that turns a failure into a body — and it must. On a stop, `asyncio.run`
+# cancels every Turn in flight; an id left accepted-and-unanswered is re-served
+# by the broker and re-executed, which is right for work that never finished,
+# while a `reject` would be terminal for a Task whose only problem was that the
+# Worker was asked to stop.
+results = workspace()
+client = FakeClient()
+
+
+class Wedged:
+    """An Adapter that never finishes, so its Turn can be cancelled mid-flight."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+
+    async def turn(self, ctx):
+        self.entered.set()
+        await asyncio.sleep(30)
+        yield Done(text="never said")
+
+
+async def _cancelled():
+    adapter = Wedged()
+    fut = asyncio.ensure_future(
+        handle_one(task("c9", "take your time", room="!c:ag2.space"), adapter,
+                   "/repo", results, client=client))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if adapter.entered.is_set():
+            break
+    fut.cancel()
+    try:
+        await fut
+    except asyncio.CancelledError:
+        return "cancelled"
+    return "finished"
+
+
+check(asyncio.run(_cancelled()) == "cancelled",
+      "a cancelled Turn leaves through the cancellation, not through an answer")
+check(not client.completed and not client.rejected,
+      "nothing is said to the broker for it: the id stays accepted-unanswered, "
+      "the broker re-serves it, and it runs again — which is what unanswered "
+      "work is supposed to do")
+
+# And the answer that was in flight when the stop came does not hold the process
+# open. `asyncio.run` shuts the default executor down by joining every thread in
+# it, so an answer sent with `asyncio.to_thread` kept the interpreter alive for
+# the whole of a `complete` — which the library bounds at its drain-lock wait
+# plus its result budget, near a minute, against a launchd that kills at twenty
+# seconds. Nothing is lost by not waiting: the library journals a result before
+# it POSTs it, and re-POSTs what is owed on the next run.
+class Sluggish(FakeClient):
+    def complete(self, broker_id, body):
+        time.sleep(1.0)
+        super().complete(broker_id, body)
+
+
+async def _answering_at_the_stop():
+    fut = asyncio.ensure_future(
+        handle_one(task("s1", "quick", room="!s:ag2.space"), NativeStub(),
+                   "/repo", workspace(), client=Sluggish()))
+    await asyncio.sleep(0.15)                # the answer is on its thread now
+    fut.cancel()                             # what the teardown does on SIGTERM
+    try:
+        await fut
+    except asyncio.CancelledError:
+        pass
+
+
+began = time.monotonic()
+asyncio.run(_answering_at_the_stop())
+took = time.monotonic() - began
+check(took < 0.6,
+      f"a stop in the middle of answering returns at once ({took:.2f}s), rather "
+      f"than holding the process for the length of the answer's POST")
+
 
 # -- the drain loop keeps going -----------------------------------------------
 
@@ -360,6 +470,38 @@ check(asyncio.run(_drain()), "the drain loop survives a Task that raised")
 check(client.answer("l2") == "ok", "the drain loop answered the healthy Task")
 check(client.answer("l1") == "agent-connect: worker error: adapter blew up",
       "and answered the one that raised, instead of leaving its lease to expire")
+
+
+# -- but a Worker that cannot be given work does not go on saying it is serving --
+
+# The queue reader is the Worker's only inlet, and it used to catch exactly one
+# exception — the `RuntimeError` its handover raises against a closed loop.
+# Anything raised by the queue read itself ended the thread in silence, after which the
+# Worker reported `serving`, beat for ever with `tasks_running: 0`, and received
+# nothing: alive by every measure anybody has, and no longer an agent.
+class Unreadable(FakeClient):
+    def next_task(self, timeout=None):
+        raise OSError("the queue went away")
+
+
+async def _dead_reader():
+    try:
+        await asyncio.wait_for(
+            serve(NativeStub(), "/repo", workspace(), Unreadable(), 0.01), 5.0)
+    except asyncio.TimeoutError:
+        return "still serving, receiving nothing"
+    except RuntimeError as exc:
+        return str(exc)
+    return "returned"
+
+
+ended = asyncio.run(_dead_reader())
+check("the queue reader stopped" in ended,
+      "a queue read that raised takes the drain loop down with it, so the "
+      "status file gets an `error` and a service manager restarts something "
+      "that can actually be given work")
+check("the queue went away" in ended,
+      "carrying what actually happened, because nothing else saw it")
 
 print("\n" + ("PASS — async adapter contract green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

@@ -2,7 +2,7 @@
 
 Drains the Relay Client's Task queue, runs the configured Adapter on each Task,
 and answers it — `complete` with what the Local Agent produced, `reject` for a
-Task nothing could ever answer. The transport is a library this repository owns
+Task nothing could ever answer. The Relay Client is a library this repository owns
 and this process runs (workspace `docs/adr/0001`); everything the wire knows is
 below `agent_connect.relay`, and everything above it — Sessions, the Ladder, the
 Sandbox, ACP — is here.
@@ -16,12 +16,14 @@ the library re-*completes* a redelivery instead, and a Task never reaches this
 module twice.
 
 **The library is sync and threaded; this side is asyncio.** Every call across
-that seam runs on a thread rather than on the event loop: the queue read on a
-daemon thread of its own, `complete` and `reject` on the default executor. That
-is not tidiness. Cadence is a correctness property on the other side of the seam
-— a poll thread that stops polling loses its leases and its work comes back as
-duplicate delivery — and a blocked event loop up here is a `complete` that never
-happens down there.
+that seam runs on a **daemon thread** rather than on the event loop or on the
+default executor: the queue read on one of its own, `complete` and `reject` on
+one apiece. Cadence is a correctness property on the other side of the seam — a
+poll thread that stops polling loses its leases — and a blocked event loop up
+here is a `complete` that never happens down there. The daemon part is the same
+argument at shutdown: `asyncio.run` joins every thread of the default executor
+on its way out, so one answer in flight would hold the process open past the
+point a service manager stops waiting and starts killing.
 
 Tasks are processed **concurrently across rooms** and serialised within one
 Session: a ten-minute request in one room no longer silences every other room,
@@ -45,6 +47,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from . import attachments as att
 from . import relay as relay_client
 from .adapters import get as get_adapter
 from .config import CONFIG_ENV, DEFAULT_PATH, ConfigError
@@ -117,6 +120,12 @@ GUEST = "guest"
 #: it, stops re-serving it, and posts the terminal-failure notice itself.
 EMPTY_TASK = "EMPTY_TASK"
 
+#: What the Adapter is asked when a Task carries files and not one word of text.
+#: An upload with no caption is a question — "look at this" — and the Local Agent
+#: has to be told it is being asked one, because the files themselves arrive
+#: beside the prompt rather than in it.
+UNCAPTIONED = "(shared with no message of its own: {names})"
+
 
 def attested_tier(raw: str) -> str:
     """The Tier to act on, from the Tier the broker attested. Fails closed.
@@ -148,10 +157,57 @@ def task_attachments(task) -> Tuple[Attachment, ...]:
 
     Tolerant of a library that has not grown the tuple yet: transport-seam
     ticket 03 is media ingress and ticket 08 is where `agent_connect.attachments`
-    stops parsing and starts consuming these directly. Until both land, a Task
-    carries none and a Turn sees none.
+    stops parsing and starts consuming these directly. A library without the
+    tuple delivers a Task that carries none, and a Turn sees none.
     """
-    return tuple(getattr(task, "attachments", ()) or ())
+    return tuple(_as_attachment(one)
+                 for one in (getattr(task, "attachments", ()) or ()))
+
+
+def _as_attachment(one) -> Attachment:
+    """One delivered attachment, in the words the Adapter boundary uses.
+
+    The Relay Client resolves a marker into an attachment of its own — `path`,
+    `name`, and an `ok`/`reason` pair for a fetch that did not happen — and the
+    boundary's vocabulary calls the same two facts `locator` and `filename`.
+    They are the same file under different names, so the rename happens here,
+    once, instead of in every Adapter: without it `attachments.label` reads a
+    field that is not there and a Turn carrying any file at all dies as a
+    "worker error" the person cannot act on.
+
+    A fetch that failed carries no path, and an Attachment with no locator is
+    already what the Adapters report as unreadable — the room is told, in their
+    words rather than the library's. Carrying the library's own sentence for
+    *why* across this seam is ticket 08's, with the rest of the ingress.
+    """
+    if isinstance(one, Attachment):
+        return one
+    return Attachment(
+        locator=getattr(one, "path", "") or "",
+        mime=getattr(one, "mime", "") or "",
+        filename=getattr(one, "name", "") or "",
+        size=getattr(one, "size", 0) or 0,
+    )
+
+
+def uncaptioned_prompt(attachments) -> str:
+    """What a Task with files and no text asks, or `""` when it carries no files.
+
+    A caption-less upload from Element arrives as a body that was *only* a media
+    marker, and the library empties such a body by design — "the attachment
+    tuple is where that task's content is". Judged on the body alone that Task
+    reads as empty, and empty is terminal: `reject` dead-letters it, the broker
+    posts a failure notice, and someone who dropped a screenshot into a room is
+    told their message could never be answered while the Adapter never ran.
+
+    So emptiness is judged on the body **and** the files. A Task carrying files
+    has content, and this is the sentence that says so in band, naming them, in
+    the one place that knows both halves.
+    """
+    if not attachments:
+        return ""
+    return UNCAPTIONED.format(
+        names=", ".join(att.label(one) for one in attachments))
 
 
 def turn_context(task, repo: str) -> TurnContext:
@@ -170,10 +226,17 @@ def turn_context(task, repo: str) -> TurnContext:
     The room identifier is the broker's `channel_id`, which the library delivers
     as `room_id` — one name for one concept, the rename I1 asked for.
     `room_name` is the human label and is carried for display only.
+
+    **A Turn's content is the body and the files together.** A prompt is empty
+    here only when the Task carried nothing at all: an upload with no caption
+    arrives with an empty body and a file, and `uncaptioned_prompt` is what it
+    asks. Nothing is ever folded into a body someone typed — this is the case
+    where nobody typed one.
     """
     tier = attested_tier(task.access_tier)
+    attachments = task_attachments(task)
     return TurnContext(
-        prompt=(task.body or "").strip(),
+        prompt=(task.body or "").strip() or uncaptioned_prompt(attachments),
         task_id=task.id,
         room=task.room_id,
         room_name=task.room_name,
@@ -183,7 +246,7 @@ def turn_context(task, repo: str) -> TurnContext:
         source_message_id=task.source_message_id,
         sandbox=tier_to_sandbox(tier),
         cwd=repo,
-        attachments=task_attachments(task),
+        attachments=attachments,
     )
 
 
@@ -236,12 +299,16 @@ async def process_one(
 ) -> str:
     """Handle one delivered Task and return the body that answers it.
 
-    Returns `""` for a Task nothing could answer — an empty prompt, which is
-    also what a body that was *only* an unsigned metadata block degrades to
-    after the library quarantines it. `handle_one` turns that into the reject.
+    Returns `""` for a Task nothing could answer — no text *and* no files, which
+    is what a body that was only an unsigned metadata block degrades to after
+    the library quarantines it. `handle_one` turns that into the reject.
     Everything else comes back as a body: the answer, the terminal marker when
     the answer already went to the room up the Ladder, or the structured
     rejection when the Turn produced nothing to say.
+
+    An upload with no caption is emphatically not one of them: its body is empty
+    and its content is in the attachments, so `turn_context` gives it a prompt
+    that says so and the Turn runs like any other.
 
     `sessions` — when given — maps a Session key to the `SessionQueue` that
     keeps one Turn at a time open on it. Tasks with different keys never
@@ -258,7 +325,7 @@ async def process_one(
     if not ctx.prompt:
         return ""
     # The results directory is also the *outgoing* directory: it is the one place
-    # the transport's send allowlist trusts, so a file the agent produced leaves
+    # the Relay Client's send allowlist trusts, so a file the agent produced leaves
     # this machine by being staged there and named in the result body. The Worker
     # uploads nothing itself — see `agent_connect.outgoing`. Transport-seam
     # ticket 09 retires the staging airlock for the library's allowlisted-path
@@ -296,20 +363,30 @@ async def handle_one(
     That is the contract the library's seam is built on: it hands a Task over
     and waits to be told `complete` or `reject`, and an answer that is merely
     dropped is a lease left to expire, a redelivery, and eventually a
-    dead-letter five attempts later. So there is exactly one exit here, and it
-    is one of those two calls.
+    dead-letter five attempts later. So a Task that reaches the end of this
+    function has left through one of those two calls, and never both.
+
+    **Cancellation is the third exit, and it answers neither on purpose.**
+    `CancelledError` has been a `BaseException` since 3.8, so the guard below
+    does not catch it and must not: on a stop, `asyncio.run` cancels every Turn
+    in flight, and an id left accepted-and-unanswered is re-served by the broker
+    and re-executed — which is the correct outcome for work that never finished.
+    Answering it here would be worse in both directions: a `complete` would post
+    an answer nobody produced, and a `reject` is terminal for a Task whose only
+    problem was that the Worker was asked to stop.
 
     One Task failing is still one Task's problem: the failure becomes the body,
     so the person who asked hears something back rather than nothing, and the
     drain loop above keeps turning.
 
     A `reject` is reserved for input nothing could ever answer, which on this
-    side of the seam is one thing: a Task with no prompt in it. Re-serving that
-    produces the same nothing five times over, and the broker's dead-letter park
-    is where the protocol says it goes — this is the flow sparrow never
-    implemented and the reason the old code could only write `[no-send] empty
-    task` and hope. The broker posts the terminal-failure notice; the Worker
-    posts none, exactly as with the `TurnReporter`'s structured rejection.
+    side of the seam is one thing: a Task with neither text nor files in it.
+    Re-serving that produces the same nothing five times over, and the broker's
+    dead-letter park is where the protocol says it goes — this is the flow
+    sparrow never implemented and the reason the old code could only write
+    `[no-send] empty task` and hope. The broker posts the terminal-failure
+    notice; the Worker posts none, exactly as with the `TurnReporter`'s
+    structured rejection.
 
     `client` may be `None` — a test, or a caller driving one Task by hand — and
     then the answer travels back as the return value and nothing is told to any
@@ -318,34 +395,85 @@ async def handle_one(
     """
     try:
         body = await process_one(task, adapter, repo, results_dir, sessions, ops, settings)
+    except asyncio.CancelledError:
+        # Written out rather than left to the `Exception` guard's blind spot, so
+        # the third exit is visible where the other two are. Nothing is said to
+        # the broker: see above.
+        raise
     except Exception as e:  # noqa: BLE001 — never die on one bad task
         body = f"agent-connect: worker error: {e}"
     if not body.strip():
-        # Belt and braces: `process_one` returns "" only for an empty prompt,
-        # and the reporter's endings are never blank. A blank body would be
-        # refused by `complete` anyway (H5: an empty answer is "not ready", not
-        # an answer), so it must not be able to reach it.
+        # Belt and braces: `process_one` returns "" only for a Task with neither
+        # text nor files, and the reporter's endings are never blank. A blank
+        # body would be refused by `complete` anyway (H5: an empty answer is
+        # "not ready", not an answer), so it must not be able to reach it.
         await _answer(client, "reject", task.id, EMPTY_TASK)
         return ""
     await _answer(client, "complete", task.id, body)
     return body
 
 
+async def in_daemon_thread(call, *args):
+    """Await a blocking call on a thread that cannot outlive this process.
+
+    `asyncio.to_thread` would be the obvious way, and it is the wrong one here.
+    It runs on the loop's default executor, and `asyncio.run` shuts that
+    executor down on the way out by **joining every thread in it**: measured, a
+    SIGTERM during an eight-second call held the interpreter for 8.01 s after
+    the loop had finished. That is the shutdown hang the queue reader is a
+    daemon thread to avoid, and a `complete` can be inside it for the better
+    part of a minute (the library's drain-lock wait plus its result budget, with
+    a twenty-second POST able to start at the end of it).
+
+    Nothing is lost by not waiting. Everything this is used for is durable
+    before its network call — the library journals a result and then POSTs it,
+    and re-POSTs what is owed on the next run — so an abandoned thread costs a
+    round trip, not an answer.
+    """
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def hand_back(setter, value) -> None:
+        # The awaiting Turn may have been cancelled, and the loop may be closed
+        # — both mean nobody is waiting for this any more, and neither is worth
+        # a traceback on the way out.
+        if not done.cancelled():
+            setter(value)
+
+    def run() -> None:
+        try:
+            result = call(*args)
+        except BaseException as exc:  # noqa: BLE001 — carried, not swallowed
+            handed = (done.set_exception, exc)
+        else:
+            handed = (done.set_result, result)
+        try:
+            loop.call_soon_threadsafe(hand_back, *handed)
+        except RuntimeError:
+            pass                            # the loop closed; nobody is waiting
+
+    threading.Thread(target=run, name="agent-connect-answer", daemon=True).start()
+    return await done
+
+
 async def _answer(client, how: str, task_id: str, payload: str) -> None:
     """Tell the library how one Task ended, without blocking the event loop.
 
     The call is sync and does I/O — `complete` writes the journal and then
-    POSTs — so it goes to a thread. It is also the last thing standing between
-    a finished Turn and the person who asked, so a failure here is said loudly
-    on stderr and nowhere else: raising would take down the drain loop, and
-    swallowing it silently would lose an answer without a trace. The retry is
-    the library's (F5: a result is retained until its POST succeeds), which is
-    why there is none here.
+    POSTs — so it goes to a thread of its own (see `in_daemon_thread`: not the
+    default executor, which a stop would have to join). It is also the last
+    thing standing between a finished Turn and the person who asked, so a
+    failure here is said loudly on stderr and nowhere else: raising would take
+    down the drain loop, and swallowing it silently would lose an answer without
+    a trace. The retry is the library's (F5: a result is retained until its POST
+    succeeds), which is why there is none here.
     """
     if client is None:
         return
     try:
-        await asyncio.to_thread(getattr(client, how), task_id, payload)
+        await in_daemon_thread(getattr(client, how), task_id, payload)
+    except asyncio.CancelledError:
+        raise                               # a stop, not a failed answer
     except Exception as exc:  # noqa: BLE001 — one Task's answer, not the loop
         print(f"agent-connect: could not {how} task {task_id}: {exc}",
               file=sys.stderr, flush=True)
@@ -388,6 +516,14 @@ async def serve(
     loop is turning; those two numbers are what an observer needs to tell that
     apart from work actually moving. Keyword-only because it is an observer, not
     a parameter of the job.
+
+    **A queue reader that stops reading takes the Worker with it.** It is the
+    Worker's only inlet, and a Worker that has lost it goes on beating
+    `serving` with nothing running and receives nothing, for ever — alive by
+    every measure anybody has, and no longer an agent. So the reader hands
+    whatever ended it back to this loop, which raises it: the status file gets
+    an `error` with the reason in it, the process exits, and a service manager
+    restarts something that can be given work.
     """
     sessions: dict = {}
     running: set = set()
@@ -407,25 +543,44 @@ async def serve(
     inbound: asyncio.Queue = asyncio.Queue()
     stop = threading.Event()
 
+    def hand_over(item) -> bool:
+        """Put one thing on the loop's queue. False once the loop has closed."""
+        try:
+            loop.call_soon_threadsafe(inbound.put_nowait, item)
+            return True
+        except RuntimeError:
+            # The loop closed under us — the Worker is going away. A Task
+            # dropped here stays accepted-and-unanswered in the library's
+            # journal, which is what the broker re-serves; dropping it is the
+            # one thing this queue is documented to be allowed to do, because
+            # it is a handoff and not the durability boundary.
+            return False
+
     def pump() -> None:
-        while not stop.is_set():
-            task = client.next_task(poll)
-            if task is None:
-                continue                    # nothing arrived in `poll` seconds
-            try:
-                loop.call_soon_threadsafe(inbound.put_nowait, task)
-            except RuntimeError:
-                # The loop closed under us — the Worker is going away. The Task
-                # stays accepted-and-unanswered in the library's journal, which
-                # is what the broker re-serves; dropping it here is the one
-                # thing the queue is documented to be allowed to do, because it
-                # is a handoff and not the durability boundary.
-                return
+        try:
+            while not stop.is_set():
+                task = client.next_task(poll)
+                if task is None:
+                    continue                # nothing arrived in `poll` seconds
+                if not hand_over(task):
+                    return
+        except BaseException as exc:  # noqa: BLE001 — reported, never silent
+            # Only `RuntimeError` from the handover used to be caught, so
+            # anything the queue read itself raised ended this thread without a
+            # word and left a Worker that reported `serving` for ever and
+            # received nothing. Whatever it was travels back to the loop, which
+            # raises it where the status file and the exit code can see it.
+            if not stop.is_set():
+                hand_over(exc)
 
     threading.Thread(target=pump, name="agent-connect-queue", daemon=True).start()
     try:
         while True:
             task = await inbound.get()
+            if isinstance(task, BaseException):
+                raise RuntimeError(
+                    "the queue reader stopped: this Worker can no longer be "
+                    f"given work ({type(task).__name__}: {task})") from task
             fut = asyncio.ensure_future(
                 handle_one(task, adapter, repo, results_dir, sessions,
                            ops, settings, client=client)
@@ -471,6 +626,90 @@ def preflight(adapter, status: Optional[StatusFile] = None) -> str:
     found = describe()
     print(f"agent-connect: {found}")
     return found
+
+
+#: What a stop may spend waiting for the Relay Client's poll thread to leave.
+#:
+#: The arithmetic, because the number is a trade and not a taste. launchd sends
+#: SIGKILL 20 s after its SIGTERM (`ExitTimeOut`'s default; the plist in
+#: `install.sh` sets none), and everything after the wait — the `stopped` write
+#: that the whole handler exists for — has to happen before that. Twelve leaves
+#: eight for the loop to tear down and the file to be written, which measures in
+#: milliseconds once no answer is on the default executor (`in_daemon_thread`).
+#:
+#: **What the wait buys is the singleton guard's release.** The library releases
+#: it only when the join actually joined — a guard released while the loop may
+#: still poll is two pollers on one bearer, which is the incident J1 exists for
+#: — so a stop that gives up leaves the record to go stale and the replacement
+#: Worker stands by for `STALE_AFTER_S` + `STANDBY_RECHECK_S`, near three
+#: minutes of a person's messages going nowhere. The 2.0 s this replaces could
+#: never join at all: the poll thread is inside a 25 s long poll almost all of
+#: the time, so `guard.release()` was unreachable code and every restart paid
+#: the standby.
+#:
+#: **And it does not buy it away.** A poll that began a moment before the signal
+#: outlives any budget that fits in launchd's window, and then the guard is left
+#: held exactly as before. That is the cost accepted here, in exchange for a
+#: stop a service manager does not have to kill.
+STOP_BUDGET_S = 12.0
+
+
+class RelayStop:
+    """Begins the Relay Client's stop at the first sign the Worker is leaving.
+
+    `client.stop()` does two things and only the second one is expensive: it
+    signals the poll thread, then waits for it. Called where the old code called
+    it — after `asyncio.run` has returned — the waiting starts only once
+    everything else is already over, and the seconds the teardown took are
+    seconds the long poll could have spent unwinding. So the signal goes out
+    from the SIGTERM handler (`begin`) and the waiting happens at the end
+    (`finish`), and the two overlap by however long the Worker took to put
+    itself away.
+
+    `begin` is called from a signal handler, so it does the least it can: start
+    one daemon thread. `finish` is idempotent and safe to call on a Worker that
+    never got as far as having a client.
+    """
+
+    def __init__(self, budget: float = STOP_BUDGET_S):
+        self.budget = float(budget)
+        self._client = None
+        self._thread: Optional[threading.Thread] = None
+        self._begun = False
+        self._began = 0.0
+        #: Reentrant, because the signal handler runs *on the main thread*, at
+        #: whatever bytecode it had reached: a plain lock held by `finish` when
+        #: the signal lands would be a Worker deadlocked by its own stop.
+        self._lock = threading.RLock()
+
+    def __repr__(self) -> str:  # pragma: no cover — diagnostics only
+        return f"<RelayStop budget={self.budget} begun={self._begun}>"
+
+    def watch(self, client) -> None:
+        """The client to stop. Called once, as soon as there is one."""
+        with self._lock:
+            self._client = client
+
+    def begin(self) -> None:
+        """Tell the client to stop, and do not wait for it here. Once only."""
+        with self._lock:
+            if self._client is None or self._begun:
+                return
+            client = self._client
+            self._begun = True
+            self._began = time.monotonic()
+            self._thread = threading.Thread(
+                target=lambda: client.stop(timeout=self.budget),
+                name="agent-connect-relay-stop", daemon=True)
+            self._thread.start()
+
+    def finish(self) -> None:
+        """Wait out what is left of the budget, so the guard can be released."""
+        self.begin()
+        thread = self._thread
+        if thread is None:
+            return                          # there was never a client to stop
+        thread.join(max(0.0, self.budget - (time.monotonic() - self._began)) + 0.5)
 
 
 USAGE = f"""usage: agent-connect [--config PATH] [--export-config]
@@ -528,7 +767,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Task's result file against every observer's ability to tell a stop from a
     # crash; the archived result is also not the answer, which has already gone
     # to the room up the Ladder.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    #
+    # The handler also tells the Relay Client to stop *here*, at the signal,
+    # rather than at the `finally` below: the poll thread it has to wait for is
+    # inside a long poll, and the seconds this process spends putting itself
+    # away are seconds that wait can overlap with. See `RelayStop`.
+    stopping = RelayStop()
+
+    def terminated(*_):
+        stopping.begin()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, terminated)
     status: Optional[StatusFile] = None
     try:
         # ---- the startup order is a contract ------------------------------
@@ -554,6 +804,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         ws = _ws()
         status = status_from_env()
         status.starting(workspace=str(ws))
+        # Checked here, before anything that could refuse for another reason: it
+        # is the name of the directory this Worker's durable state lives in, and
+        # a Worker with a mistyped name and no token used to be told about the
+        # token, fix that, and only then be told about the name. A setting that
+        # is *wrong* outranks one that is *missing*.
+        try:
+            relay_client.instance()
+        except ValueError as exc:
+            raise SystemExit(f"agent-connect: {exc}")
         adapter_name = os.environ.get("AGENT_CONNECT_ADAPTER")
         if not adapter_name:
             raise SystemExit(
@@ -566,7 +825,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             raise SystemExit(f"agent-connect: {exc}")
         status.starting(adapter=adapter_name)
 
-        # The transport, constructed before the Adapter's preflight and started
+        # The Relay Client, constructed before the Adapter's preflight and started
         # after it. Constructing it is what validates the credential, and a bad
         # token should be a refusal in the first second rather than in the
         # forty-sixth, after an ACP bridge has finished proving the Local Agent
@@ -590,6 +849,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         # starting already says what it is pointed at.
         client.on_status(status.relay)
         status.relay(client.snapshot())
+        # From here on a SIGTERM has something to stop, and the sooner it says
+        # so the more of the wait it can spend on work that is already happening.
+        stopping.watch(client)
 
         agent = preflight(adapter, status)
         repo = str(_resolve_repo())
@@ -614,16 +876,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                       status=status)
             )
         finally:
-            # Barely waited on, and deliberately. The poll thread is a daemon
-            # sitting in a 25-second long poll with a 35-second socket timeout,
-            # so joining it properly would turn every SIGTERM into half a minute
-            # of a service manager waiting — and then killing us before
-            # `stopped` could be written, which is the one thing this handler
-            # exists to get into the file. Nothing is lost by not waiting:
+            # Waited on, for as long as `STOP_BUDGET_S` says and no longer,
+            # because the wait is what releases the singleton guard: a stop that
+            # gives up costs the *next* Worker three minutes of standby before
+            # it may poll at all. Anything the wait does abandon is safe —
             # anything already answered is in the library's journal and is
             # re-POSTed by the next run, and anything accepted and unanswered is
             # re-served by the broker and re-completed rather than re-executed.
-            client.stop(timeout=2.0)
+            stopping.finish()
     except KeyboardInterrupt:
         _record(status, StatusFile.stopped, "interrupted")
         raise
