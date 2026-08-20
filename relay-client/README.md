@@ -23,7 +23,8 @@ URL-encoded separator) had to be learned twice too. They live here once now.
 
 Under construction. What ships today is the foundation the wire loop is built
 on: credentials, name resolution, the request core, backoff, and the state-dir
-layout. The Task queue and the outbound surface follow.
+layout — plus the outbound surface: Room Ops, the egress allowlist and the
+result-marker grammar. The Task queue and the poll loop follow.
 
 ## Credentials
 
@@ -78,6 +79,84 @@ layout.ensure()         # 0700; holds the journal, the status file, the lock
 
 Per-instance by construction: one host may run clients against several gateways,
 and broker task ids are unique only *within* a gateway.
+
+## Room Ops
+
+Speaking in a room *as* the agent identity — post, edit, react, upload:
+
+```python
+from ag2_relay_client.roomops import RoomOps
+
+rooms = RoomOps(http, allowlist=allowlist)
+event = rooms.message(room_id, "⏳ On it...")   # keep the id; the ladder needs it
+rooms.edit(room_id, event, answer)              # ...then complete with [REPLIED]
+```
+
+**Nothing here raises into your loop.** A room that cannot be spoken to is a
+room whose answer arrives the plain way, through `POST /v1/results`; losing an
+answer to a decoration is never acceptable. A failure answers `None` / `False`
+and marks room ops unavailable for a **time-gated** cooldown (~300 s) — long
+enough that a broken broker is not retried per task, short enough that it heals
+itself after a broker deploy without a restart. A `401`/`403` still reaches the
+`on_auth_rejected` hook, because a revoked bearer is not a cosmetic failure.
+
+An `op:edit` body over 4000 characters is refused *locally*, without spending
+the cooldown: the reply goes through `/v1/results`, whose render path chunks it.
+And this client never reacts to a message it was served — the broker places the
+intake reaction, and a second one is the room seeing double.
+
+## Sending a file
+
+Egress is **paths only**, and the roots are fixed when the client is built:
+
+```python
+from ag2_relay_client.egress import EgressAllowlist
+
+allowlist = EgressAllowlist([workspace / "results"], max_bytes=24 * 1024 * 1024)
+```
+
+**There is no bytes-upload API, public or private.** One exists nowhere in this
+package on purpose: a surface that took bytes would make the allowlist
+decorative, since a caller could read anything and hand the contents over. The
+only door is `EgressAllowlist.open(path)`, which returns a descriptor it has
+already judged — resolved, inside a root by a real path-separator boundary,
+opened one component at a time with `O_NOFOLLOW` so a symlink swapped in after
+the check cannot be followed, and `fstat`'d for regular-file-ness, size, and a
+single hard link. There is no method that widens an allowlist at runtime, and
+the object refuses attribute writes after construction.
+
+The check now runs in the same process that holds the bearer, where it used to
+run in a separate one. `egress.py`'s docstring records that regression honestly;
+read it before changing anything there, and read `tests/test_egress.py` as the
+threat model it mitigates.
+
+## Result markers
+
+One parser, because every copy of it drifted — and a marker one consumer
+stripped reached users through another as literal text:
+
+```python
+from ag2_relay_client.outbound import Outbound
+
+prepared = Outbound(rooms).prepare(task_id, room_id, agent_output)
+http.post("/v1/results", {"id": task_id, "body": prepared.body})
+```
+
+`prepare` reads the grammar (skip is terminal; `[dm-only]` is detected anywhere
+and suppresses a `[channel:]` redirect; stripping is narrower than detection so
+prose *discussing* a marker is not rewritten; a marker inside markdown code is
+being shown, not issued), uploads whatever the body named, and hands back the
+body to POST — with `[channel:]` re-stitched for the broker's deliverer and any
+refused file explained in-band as `[attachment not sent: …]`.
+
+Two properties are worth stating out loud:
+
+- `[no-send]` / `[REPLIED]` / `[deduped: <id>]` **still POST**. They complete
+  the lease with no user-visible message; skipping the POST as well leaves the
+  lease to expire and the task to be re-served for ever.
+- Calling `prepare` again for the same task — which is what a retried result
+  POST does — re-derives the same body and **uploads nothing more**. Call
+  `forget(task_id)` when the POST finally succeeds; only success retires an id.
 
 ## License
 
