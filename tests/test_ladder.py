@@ -40,6 +40,7 @@ from agent_connect.events import (
 )
 from agent_connect.reporter import PLACEHOLDER, REPLIED, LadderSettings, TurnReporter
 from agent_connect.roomops import RoomOps, room_ops_from_env
+from _queue import FakeClient, task
 from agent_connect.worker import handle_one, process_one
 
 fails = 0
@@ -124,20 +125,11 @@ def relay_ops(**kw):
 
 
 def workspace():
+    """The outgoing directory, which is all a workspace is to a Turn now."""
     tmp = Path(tempfile.mkdtemp())
-    tasks, results = tmp / "tasks", tmp / "results"
-    tasks.mkdir()
+    results = tmp / "results"
     results.mkdir()
-    return tasks, results
-
-
-def write_task(tasks: Path, task_id: str, body: str, **headers) -> Path:
-    lines = [f"id: {task_id}", f"task: {body}"]
-    lines += [f"{k}: {v}" for k, v in headers.items() if k != "access_tier"]
-    lines.append(f"access_tier: {headers.get('access_tier', 'owner')}")
-    path = tasks / f"task-{task_id}.txt"
-    path.write_text("\n".join(lines) + "\n")
-    return path
+    return results
 
 
 def ctx_for(room="!room:ag2.space", prompt="do it"):
@@ -480,13 +472,15 @@ relay.stop()
 print("\n-- through the Worker's seam, end to end --")
 
 relay, ops = relay_ops()
-tasks, results = workspace()
-path = write_task(tasks, "L1", "summarise worker.py",
-                  channel_id="!room:ag2.space", sender_name="Nikita", access_tier="owner")
+results = workspace()
+client = FakeClient()
 asyncio.run(
-    handle_one(path, work(), "/repo", results, None, ops, LadderSettings(throttle=0.0))
+    handle_one(task("L1", "summarise worker.py", room="!room:ag2.space",
+                    sender_name="Nikita"),
+               work(), "/repo", results, None, ops, LadderSettings(throttle=0.0),
+               client=client)
 )
-result = (results / "task-L1.txt").read_text()
+result = client.answer("L1")
 check(len(relay.ops_of("message")) == 1,
       "one Task through the Worker posts one message into the room")
 check(relay.ops[0]["body"] == PLACEHOLDER, "the placeholder, by its fleet-wide copy")
@@ -496,14 +490,14 @@ check(result.startswith(REPLIED), "and the result completes the lease")
 check("the answer" in result, "while still archiving what was said")
 relay.stop()
 
-# The Worker's default — no ops passed — is byte-for-byte what it was before.
-tasks, results = workspace()
-path = write_task(tasks, "L2", "summarise worker.py", channel_id="!r:ag2.space")
-asyncio.run(process_one(path, Scripted(MessageChunk(text="plain"),
-                                       Done(reason=COMPLETED, text="plain")),
-                        "/repo", results))
-check((results / "task-L2.txt").read_text() == "plain\n",
-      "a Worker given no relay writes exactly the answer, as before the Ladder")
+# The Worker's default — no ops passed — is what it was before the Ladder.
+results = workspace()
+plain = asyncio.run(process_one(task("L2", "summarise worker.py", room="!r:ag2.space"),
+                                Scripted(MessageChunk(text="plain"),
+                                         Done(reason=COMPLETED, text="plain")),
+                                "/repo", results))
+check(plain == "plain",
+      "a Worker given no relay answers with exactly the answer, as before the Ladder")
 
 
 print("\n-- reading the relay out of the environment --")

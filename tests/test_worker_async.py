@@ -1,8 +1,13 @@
 """Tests for the asynchronous, event-shaped Adapter contract and the shim.
 
 Everything here is asserted at the Worker's handle-one-Task seam or at the
-Adapter boundary: what the Adapter was handed, what events crossed, and what
-landed in results/. Nothing asserts on which internal object called which.
+Adapter boundary: what the Adapter was handed, what events crossed, and what the
+Relay Client was told the answer was. Nothing asserts on which internal object
+called which.
+
+The fixtures are queue fixtures — a `Task` put on a `FakeClient`, and the
+`complete` / `reject` it recorded. They used to be files in `tasks/` and files
+in `results/`, which is the seam this ticket removed.
 
 Run: python3 tests/test_worker_async.py
 """
@@ -17,10 +22,11 @@ import threading
 import time
 from pathlib import Path
 
+from _queue import FakeClient, task
 from agent_connect import events as ev
 from agent_connect.adapters import ADAPTERS, ShimAdapter, get as get_adapter
 from agent_connect.events import Done, MessageChunk, TurnContext
-from agent_connect.worker import handle_one, parse_task, process_one, serve, turn_context
+from agent_connect.worker import EMPTY_TASK, handle_one, process_one, serve, turn_context
 
 fails = 0
 
@@ -33,20 +39,11 @@ def check(cond, name):
 
 
 def workspace():
+    """The outgoing directory, which is all a workspace is to a Turn now."""
     tmp = Path(tempfile.mkdtemp())
-    tasks, results = tmp / "tasks", tmp / "results"
-    tasks.mkdir()
+    results = tmp / "results"
     results.mkdir()
-    return tasks, results
-
-
-def write_task(tasks: Path, task_id: str, body: str, **headers) -> Path:
-    lines = [f"id: {task_id}", f"task: {body}"]
-    lines += [f"{k}: {v}" for k, v in headers.items() if k != "access_tier"]
-    lines.append(f"access_tier: {headers.get('access_tier', 'owner')}")
-    path = tasks / f"task-{task_id}.txt"
-    path.write_text("\n".join(lines) + "\n")
-    return path
+    return results
 
 
 class SyncStub:
@@ -90,18 +87,11 @@ class NativeStub:
 
 # -- the context reaches the Adapter, carrying every field -------------------
 
-fields = parse_task(
-    "id: task-c1\n"
-    "channel_id: !room:ag2.space\n"
-    "room_name: qingyun\n"
-    "sender_name: Nikita\n"
-    "user_id: @nikita:ag2.space\n"
-    "source: ag2space\n"
-    "source_message_id: $msg-42\n"
-    "task: summarise worker.py\n"
-    "access_tier: owner\n"
-)
-ctx = turn_context(fields, "task-c1", "/repo")
+ctx = turn_context(
+    task("task-c1", "summarise worker.py", room="!room:ag2.space",
+         room_name="qingyun", sender_name="Nikita", user_id="@nikita:ag2.space",
+         source_message_id="$msg-42"),
+    "/repo")
 check(ctx.room == "!room:ag2.space", "context carries the room")
 check(ctx.access_tier == "owner", "context carries the Access Tier")
 check(ctx.sender_name == "Nikita", "context carries the sender name")
@@ -112,19 +102,17 @@ check(ctx.sandbox == "workspace-write", "the Sandbox is derived from the Tier, h
 check(ctx.cwd == "/repo", "context carries the working directory")
 check(ctx.session_key == ("!room:ag2.space", "owner"), "Session key is room + Tier, never room alone")
 check(
-    turn_context({"access_tier": "owner", "task": "x"}, "task-r0", "/repo").session_key
-    != turn_context({"access_tier": "owner", "task": "x"}, "task-r1", "/repo").session_key,
+    turn_context(task("task-r0", "x"), "/repo").session_key
+    != turn_context(task("task-r1", "x"), "/repo").session_key,
     "two roomless Tasks do not share a Session key",
 )
 
 native = NativeStub()
-tasks, results = workspace()
-tf = write_task(
-    tasks, "c2", "do it",
-    channel_id="!r2:ag2.space", sender_name="Nikita", user_id="@n:ag2.space",
-    source_message_id="$m2", access_tier="owner",
-)
-asyncio.run(process_one(tf, native, "/repo", results))
+results = workspace()
+client = FakeClient()
+tf = task("c2", "do it", room="!r2:ag2.space", sender_name="Nikita",
+          user_id="@n:ag2.space", source_message_id="$m2")
+asyncio.run(handle_one(tf, native, "/repo", results, client=client))
 seen = native.seen[0]
 check(isinstance(seen, TurnContext), "the Adapter is handed a TurnContext")
 check(
@@ -132,7 +120,10 @@ check(
     == ("!r2:ag2.space", "owner", "Nikita", "@n:ag2.space", "$m2"),
     "every carried field reaches the Adapter",
 )
-check((results / "task-c2.txt").read_text() == "hi\n", "the answer is written from the event stream")
+check(client.answer("c2") == "hi",
+      "the answer the Relay Client is completed with comes from the event stream")
+check(client.completed == [("c2", "hi")] and not client.rejected,
+      "one Task off the queue, one `complete`, under the broker's own id")
 
 
 # -- the shim: two events, and codex unchanged -------------------------------
@@ -194,12 +185,12 @@ check(get_adapter("codex").impl is ADAPTERS["codex"], "codex is driven by its ow
 # that prose through verbatim rather than classify it — the error text a person
 # sees for a missing CLI or a timeout is unchanged.
 errs = ShimAdapter("codex-ish", SyncStub(output="agent-connect: codex timed out after 600s."))
-tasks, results = workspace()
-et = write_task(tasks, "x1", "do it", channel_id="!e:ag2.space")
-asyncio.run(process_one(et, errs, "/repo", results))
+results = workspace()
+out = asyncio.run(process_one(task("x1", "do it", room="!e:ag2.space"),
+                              errs, "/repo", results))
 check(
-    (results / "task-x1.txt").read_text() == "agent-connect: codex timed out after 600s.\n",
-    "an Adapter's own error text reaches the result unchanged",
+    out == "agent-connect: codex timed out after 600s.",
+    "an Adapter's own error text reaches the answer unchanged",
 )
 
 
@@ -242,17 +233,18 @@ check(
 # -- rooms stop blocking each other ------------------------------------------
 
 slow = ShimAdapter("slow", SyncStub(delay=0.4))
-tasks, results = workspace()
-a = write_task(tasks, "r1", "slow one", channel_id="!a:ag2.space")
-b = write_task(tasks, "r2", "slow two", channel_id="!b:ag2.space")
+results = workspace()
+client = FakeClient()
+a = task("r1", "slow one", room="!a:ag2.space")
+b = task("r2", "slow two", room="!b:ag2.space")
 
 
 async def _two_rooms():
     sessions = {}
     started = time.monotonic()
     await asyncio.gather(
-        process_one(a, slow, "/repo", results, sessions),
-        process_one(b, slow, "/repo", results, sessions),
+        handle_one(a, slow, "/repo", results, sessions, client=client),
+        handle_one(b, slow, "/repo", results, sessions, client=client),
     )
     return time.monotonic() - started
 
@@ -260,15 +252,12 @@ async def _two_rooms():
 elapsed = asyncio.run(_two_rooms())
 check(elapsed < 0.75, f"two rooms are served at once (took {elapsed:.2f}s, not ~0.8s)")
 check(slow.impl.peak == 2, "both Tasks were genuinely in flight together")
-check(
-    (results / "task-r1.txt").exists() and (results / "task-r2.txt").exists(),
-    "both rooms got a result",
-)
+check(client.answered == {"r1", "r2"}, "both rooms got an answer")
 
 same = ShimAdapter("same", SyncStub(delay=0.2))
-tasks, results = workspace()
-c = write_task(tasks, "s1", "first", channel_id="!same:ag2.space")
-d = write_task(tasks, "s2", "second", channel_id="!same:ag2.space")
+results = workspace()
+c = task("s1", "first", room="!same:ag2.space")
+d = task("s2", "second", room="!same:ag2.space")
 
 
 async def _one_session():
@@ -285,9 +274,10 @@ check(same.impl.peak == 1, "one Session runs one Turn at a time")
 
 # -- a failing Task is one Task's problem ------------------------------------
 
-tasks, results = workspace()
-boom = write_task(tasks, "b1", "explode", channel_id="!x:ag2.space")
-fine = write_task(tasks, "b2", "fine", channel_id="!y:ag2.space")
+results = workspace()
+client = FakeClient()
+boom = task("b1", "explode", room="!x:ag2.space")
+fine = task("b2", "fine", room="!y:ag2.space")
 
 
 class Selective:
@@ -300,62 +290,76 @@ class Selective:
 async def _one_bad():
     sessions = {}
     await asyncio.gather(
-        handle_one(boom, Selective(), "/repo", results, sessions),
-        handle_one(fine, Selective(), "/repo", results, sessions),
+        handle_one(boom, Selective(), "/repo", results, sessions, client=client),
+        handle_one(fine, Selective(), "/repo", results, sessions, client=client),
     )
 
 
 asyncio.run(_one_bad())
 check(
-    (results / "task-b1.txt").read_text() == "agent-connect: worker error: adapter blew up\n",
-    "a failing Task writes the same error result as before",
+    client.answer("b1") == "agent-connect: worker error: adapter blew up",
+    "a failing Task completes with the same error text as before — the person "
+    "who asked hears something back rather than nothing",
 )
-check((results / "task-b2.txt").read_text() == "ok\n", "the healthy Task in another room is unaffected")
+check(client.answer("b2") == "ok", "the healthy Task in another room is unaffected")
+check(not client.rejected,
+      "and neither is dead-lettered: a Worker bug is not a malformed Task, and "
+      "rejecting one would tell the broker never to try this Task again")
 
 
-# -- a result is written exactly once ----------------------------------------
+# -- every Task leaves through complete or reject, once -----------------------
 
-tasks, results = workspace()
-empty_task = tasks / "task-e1.txt"
-empty_task.write_text("id: task-e1\ntask:\naccess_tier: owner\n")
+results = workspace()
+client = FakeClient()
 counted = NativeStub()
-asyncio.run(process_one(empty_task, counted, "/repo", results))
-check((results / "task-e1.txt").read_text() == "[no-send] empty task\n", "an empty Task is marked no-send")
+asyncio.run(handle_one(task("e1", ""), counted, "/repo", results, client=client))
+check(client.refusal("e1") == EMPTY_TASK,
+      "a Task with no prompt in it is dead-lettered rather than dropped: "
+      "re-serving it produces the same nothing five times over")
+check(not client.completed, "and nothing is completed for it")
 check(counted.seen == [], "an empty Task never reaches the Adapter")
 
-(results / "task-e1.txt").write_text("already answered\n")
-asyncio.run(process_one(empty_task, counted, "/repo", results))
-check((results / "task-e1.txt").read_text() == "already answered\n", "an answered Task is not answered twice")
+# A body that was only an unsigned metadata block is empty by the time it gets
+# here — the library quarantined it (G2) and deliberately does not fall back to
+# the unstripped text. That is a Task nothing could ever answer, too.
+asyncio.run(handle_one(task("e2", "[room-ops metadata: reply_to=$x]"), counted,
+                       "/repo", results, client=client))
+check(client.refusal("e2") == EMPTY_TASK,
+      "a body that was nothing but a quarantined metadata block is the same "
+      "refusal, and still never reaches the Adapter")
+check(counted.seen == [], "— still nothing handed to the Local Agent")
 
-pre = write_task(tasks, "e2", "hello", channel_id="!z:ag2.space")
-(results / "task-e2.txt").write_text("first answer\n")
-asyncio.run(handle_one(pre, Selective(), "/repo", results))
-check(
-    (results / "task-e2.txt").read_text() == "first answer\n",
-    "an existing result survives a second pass, failures included",
-)
-
-
-# -- the scan loop keeps going ------------------------------------------------
-
-tasks, results = workspace()
-write_task(tasks, "l1", "explode", channel_id="!l1:ag2.space")
-write_task(tasks, "l2", "fine", channel_id="!l2:ag2.space")
+answered = asyncio.run(handle_one(task("e3", "hello", room="!z:ag2.space"),
+                                  Selective(), "/repo", results, client=client))
+check(answered == "ok" and client.answer("e3") == "ok",
+      "and an ordinary Task is completed with what the Turn returned")
+check(len(client.completed) + len(client.rejected) == 3,
+      "three Tasks off the queue, three answers to the broker — no silent drops")
 
 
-async def _scan():
-    loop = asyncio.ensure_future(serve(Selective(), "/repo", results, tasks, 0.01))
+# -- the drain loop keeps going -----------------------------------------------
+
+results = workspace()
+client = FakeClient().offer(task("l1", "explode", room="!l1:ag2.space"),
+                            task("l2", "fine", room="!l2:ag2.space"))
+
+
+async def _drain():
+    loop = asyncio.ensure_future(
+        serve(Selective(), "/repo", results, client, 0.01))
     for _ in range(200):
         await asyncio.sleep(0.01)
-        if (results / "task-l1.txt").exists() and (results / "task-l2.txt").exists():
+        if client.answered == {"l1", "l2"}:
             break
     still_running = not loop.done()
     loop.cancel()
     return still_running
 
 
-check(asyncio.run(_scan()), "the scan loop survives a Task that raised")
-check((results / "task-l2.txt").read_text() == "ok\n", "the scan loop answered the healthy Task")
+check(asyncio.run(_drain()), "the drain loop survives a Task that raised")
+check(client.answer("l2") == "ok", "the drain loop answered the healthy Task")
+check(client.answer("l1") == "agent-connect: worker error: adapter blew up",
+      "and answered the one that raised, instead of leaving its lease to expire")
 
 print("\n" + ("PASS — async adapter contract green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

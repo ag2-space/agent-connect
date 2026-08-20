@@ -1,9 +1,27 @@
 """agent-connect worker.
 
-Watches a workspace `tasks/` dir (populated by the AG2 Space relay client),
-runs the configured agent adapter on each task, and writes `results/`. The relay
-client handles all Matrix transport + posting back — this only turns a task into
-an agent run.
+Drains the Relay Client's Task queue, runs the configured Adapter on each Task,
+and answers it — `complete` with what the Local Agent produced, `reject` for a
+Task nothing could ever answer. The transport is a library this repository owns
+and this process runs (workspace `docs/adr/0001`); everything the wire knows is
+below `agent_connect.relay`, and everything above it — Sessions, the Ladder, the
+Sandbox, ACP — is here.
+
+There used to be a `tasks/` directory between the two, written by a foreign
+process, globbed here, and remembered in an in-memory `seen` set. All three are
+gone, and with them the thing they never actually provided: the delivery
+guarantee was always the broker's lease, and a `seen` set that dies with the
+process turned a restart mid-Task into a re-run of the Turn. The journal under
+the library re-*completes* a redelivery instead, and a Task never reaches this
+module twice.
+
+**The library is sync and threaded; this side is asyncio.** Every call across
+that seam runs on a thread rather than on the event loop: the queue read on a
+daemon thread of its own, `complete` and `reject` on the default executor. That
+is not tidiness. Cadence is a correctness property on the other side of the seam
+— a poll thread that stops polling loses its leases and its work comes back as
+duplicate delivery — and a blocked event loop up here is a `complete` that never
+happens down there.
 
 Tasks are processed **concurrently across rooms** and serialised within one
 Session: a ten-minute request in one room no longer silences every other room,
@@ -15,9 +33,6 @@ docstring used to carry a second list of the same environment variables, which
 went out of date the moment an Adapter grew one of its own; there is now one
 home for all of them and `test_acp_settings.py` fails if a setting exists in the
 package and not in that section.
-
-Task files are the AG2 Space convention: `tasks/task-<id>.txt` with `id:`,
-`task:` and `access_tier:` lines. Results go to `results/task-<id>.txt`.
 """
 from __future__ import annotations
 
@@ -25,16 +40,17 @@ import asyncio
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from . import relay as relay_client
 from .adapters import get as get_adapter
-from .attachments import parse as parse_attachments
 from .config import CONFIG_ENV, DEFAULT_PATH, ConfigError
 from .config import export as export_config
 from .config import load as load_config
-from .events import TurnContext
+from .events import Attachment, TurnContext
 from .outgoing import Outbox
 from .pending import queue_for
 from .reporter import LadderSettings, TurnReporter
@@ -91,34 +107,19 @@ def _resolve_repo() -> Path:
 #: The Access Tier vocabulary this side acts on, and the whole of it. The broker
 #: attests the tier and the Worker acts on the attestation (`docs/adr/0003`);
 #: nothing here restamps a tier of its own. Anything that is not exactly `owner`
-#: — a missing header, a duplicated one, a near-miss like `OWNER`, or one of the
-#: other words sutando still writes (`team`) — is not an attestation of
-#: ownership, and a Task without one is a guest's.
+#: — a missing field, a near-miss like `OWNER`, or one of the other words
+#: sutando still writes (`team`) — is not an attestation of ownership, and a
+#: Task without one is a guest's.
 OWNER = "owner"
 GUEST = "guest"
 
-# Header keys the AG2 Space relay writes (ag2-sparrow's task-file layout).
-# The relay deliberately writes `access_tier` as the LAST header — after
-# `task:` — as an anti-forgery invariant, so the parser must keep reading
-# headers after the task line instead of treating everything to EOF as body.
-#
-# Any key missing from this set lands in the prompt body instead, so the Local
-# Agent reads relay metadata as if a person had typed it. The attachment keys
-# are written after `task:`, which is how they came to leak; the parser itself
-# is order-independent, so their position is relay trivia, not an invariant.
-_HEADER_KEYS = {
-    "id", "timestamp", "task", "source", "channel_id", "chat_id", "room_name",
-    "sender_name", "user_id", "priority", "interaction_type", "access_tier",
-    "collaborator", "reply_to_event", "reply_to_me", "thread_ts",
-    # attachments
-    "content_modalities", "media_form", "attachments",
-    # provenance
-    "source_message_id", "platform_card",
-}
+#: What a Task nothing could ever answer is dead-lettered as. The broker parks
+#: it, stops re-serving it, and posts the terminal-failure notice itself.
+EMPTY_TASK = "EMPTY_TASK"
 
 
 def attested_tier(raw: str) -> str:
-    """The Tier to act on, from the Tier the relay wrote. Fails closed.
+    """The Tier to act on, from the Tier the broker attested. Fails closed.
 
     The broker computes the sender's Access Tier and attests it on the Task;
     this is the whole of the Worker's judgement about it — either the broker
@@ -133,86 +134,56 @@ def attested_tier(raw: str) -> str:
     return OWNER if (raw or "").strip() == OWNER else GUEST
 
 
-def parse_task(text: str) -> dict:
-    """Parse an AG2 Space task file.
+def task_attachments(task) -> Tuple[Attachment, ...]:
+    """The files that came with a Task, as the Adapter boundary names them.
 
-    Headers are `key: value` lines with a known key; `task:` starts the body,
-    which may span multiple lines and ends at the next known-header line.
-    The relay sanitizes newlines out of wire fields, so a message body cannot
-    fabricate a header line of its own. Defense-in-depth on top of that: more
-    than one `access_tier` header is a forgery attempt, and no tier at all is
-    read off a Task that has one.
+    Read off the delivered Task and from nowhere else. The library resolves the
+    `[ag2space-media: …]` markers on the wire and hands over local paths, so
+    there is no marker and no URL on this side of the seam to parse — and there
+    is no `attachments:` header any more either, because there is no file for a
+    header to be written into. The relay used to dual-write a
+    `[File attached: <path>]` line into the body as well; whatever of that a
+    sender types is left exactly where it is, because a path read out of a body
+    would be a path the sender chose.
 
-    The tier comes back **exactly as it was written**, and comes back empty when
-    nothing was written or when two headers contradicted each other. That
-    distinction is the point of reporting it at all: "the relay attested guest"
-    and "the relay attested nothing" are different facts about a Task, and a
-    parser that answered `guest` to both would hide the second one from anybody
-    reading the file to find out what went wrong. Neither is a tier to act on —
-    `attested_tier`, applied in `turn_context`, is where both become `guest`.
-
-    `access_tier`, `task` and `source_message_id` always come back, because
-    each has a meaningful default — downstream threading reads the source
-    message identifier on every Task, including ones the relay wrote without
-    one. Every other known header is returned verbatim under its own key only
-    when the relay wrote it, so read those with `.get()`.
+    Tolerant of a library that has not grown the tuple yet: transport-seam
+    ticket 03 is media ingress and ticket 08 is where `agent_connect.attachments`
+    stops parsing and starts consuming these directly. Until both land, a Task
+    carries none and a Turn sees none.
     """
-    fields: dict = {"access_tier": "", "task": "", "source_message_id": ""}
-    body: list = []
-    tiers: list = []
-    in_body = False
-    for line in text.splitlines():
-        k, sep, v = line.partition(":")
-        key = k.strip()
-        if sep and key in _HEADER_KEYS and not line[:1].isspace():
-            in_body = key == "task"
-            if key == "task":
-                body.append(v.lstrip())
-            elif key == "access_tier":
-                tiers.append(v.strip())
-            else:
-                fields[key] = v.strip()
-        elif in_body:
-            body.append(line)
-    fields["task"] = "\n".join(body).strip()
-    if len(tiers) == 1:
-        fields["access_tier"] = tiers[0]
-    # zero headers → nothing was attested; multiple → forged, so nothing was
-    # attested either. Both stay empty, and `attested_tier` reads empty as guest.
-    return fields
+    return tuple(getattr(task, "attachments", ()) or ())
 
 
-def turn_context(fields: dict, task_id: str, repo: str) -> TurnContext:
-    """Build the context one Turn travels with, from a parsed Task.
+def turn_context(task, repo: str) -> TurnContext:
+    """Build the context one Turn travels with, from a delivered Task.
 
     The Access Tier is settled here, and everything downstream — the Sandbox,
     the Session key, the ACP Adapter's owner-only check — reads the settled
-    value rather than the raw header. It comes from the tier the parser fought
-    to establish and from nothing else in the file, all of which the sender can
-    write; `attested_tier` then reduces it to the two values that cross the
-    wire, so no consumer has to decide for itself what an unfamiliar tier means.
-    The room identifier is the relay's `channel_id` (a Matrix room id);
-    `room_name` is the human label and is carried for display only.
+    value rather than the attestation. It comes from `access_tier` as the broker
+    attested it and from nothing else the sender can write; `attested_tier` then
+    reduces it to the two values that cross the wire, so no consumer has to
+    decide for itself what an unfamiliar tier means. The library delivers the
+    attestation verbatim on purpose: mapping it to local privilege is the
+    consumer's decision (`docs/adr/0003`), and this line is where this consumer
+    makes it.
 
-    Attachments come from the `attachments:` **header** and from nowhere else.
-    The relay also dual-writes a `[File attached: <path>]` line into the body,
-    and that line is left exactly where it is: it is part of what the person
-    sees themselves as having sent, and a path read out of a body would be a
-    path the sender chose. See `agent_connect.attachments`.
+    The room identifier is the broker's `channel_id`, which the library delivers
+    as `room_id` — one name for one concept, the rename I1 asked for.
+    `room_name` is the human label and is carried for display only.
     """
-    tier = attested_tier(fields.get("access_tier", ""))
+    tier = attested_tier(task.access_tier)
     return TurnContext(
-        prompt=fields.get("task", "").strip(),
-        task_id=task_id,
-        room=fields.get("channel_id") or fields.get("chat_id") or "",
-        room_name=fields.get("room_name", ""),
+        prompt=(task.body or "").strip(),
+        task_id=task.id,
+        room=task.room_id,
+        room_name=task.room_name,
         access_tier=tier,
-        sender_name=fields.get("sender_name", ""),
-        user_id=fields.get("user_id", ""),
-        source_message_id=fields.get("source_message_id", ""),
+        sender_name=task.sender_name,
+        user_id=task.user_id,
+        source_message_id=task.source_message_id,
         sandbox=tier_to_sandbox(tier),
         cwd=repo,
-        attachments=parse_attachments(fields.get("attachments", "")),
+        attachments=task_attachments(task),
     )
 
 
@@ -255,15 +226,22 @@ class _NoLock:
 
 
 async def process_one(
-    task_path: Path,
+    task,
     adapter,
     repo: str,
     results_dir: Path,
     sessions: dict = None,
     ops=None,
     settings=None,
-) -> None:
-    """Handle one Task file: parse it, run a Turn, write the result once.
+) -> str:
+    """Handle one delivered Task and return the body that answers it.
+
+    Returns `""` for a Task nothing could answer — an empty prompt, which is
+    also what a body that was *only* an unsigned metadata block degrades to
+    after the library quarantines it. `handle_one` turns that into the reject.
+    Everything else comes back as a body: the answer, the terminal marker when
+    the answer already went to the room up the Ladder, or the structured
+    rejection when the Turn produced nothing to say.
 
     `sessions` — when given — maps a Session key to the `SessionQueue` that
     keeps one Turn at a time open on it. Tasks with different keys never
@@ -273,22 +251,18 @@ async def process_one(
     serialisation at all, which is what a single-Task caller wants.
 
     `ops` is the relay to climb the Ladder on, shared across Tasks; `settings`
-    is how much of it to climb. Both may be `None`, and then the result body is
-    the answer and the relay client posts it, as before.
+    is how much of it to climb. Both may be `None`, and then the answer travels
+    whole in the body this returns, as it always did.
     """
-    task_id = task_path.stem  # "task-<id>"
-    result_path = results_dir / f"{task_id}.txt"
-    if result_path.exists():
-        return
-    fields = parse_task(task_path.read_text(errors="replace"))
-    ctx = turn_context(fields, task_id, repo)
+    ctx = turn_context(task, repo)
     if not ctx.prompt:
-        result_path.write_text("[no-send] empty task\n")
-        return
+        return ""
     # The results directory is also the *outgoing* directory: it is the one place
     # the transport's send allowlist trusts, so a file the agent produced leaves
     # this machine by being staged there and named in the result body. The Worker
-    # uploads nothing itself — see `agent_connect.outgoing`.
+    # uploads nothing itself — see `agent_connect.outgoing`. Transport-seam
+    # ticket 09 retires the staging airlock for the library's allowlisted-path
+    # egress; until then this route is unchanged.
     reporter = TurnReporter(ops, settings, outbox=Outbox(results_dir))
 
     async def announce(turn) -> None:
@@ -302,45 +276,106 @@ async def process_one(
     else:
         held = queue_for(sessions, ctx.session_key).arrive(ctx, on_wait=announce)
     async with held:
-        output = await run_turn(adapter, ctx, ops, settings, reporter)
-    result_path.write_text(output + "\n")
+        return await run_turn(adapter, ctx, ops, settings, reporter)
 
 
 async def handle_one(
-    task_path: Path,
+    task,
     adapter,
     repo: str,
     results_dir: Path,
     sessions: dict = None,
     ops=None,
     settings=None,
-) -> None:
-    """`process_one`, with the guarantee that it cannot take the Worker down.
+    *,
+    client=None,
+) -> str:
+    """`process_one`, answered to the broker, and unable to take the Worker down.
 
-    One Task failing is one Task's problem. The failure is written where the
-    relay looks for the answer, so the person who asked hears something back
-    rather than nothing.
+    **Every Task that comes off the queue leaves through this function, once.**
+    That is the contract the library's seam is built on: it hands a Task over
+    and waits to be told `complete` or `reject`, and an answer that is merely
+    dropped is a lease left to expire, a redelivery, and eventually a
+    dead-letter five attempts later. So there is exactly one exit here, and it
+    is one of those two calls.
+
+    One Task failing is still one Task's problem: the failure becomes the body,
+    so the person who asked hears something back rather than nothing, and the
+    drain loop above keeps turning.
+
+    A `reject` is reserved for input nothing could ever answer, which on this
+    side of the seam is one thing: a Task with no prompt in it. Re-serving that
+    produces the same nothing five times over, and the broker's dead-letter park
+    is where the protocol says it goes — this is the flow sparrow never
+    implemented and the reason the old code could only write `[no-send] empty
+    task` and hope. The broker posts the terminal-failure notice; the Worker
+    posts none, exactly as with the `TurnReporter`'s structured rejection.
+
+    `client` may be `None` — a test, or a caller driving one Task by hand — and
+    then the answer travels back as the return value and nothing is told to any
+    broker. The body is returned either way, and `""` means the Task was
+    rejected.
     """
     try:
-        await process_one(task_path, adapter, repo, results_dir, sessions, ops, settings)
+        body = await process_one(task, adapter, repo, results_dir, sessions, ops, settings)
     except Exception as e:  # noqa: BLE001 — never die on one bad task
-        result_path = results_dir / f"{task_path.stem}.txt"
-        if not result_path.exists():
-            result_path.write_text(f"agent-connect: worker error: {e}\n")
+        body = f"agent-connect: worker error: {e}"
+    if not body.strip():
+        # Belt and braces: `process_one` returns "" only for an empty prompt,
+        # and the reporter's endings are never blank. A blank body would be
+        # refused by `complete` anyway (H5: an empty answer is "not ready", not
+        # an answer), so it must not be able to reach it.
+        await _answer(client, "reject", task.id, EMPTY_TASK)
+        return ""
+    await _answer(client, "complete", task.id, body)
+    return body
+
+
+async def _answer(client, how: str, task_id: str, payload: str) -> None:
+    """Tell the library how one Task ended, without blocking the event loop.
+
+    The call is sync and does I/O — `complete` writes the journal and then
+    POSTs — so it goes to a thread. It is also the last thing standing between
+    a finished Turn and the person who asked, so a failure here is said loudly
+    on stderr and nowhere else: raising would take down the drain loop, and
+    swallowing it silently would lose an answer without a trace. The retry is
+    the library's (F5: a result is retained until its POST succeeds), which is
+    why there is none here.
+    """
+    if client is None:
+        return
+    try:
+        await asyncio.to_thread(getattr(client, how), task_id, payload)
+    except Exception as exc:  # noqa: BLE001 — one Task's answer, not the loop
+        print(f"agent-connect: could not {how} task {task_id}: {exc}",
+              file=sys.stderr, flush=True)
 
 
 async def serve(
     adapter,
     repo: str,
     results_dir: Path,
-    tasks_dir: Path,
+    client,
     poll: float,
     ops=None,
     settings=None,
     *,
     status: Optional[StatusFile] = None,
 ) -> None:
-    """Scan for Tasks forever, starting each one without waiting for the last.
+    """Drain the Task queue forever, starting each Task without waiting for the last.
+
+    The queue read is the one blocking call in this Worker, and it is made on a
+    thread of its own — the library is sync and threaded, this side is asyncio,
+    and a `get` with a timeout on the event loop would stop everything else for
+    the length of the timeout. The thread is a **daemon**: a Worker being
+    stopped must not be kept alive by a queue read that is still inside its own
+    wait, and a service manager that asked for a stop and got half a minute of
+    silence kills rather than waits.
+
+    `poll` is what one queue read waits for before looking around, and it paces
+    nothing else: the wire's cadence belongs to the library (F1 — a poll thread
+    that stops polling loses its leases) and no setting on this side can reach
+    it. A Task that arrives wakes the read immediately, whatever `poll` says.
 
     `status` — when given — gets a heartbeat task of its own, paced by the
     status file and by nothing here. It used to be beaten once per scan, which
@@ -354,7 +389,6 @@ async def serve(
     apart from work actually moving. Keyword-only because it is an observer, not
     a parameter of the job.
     """
-    seen: set = set()
     sessions: dict = {}
     running: set = set()
     started: dict = {}                      # future → when its Turn began
@@ -369,22 +403,39 @@ async def serve(
 
     heartbeat = (asyncio.ensure_future(status.beating(liveness))
                  if status is not None else None)
+    loop = asyncio.get_running_loop()
+    inbound: asyncio.Queue = asyncio.Queue()
+    stop = threading.Event()
+
+    def pump() -> None:
+        while not stop.is_set():
+            task = client.next_task(poll)
+            if task is None:
+                continue                    # nothing arrived in `poll` seconds
+            try:
+                loop.call_soon_threadsafe(inbound.put_nowait, task)
+            except RuntimeError:
+                # The loop closed under us — the Worker is going away. The Task
+                # stays accepted-and-unanswered in the library's journal, which
+                # is what the broker re-serves; dropping it here is the one
+                # thing the queue is documented to be allowed to do, because it
+                # is a handoff and not the durability boundary.
+                return
+
+    threading.Thread(target=pump, name="agent-connect-queue", daemon=True).start()
     try:
         while True:
-            for task_path in sorted(tasks_dir.glob("task-*.txt")):
-                if task_path.name in seen:
-                    continue
-                seen.add(task_path.name)
-                fut = asyncio.ensure_future(
-                    handle_one(task_path, adapter, repo, results_dir, sessions,
-                               ops, settings)
-                )
-                running.add(fut)
-                started[fut] = time.monotonic()
-                fut.add_done_callback(running.discard)
-                fut.add_done_callback(started.pop)
-            await asyncio.sleep(poll)
+            task = await inbound.get()
+            fut = asyncio.ensure_future(
+                handle_one(task, adapter, repo, results_dir, sessions,
+                           ops, settings, client=client)
+            )
+            running.add(fut)
+            started[fut] = time.monotonic()
+            fut.add_done_callback(running.discard)
+            fut.add_done_callback(started.pop)
     finally:
+        stop.set()
         if heartbeat is not None:
             heartbeat.cancel()
 
@@ -514,27 +565,65 @@ def main(argv: Optional[List[str]] = None) -> None:
         except KeyError as exc:
             raise SystemExit(f"agent-connect: {exc}")
         status.starting(adapter=adapter_name)
+
+        # The transport, constructed before the Adapter's preflight and started
+        # after it. Constructing it is what validates the credential, and a bad
+        # token should be a refusal in the first second rather than in the
+        # forty-sixth, after an ACP bridge has finished proving the Local Agent
+        # is fine. Starting it is what leases work, and leasing work the Worker
+        # cannot yet run would be a lease burnt on a Worker that may be about to
+        # refuse to start.
+        try:
+            client = relay_client.from_env(ws)
+        except Exception as exc:  # noqa: BLE001 — a refusal, said in words
+            raise SystemExit(f"agent-connect: {exc}")
+        if client is None:
+            raise SystemExit(
+                "set AGENT_CONNECT_TOKEN to your agent identity's relay token "
+                "from the Agent Portal — in the environment, or in a config "
+                "file (--config PATH; see README.md § Settings). Without it "
+                "this Worker has no way to be given any work at all"
+            )
+        # The connection's state, in this Worker's own file beside its own
+        # facts — the layered status the spec asks a consumer to compose. Hooked
+        # up and primed before the first poll, so a Worker that is still
+        # starting already says what it is pointed at.
+        client.on_status(status.relay)
+        status.relay(client.snapshot())
+
         agent = preflight(adapter, status)
         repo = str(_resolve_repo())
         poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
 
-        tasks_dir = ws / "tasks"
         results_dir = ws / "results"
-        tasks_dir.mkdir(parents=True, exist_ok=True)
         results_dir.mkdir(parents=True, exist_ok=True)
 
-        # The Ladder, if this Worker holds a relay token: the placeholder and its
-        # edits are Room Ops, and without a token there is nobody to ask for one.
+        # The Ladder: the placeholder and its edits are Room Ops. Still asked
+        # for over `roomops.py` rather than through the client — transport-seam
+        # ticket 09 is where that seam closes too.
         ops = room_ops_from_env()
         settings = LadderSettings.from_env()
 
         detail = f"adapter={adapter_name} repo={repo} ws={ws}"
         print(f"agent-connect worker: {detail}")
         status.serving(detail=detail, agent=agent, repo=repo)
-        asyncio.run(
-            serve(adapter, repo, results_dir, tasks_dir, poll, ops, settings,
-                  status=status)
-        )
+        client.start()
+        try:
+            asyncio.run(
+                serve(adapter, repo, results_dir, client, poll, ops, settings,
+                      status=status)
+            )
+        finally:
+            # Barely waited on, and deliberately. The poll thread is a daemon
+            # sitting in a 25-second long poll with a 35-second socket timeout,
+            # so joining it properly would turn every SIGTERM into half a minute
+            # of a service manager waiting — and then killing us before
+            # `stopped` could be written, which is the one thing this handler
+            # exists to get into the file. Nothing is lost by not waiting:
+            # anything already answered is in the library's journal and is
+            # re-POSTed by the next run, and anything accepted and unanswered is
+            # re-served by the broker and re-completed rather than re-executed.
+            client.stop(timeout=2.0)
     except KeyboardInterrupt:
         _record(status, StatusFile.stopped, "interrupted")
         raise

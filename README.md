@@ -21,24 +21,28 @@ is a tiny thing that runs **on your machine**:
 ## How it reuses AG2 Space infra (no new appservice)
 
 AG2 Space's relay is already a generic **outbound** transport: a client on your
-machine connects *out*, long-polls `GET /v1/tasks` for *your* agent (identified by
-your token), drops each task into `tasks/`, and posts `results/` back. Appservices
-(which require the homeserver to reach *you*) don't scale to laptops behind NAT;
-the outbound relay does.
+machine connects *out* and long-polls `GET /v1/tasks` for *your* agent
+(identified by your token). Appservices (which require the homeserver to reach
+*you*) don't scale to laptops behind NAT; the outbound relay does.
 
-So agent-connect = **the existing relay client** (transport, unchanged) **+ this
-worker** (runs your agent on each task). The only new code is the worker + a small
-per-agent adapter.
+agent-connect speaks that relay itself, through **`ag2-relay-client`** — a
+stdlib-only library published from this repository (`relay-client/`) that owns
+the whole wire: the long poll, the lease, the acknowledgement, results,
+heartbeats and room ops. The worker holds it in-process and takes tasks off its
+queue. There is no task directory between the two and no second process: the
+delivery guarantee was never a file queue's, it is the broker's lease, and a
+worker restarting mid-task now re-*completes* the answer it already gave rather
+than running the turn again.
 
 ```
 room "!codex fix the flaky test"
       │  (relay routes to your Codex agent's token)
       ▼
-relay client  ──►  tasks/task-<id>.txt
+agent-connect ── ag2-relay-client ──►  GET /v1/tasks   (long poll, leased)
                           │
-                     agent-connect worker  ──►  codex exec --sandbox <tier> --cd <repo> "<task>"
+                     the worker  ──►  codex exec --sandbox <tier> --cd <repo> "<task>"
                           │
-                   results/task-<id>.txt  ──►  relay client  ──►  posted back to the room
+                ag2-relay-client ──►  POST /v1/results ──►  posted back to the room
 ```
 
 ## Access tiers (safety)
@@ -279,8 +283,8 @@ the file beside it, as one reply. Several files from one turn all arrive, in the
 order the agent named them.
 
 **The route matters more than the feature.** A file goes out by being placed in
-the **outgoing result directory** — the same `results/` the worker already writes
-into, and the only directory the relay client's send allowlist trusts. The worker
+the **outgoing directory** — `<workspace>/results/`, the one directory the send
+allowlist on the other side of the transport trusts. The worker
 posts no media itself, and that is deliberate: the allowlist is what stops an
 agent from being talked into attaching a private key or somebody's tax return to
 a chat message, and a worker that uploaded files directly would turn any message
@@ -411,9 +415,10 @@ AGENT_CONNECT_REPO=/Users/me/agents/scratch
 AGENT_CONNECT_WORKSPACE=/Users/me/.agent-connect/instances/scratch/workspace
 ```
 
-**Two instances must never share a workspace.** `tasks/`, `results/`, the
-session map and the status file all live in it, and two workers watching one
-`tasks/` directory will each pick up every task and run it twice. Two instances
+**Two instances must never share a workspace.** The outgoing directory, the
+relay client's state (its journal of which tasks have been answered), the
+session map and the status file all live in it, and two workers sharing one
+journal each believe the other's tasks are already answered. Two instances
 sharing an *agent token* is the same bug one layer up: one queue, two pullers.
 A new instance means a new Agent Identity.
 
@@ -445,9 +450,41 @@ nothing about the transport underneath.
   "updated_at": 1755600123.0,
   "uptime_seconds": 123.0,
   "heartbeat_seconds": 15.0,
-  "last_error": null
+  "last_error": null,
+  "relay": {
+    "state": "connected",
+    "connected": true,
+    "gateway": "https://chat.ag2.space/relay",
+    "last_ok_ts": 1755600120.0,
+    "backoff_s": 0.0,
+    "error": null,
+    "inflight": 0,
+    "pending_results": 0,
+    "updated_ts": 1755600122.0
+  }
 }
 ```
+
+**The file is layered, and the layers are two different facts.** `state`,
+`adapter` and `agent` are the worker's own account of itself — what is
+configured, and whether the local agent behind the identity answered its
+preflight. `relay` is the transport's, read off the relay client's status hook:
+whether the broker is reachable (`connected`, `state` is one of `connected`,
+`reconnecting`, `auth-wait`, `fatal`, `stopped`), when it last was
+(`last_ok_ts`), how long the client is waiting before its next attempt
+(`backoff_s`), how many tasks it has accepted and not yet answered (`inflight`),
+and how many answers it is still trying to hand back (`pending_results`). The
+gateway URL is redacted before it is ever written. `relay` is `null` before the
+transport is constructed — "no relay" and "a relay that is offline" are
+different facts about a worker.
+
+**The relay block does not beat.** `updated_at` is refreshed by the worker's own
+heartbeat and by nothing else, so it goes on meaning exactly one thing: this
+process's event loop is turning. The relay client's status hook runs on its own
+polling thread, and a live polling thread proves nothing about a wedged event
+loop — so the hook writes the connection through without touching either clock.
+The block carries the client's own `updated_ts`, for a reader who wants to know
+whether the *transport's* view is current.
 
 **Four states, and that is all of them:** `starting` (the file exists before
 anything can go wrong, so a worker that dies in preflight still leaves the
@@ -521,14 +558,14 @@ table.
 | Setting | What it does | Default |
 | --- | --- | --- |
 | `AGENT_CONNECT_CONFIG` | the config file to read (see the section above). The `--config` flag wins over it | `~/.agent-connect/config.env`, if it exists |
-| `AGENT_CONNECT_TOKEN` | your agent identity's relay token, from the Agent Portal | *(required)* |
+| `AGENT_CONNECT_TOKEN` | your agent identity's relay token, from the Agent Portal. It is a combined `<gateway-url>\|<secret>` credential: the gateway travels inside it, and there is no default to fall back on, so a bare secret needs `REMOTE_TASK_URL` beside it. Without a token the worker refuses to start, because it would have no way of being given any work | *(required)* |
 | `AGENT_CONNECT_ADAPTER` | which adapter runs the task: `codex`, `ollama`, `omnigent`, `cline`, `kilo`, `acp` | *(required)* |
 | `AGENT_CONNECT_REPO` | the working directory the agent operates in. Created for you when it is the default; a path under `~/Documents`, `~/Desktop` or `~/Downloads` is warned about, because macOS privacy protection turns agent file operations there into an unexplained "operation not permitted" | `~/agents` |
-| `AGENT_CONNECT_WORKSPACE` | workspace dir holding `tasks/` + `results/` | `~/.agent-connect/workspace` |
+| `AGENT_CONNECT_WORKSPACE` | workspace dir holding the outgoing `results/`, the relay client's state under `relay/`, the session map and the status file | `~/.agent-connect/workspace` |
 | `AGENT_CONNECT_STATUS_FILE` | the status file this worker owns (see the section above) | `<workspace>/status.json` |
 | `AGENT_CONNECT_STATUS_HEARTBEAT` | seconds between refreshes of the status file's `updated_at`, and the staleness window an observer reads out of it | `15.0` |
-| `AGENT_CONNECT_INSTANCE` | a name for this worker instance, carried into its status file so a supervisor watching several can tell them apart. Nothing else reads it | *(unset)* |
-| `AGENT_CONNECT_POLL` | seconds between scans for new tasks | `1.0` |
+| `AGENT_CONNECT_INSTANCE` | a name for this worker instance: carried into its status file so a supervisor watching several can tell them apart, and used to namespace the relay client's state under `<workspace>/relay/`. Letters, digits, `_` and `-`, at most 32 — a name outside that is refused rather than mangled, because two instances quietly sharing one sanitised name would share one journal | `default` |
+| `AGENT_CONNECT_POLL` | seconds one read of the relay client's task queue waits before the worker looks around. It paces nothing else: a task that arrives wakes the read immediately, and the long-poll cadence on the wire belongs to the relay client | `1.0` |
 | `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` | how much of one attached file is read into a prompt. An attachment over this is reported in the room, never shrunk to fit. `0` means no limit | `10485760` (10 MB) |
 | `AGENT_CONNECT_OUTGOING_MAX_BYTES` | how large a file the agent produced may be and still be sent to the room. The relay refuses more than this anyway; refusing it here means a sentence in the room instead of a log line. `0` means no limit | `26214400` (25 MB) |
 
@@ -575,12 +612,12 @@ Other adapters:
 | `AGENT_CONNECT_CLINE_MODEL` | model the `cline` adapter selects | *(cline default)* |
 | `AGENT_CONNECT_KILO_BIN` | path to the `kilo` binary | `kilo` |
 
-The relay client (`ag2-sparrow`) reads its own `AGENT_CONNECT_TASK_DIR`,
-`AGENT_CONNECT_RESULT_DIR`, `AGENT_CONNECT_STATE_DIR`, `REMOTE_TASK_TOKEN` and
-`REMOTE_TASK_URL`; the installer wires those into `launch.sh` for you. The
-worker reads those last two as well, and only for the ladder: they say which
-relay to ask for a room op and with which token. Without a token the worker
-posts nothing and the answer travels as the task result, as it always did.
+`REMOTE_TASK_TOKEN` and `REMOTE_TASK_URL` are the names the old two-process
+launcher exported for the transport's own process. Both are still read, and mean
+what they always meant: the same credential under its other name, and a gateway
+for a bare secret that does not carry one. `AGENT_CONNECT_TASK_DIR`,
+`AGENT_CONNECT_RESULT_DIR` and `AGENT_CONNECT_STATE_DIR` are `ag2-sparrow`'s and
+are read by nothing in this package.
 
 ## Adapters
 

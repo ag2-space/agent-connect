@@ -40,6 +40,7 @@ try:
     from agent_connect.events import REFUSED
     from agent_connect.roomops import RoomOps
     from agent_connect.sessions import SessionStore
+    from _queue import task as queued_task
     from agent_connect.worker import GUEST, OWNER, handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(
@@ -116,10 +117,9 @@ class Bench:
     def __init__(self, script: dict, relay: bool = True):
         self._dir = tempfile.TemporaryDirectory()
         base = Path(self._dir.name)
-        self.tasks = base / "tasks"
         self.results = base / "results"
         self.repo = base / "repo"
-        for d in (self.tasks, self.results, self.repo):
+        for d in (self.results, self.repo):
             d.mkdir()
         self.script_path = base / "script.json"
         self.script_path.write_text(json.dumps(script))
@@ -132,26 +132,23 @@ class Bench:
         )
 
     def handle(self, task_id: str, body: str, tier=None) -> str:
-        """Run one Task through the Worker and return what it wrote back.
+        """Run one Task through the Worker and return the answer it gave.
 
-        `tier=None` writes no `access_tier` header at all — the Task the broker
-        never attested, which is a different case from one it attested `guest`.
+        `tier=None` is a Task with no `access_tier` on it at all — the Task the
+        broker never attested, which is a different case from one it attested
+        `guest`.
         """
-        lines = [f"id: {task_id}", f"channel_id: {ROOM}", f"task: {body}"]
-        if tier is not None:
-            lines.append(f"access_tier: {tier}")
-        path = self.tasks / f"task-{task_id}.txt"
-        path.write_text("\n".join(lines) + "\n")
+        task = queued_task(task_id, body, room=ROOM,
+                           tier="" if tier is None else tier)
         os.environ["FAKE_ACP_REPORT"] = str(self.report_path)
         try:
-            asyncio.run(asyncio.wait_for(
-                handle_one(path, self.adapter, str(self.repo), self.results,
+            return asyncio.run(asyncio.wait_for(
+                handle_one(task, self.adapter, str(self.repo), self.results,
                            {}, self.ops, LadderSettings(live=True, throttle=0.0)),
                 timeout=30,
             ))
         finally:
             os.environ.pop("FAKE_ACP_REPORT", None)
-        return (self.results / f"task-{task_id}.txt").read_text()
 
     def report(self):
         """What the Local Agent saw, or `None` if it was never started."""

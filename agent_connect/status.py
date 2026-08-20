@@ -31,8 +31,42 @@ current. The file is the contract; the transport underneath it is not.
       "updated_at": 1755600123.0,      // unix seconds, this write
       "uptime_seconds": 123.0,         // monotonic, immune to clock steps
       "heartbeat_seconds": 15.0,
-      "last_error": {"at": 1755600100.0, "message": "..."} | null
+      "last_error": {"at": 1755600100.0, "message": "..."} | null,
+      "relay": {                       // the transport, or null before it starts
+        "state": "connected",          // connected | reconnecting | auth-wait
+                                       // | fatal | stopped
+        "connected": true,
+        "gateway": "https://chat.ag2.space/relay",   // redacted by the library
+        "last_ok_ts": 1755600120.0,    // unix seconds of the last healthy poll
+        "backoff_s": 0.0,
+        "error": null,
+        "inflight": 0,                 // Tasks accepted and not yet answered
+        "pending_results": 0,          // answers written and not yet POSTed
+        "updated_ts": 1755600122.0     // the LIBRARY's clock, not this file's
+      }
     }
+
+## The file is layered, and the layers are two different facts
+
+`state`, `adapter`, `agent` and `repo` are the Worker's own account of itself:
+what is configured, and whether the Local Agent behind the Agent Identity
+answered its preflight. `relay` is the transport's, copied out of the Relay
+Client's status snapshot through the change hook it offers — the library also
+writes its own connection-only file under its state dir, so observability
+survives a consumer that never reads the hook, and this block is the richer
+composition the spec asks a consumer to make. It is **not** an impersonation of
+anybody else's status schema.
+
+**The relay block never beats.** `updated_at` is refreshed by the Worker's own
+heartbeat task and by nothing else, so it goes on meaning exactly one thing: the
+Worker's event loop is turning. The status hook runs on the library's poll
+thread, and a poll thread that is alive proves nothing about an event loop that
+is wedged — letting it refresh `updated_at` would be the third way found to
+defeat staleness, after `AGENT_CONNECT_POLL` and the missing beat before
+`serving`. So the hook rewrites the document with the new connection facts and
+leaves both clocks exactly where the last beat left them. The block carries the
+library's own `updated_ts` instead, so a reader who wants to know whether the
+*transport's* view is current has it without borrowing this file's clock.
 
 **One file per instance.** The path hangs off the workspace, and a workspace
 belongs to exactly one Worker (`README.md` § Running more than one agent on one
@@ -92,6 +126,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Mapping, Optional
@@ -124,6 +159,14 @@ STATES = frozenset({STARTING, SERVING, STOPPED, ERROR})
 #: Bumped only for a change a reader could not survive. Readers should ignore
 #: fields they do not know rather than refuse the document.
 VERSION = 1
+
+#: What the Worker copies out of the Relay Client's status snapshot, and the
+#: whole of it. A projection rather than the snapshot itself: this file is a
+#: service contract with an outside reader, and a block that silently gained
+#: whatever the library added next would be a contract nobody wrote down. A
+#: field the library grows and this file should carry is a line added here.
+RELAY_FIELDS = ("state", "connected", "gateway", "last_ok_ts", "backoff_s",
+                "error", "inflight", "pending_results", "updated_ts")
 
 
 def status_path(env: Optional[Mapping[str, str]] = None) -> Path:
@@ -208,6 +251,13 @@ class StatusFile:
         self._booted = monotonic()
         self._last_write = 0.0
         self._complained = False
+        #: The document is written from two threads now: the Worker's event
+        #: loop, and the Relay Client's poll thread through the status hook.
+        #: The temporary file is named after the pid, so two writers without a
+        #: lock would race each other for the same name and one would rename a
+        #: half-written document over the real one — the exact failure the
+        #: write-beside-and-rename dance exists to prevent.
+        self._lock = threading.RLock()
         #: Everything the file says, kept so a transition need not restate the
         #: facts that have not changed.
         self._doc: dict = {
@@ -222,6 +272,11 @@ class StatusFile:
             "tasks_running": 0,
             "oldest_task_seconds": 0.0,
             "last_error": None,
+            #: Null until the transport is constructed. "No relay block" and "a
+            #: relay block saying reconnecting" are different facts, and a
+            #: reader that could not tell them apart would report a Worker with
+            #: no transport at all as one that is merely offline.
+            "relay": None,
         }
 
     # -- transitions --------------------------------------------------------
@@ -243,8 +298,28 @@ class StatusFile:
     def error(self, message: str, **facts) -> None:
         """Stopped because of this. The message is the operator's to act on, so
         it is kept verbatim and also recorded as `last_error`."""
-        self._doc["last_error"] = {"at": self._clock(), "message": str(message)}
-        self._write(ERROR, detail=str(message), **facts)
+        with self._lock:
+            self._doc["last_error"] = {"at": self._clock(), "message": str(message)}
+            self._write(ERROR, detail=str(message), **facts)
+
+    def relay(self, snapshot: Optional[Mapping] = None) -> None:
+        """The transport's connection state, as the library just reported it.
+
+        Written for `RelayClient.on_status`, and called from the library's poll
+        thread — so it says nothing about the Worker's own state and does not
+        touch either clock (see the module docstring: a live poll thread is not
+        a live event loop, and `updated_at` must go on meaning only the second).
+        Everything else in the document is left exactly as the last transition
+        left it.
+
+        A hook that raised would be logged and forgotten by the library, which
+        is a status file that quietly stops updating; `_write` swallows its own
+        I/O errors already, and there is nothing else here that can raise.
+        """
+        block = ({name: snapshot.get(name) for name in RELAY_FIELDS}
+                 if snapshot is not None else None)
+        with self._lock:
+            self._write(self._doc.get("state", STARTING), beat=False, relay=block)
 
     def beat(self, **facts) -> None:
         """Say the same thing again, so that saying nothing means something.
@@ -274,30 +349,37 @@ class StatusFile:
 
     # -- internals ----------------------------------------------------------
 
-    def _write(self, state: str, **facts) -> None:
+    def _write(self, state: str, *, beat: bool = True, **facts) -> None:
         # A state outside the four is a programming error, not an operator's
         # problem, and it must not reach a reader that switches on the value.
         if state not in STATES:
             raise ValueError(f"not a status state: {state!r}")
-        self._doc.update(facts)
-        self._doc["state"] = state
-        self._doc["updated_at"] = self._clock()
-        self._doc["uptime_seconds"] = self._monotonic() - self._booted
-        self._last_write = self._doc["updated_at"]
-        tmp = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(self._doc, indent=2, sort_keys=True) + "\n")
-            os.replace(tmp, self.path)
-        except OSError as exc:  # noqa: BLE001 — an observer's problem, not a Task's
-            if not self._complained:
-                self._complained = True
-                print(f"agent-connect: cannot write the status file {self.path}: {exc}",
-                      file=sys.stderr, flush=True)
+        with self._lock:
+            self._doc.update(facts)
+            self._doc["state"] = state
+            if beat:
+                # The two clocks advance together, and only for a writer that
+                # is the Worker itself. `beat=False` is the status hook, which
+                # runs on the transport's thread and has nothing to say about
+                # whether this process's event loop is still turning.
+                self._doc["updated_at"] = self._clock()
+                self._doc["uptime_seconds"] = self._monotonic() - self._booted
+                self._last_write = self._doc["updated_at"]
+            document = json.dumps(self._doc, indent=2, sort_keys=True) + "\n"
+            tmp = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
             try:
-                tmp.unlink()
-            except OSError:
-                pass
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(document)
+                os.replace(tmp, self.path)
+            except OSError as exc:  # noqa: BLE001 — an observer's problem, not a Task's
+                if not self._complained:
+                    self._complained = True
+                    print(f"agent-connect: cannot write the status file {self.path}: {exc}",
+                          file=sys.stderr, flush=True)
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
 
 def from_env(env: Optional[Mapping[str, str]] = None) -> StatusFile:

@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from unittest import mock
 
+from _queue import child_env
 from agent_connect.worker import _resolve_repo
 
 fails = 0
@@ -89,11 +90,12 @@ with tempfile.TemporaryDirectory() as tmp:
 
 with tempfile.TemporaryDirectory() as home:
     log = Path(home) / "out.log"
-    child = {"PATH": os.environ.get("PATH", ""), "HOME": home,
-             "PYTHONUNBUFFERED": "1",
-             "AGENT_CONNECT_ADAPTER": "ollama",
-             "AGENT_CONNECT_WORKSPACE": str(Path(home) / "ws"),
-             "AGENT_CONNECT_POLL": "0.05"}
+    child = child_env(**{
+        "HOME": home,
+        "AGENT_CONNECT_ADAPTER": "ollama",
+        "AGENT_CONNECT_WORKSPACE": str(Path(home) / "ws"),
+        "AGENT_CONNECT_POLL": "0.05",
+    })
     with open(log, "w") as sink:
         proc = subprocess.Popen(
             [sys.executable, "-m", "agent_connect"],

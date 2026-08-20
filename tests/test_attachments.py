@@ -1,11 +1,19 @@
 """Tests for the attachment header and for opening what it points at.
 
-Two halves. The first is the wire format — the one-line JSON array the relay
-client's `format_attachments` writes — decoded the way its own
-`parse_attachments` decodes it, tolerantly. The second is the part that touches
-the filesystem, and it is the interesting one: the locator is sender-adjacent
-data, so every check that stands between it and `os.read` is asserted here
-against a real file, a real symlink, a real FIFO and a real directory.
+Two halves. The first is the header format — the one-line JSON array
+`ag2-sparrow`'s `format_attachments` used to write — decoded the way its own
+`parse_attachments` decoded it, tolerantly. **No such header reaches the Worker
+any more**: the transport is a library in-process, it resolves the wire's media
+markers itself and delivers local paths, and transport-seam ticket 08 is where
+this parser goes with the header it read. It is kept and tested until then
+because deleting a decoder and its replacement in one change leaves nothing to
+compare against.
+
+The second half is the part that touches the filesystem, and it is the
+interesting one — and it does *not* retire with the header, because bytes still
+land on disk: the locator is sender-adjacent data, so every check that stands
+between it and `os.read` is asserted here against a real file, a real symlink, a
+real FIFO and a real directory.
 
 No dependencies: this is the Worker's own vocabulary, not ACP.
 
@@ -24,7 +32,8 @@ from pathlib import Path
 from agent_connect import attachments
 from agent_connect.adapters.shim import ShimAdapter
 from agent_connect.attachments import Attachment
-from agent_connect.worker import handle_one, parse_task, turn_context
+from _queue import task
+from agent_connect.worker import handle_one, turn_context
 
 fails = 0
 
@@ -187,38 +196,29 @@ check(attachments.max_bytes({"AGENT_CONNECT_ATTACHMENT_MAX_BYTES": "-1"})
       "and neither is a negative one")
 
 # --- the Task carries them, and the body is left alone ----------------------
+# The header these used to be written in is gone with the file it was written
+# in: the library resolves the wire's media markers and delivers local paths.
+# What is asserted here is the part that did not change — an attachment travels
+# beside the prompt and never inside it.
 
-task = (
-    "id: t9\n"
-    "channel_id: !room:ag2.space\n"
-    f"task: what is wrong with this?\n[Photo attached: {real}]\n"
-    f"attachments: {json.dumps([{'locator': str(real), 'mime': 'image/png', 'filename': 'shot.png'}])}\n"
-    "access_tier: owner\n"
-)
-ctx = turn_context(parse_task(task), "task-t9", "/repo")
+shot = Attachment(locator=str(real), mime="image/png", filename="shot.png")
+ctx = turn_context(
+    task("t9", f"what is wrong with this?\n[Photo attached: {real}]",
+         room="!room:ag2.space", attachments=(shot,)),
+    "/repo")
 check(len(ctx.attachments) == 1 and ctx.attachments[0].mime == "image/png",
       "a Task's attachments reach the Adapter boundary on the TurnContext")
 check(ctx.prompt == f"what is wrong with this?\n[Photo attached: {real}]",
       "and the person's own text — legacy marker and all — is untouched by it")
 
 # The body is where a sender writes. A path read out of it would be a path the
-# sender chose, so a forged marker carries no attachment.
-forged = (
-    "id: t10\n"
-    "task: look at this\n[File attached: /etc/passwd]\n"
-    "access_tier: owner\n"
-)
-check(turn_context(parse_task(forged), "task-t10", "/repo").attachments == (),
+# sender chose, so a marker someone typed carries no attachment.
+check(turn_context(task("t10", "look at this\n[File attached: /etc/passwd]"),
+                   "/repo").attachments == (),
       "a `[File attached: …]` line typed by a sender is not an attachment")
 
-# A header that could not be parsed leaves the question intact.
-broken = "id: t11\ntask: hello\nattachments: {oops\naccess_tier: owner\n"
-broken_ctx = turn_context(parse_task(broken), "task-t11", "/repo")
-check(broken_ctx.attachments == () and broken_ctx.prompt == "hello",
-      "a broken attachments header costs the attachment, never the question")
-
-check(turn_context(parse_task("id: t12\ntask: hi\n"), "task-t12", "/repo").attachments == (),
-      "a Task with no attachments header has no attachments")
+check(turn_context(task("t12", "hi"), "/repo").attachments == (),
+      "a Task that carried no attachments has none")
 
 # --- an Adapter that cannot take attachments at all says so -----------------
 # The shim is every synchronous Adapter: `run(task, sandbox, cwd)` has nowhere
@@ -239,21 +239,14 @@ class OnlyText:
 impl = OnlyText()
 shimmed = ShimAdapter("codex", impl)
 shim_ws = base / "shim"
-(shim_ws / "tasks").mkdir(parents=True)
 (shim_ws / "results").mkdir(parents=True)
-shim_task = shim_ws / "tasks" / "task-s1.txt"
-shim_task.write_text(
-    "id: s1\n"
-    "channel_id: !room:ag2.space\n"
-    "task: what is wrong with this?\n"
-    "attachments: " + json.dumps([
-        {"locator": str(real), "mime": "image/png", "filename": "shot.png"},
-        {"locator": str(real), "mime": "application/pdf", "filename": "notes.pdf"},
-    ], separators=(",", ":")) + "\n"
-    "access_tier: owner\n"
-)
-asyncio.run(handle_one(shim_task, shimmed, str(base), shim_ws / "results"))
-shim_out = (shim_ws / "results" / "task-s1.txt").read_text()
+shim_out = asyncio.run(handle_one(
+    task("s1", "what is wrong with this?", room="!room:ag2.space",
+         attachments=(
+             Attachment(locator=str(real), mime="image/png", filename="shot.png"),
+             Attachment(locator=str(real), mime="application/pdf", filename="notes.pdf"),
+         )),
+    shimmed, str(base), shim_ws / "results"))
 
 check("I can't read that kind of attachment" in shim_out,
       "an Adapter that cannot take attachments reports it honestly")

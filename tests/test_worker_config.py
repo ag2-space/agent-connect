@@ -27,6 +27,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from _queue import child_env
 from agent_connect.config import CONFIG_ENV, Config, accepts, locate, parse
 
 ROOT = _bootstrap.ROOT
@@ -48,8 +49,11 @@ home = tmp / "home"
 work = tmp / "work"
 work.mkdir()
 
+# The token is written the way the Agent Portal issues it: the gateway travels
+# inside the credential, because there is no default gateway anywhere in this
+# system to fall back on.
 SETTINGS = f"""# written by hand, the way an operator would
-AGENT_CONNECT_TOKEN=tok-from-the-file
+AGENT_CONNECT_TOKEN=http://127.0.0.1:9/relay|tok-from-the-file
 AGENT_CONNECT_ADAPTER=ollama
 AGENT_CONNECT_REPO={work}
 AGENT_CONNECT_WORKSPACE={tmp}/ws
@@ -75,8 +79,10 @@ def start(*args, env=None, timeout=20.0):
     log = tmp / f"run-{_runs}.log"
     # Unbuffered, because the child is stopped rather than allowed to exit and
     # a buffered `print` would die in the buffer with it.
-    child = {"PATH": os.environ.get("PATH", ""), "HOME": str(home),
-             "PYTHONUNBUFFERED": "1"}
+    # The credential the child needs comes out of the config file under test in
+    # most of these, so `child_env`'s own is dropped unless a case wants it.
+    child = child_env(HOME=str(home))
+    child.pop("AGENT_CONNECT_TOKEN")
     child.update(env or {})
     with open(log, "w") as sink:
         proc = subprocess.Popen(
@@ -127,7 +133,8 @@ check(overridden == ["AGENT_CONNECT_ADAPTER"], "and reported as overridden")
 check(env["AGENT_CONNECT_REPO"] == str(work),
       "a variable set to whitespace is not a decision the operator made, so the "
       "file fills it")
-check("AGENT_CONNECT_TOKEN" in applied and env["AGENT_CONNECT_TOKEN"] == "tok-from-the-file",
+check("AGENT_CONNECT_TOKEN" in applied
+      and env["AGENT_CONNECT_TOKEN"] == "http://127.0.0.1:9/relay|tok-from-the-file",
       "everything the environment was silent about comes from the file")
 
 
@@ -183,7 +190,11 @@ READ_BACK = (
 
 def through_the_shell(path, base):
     """What a launcher's environment holds after `eval $(--export-config)`."""
-    child = {"PATH": os.environ.get("PATH", ""), "PYTHONUNBUFFERED": "1"}
+    # The fixture under test is what supplies the settings, so `child_env`'s
+    # own credential is dropped: it would show up in the read-back and make
+    # every comparison disagree about a variable neither reader read.
+    child = child_env()
+    child.pop("AGENT_CONNECT_TOKEN")
     child.update(base)
     script = (
         '_cfg="$(python3 -m agent_connect --config "$1" --export-config)" || exit 1\n'

@@ -38,6 +38,7 @@ try:
     from agent_connect.reporter import NO_SEND, PLACEHOLDER, REPLIED, LadderSettings
     from agent_connect.roomops import RoomOps
     from agent_connect.sessions import SessionSettings, SessionStore
+    from _queue import task as queued_task
     from agent_connect.worker import handle_one, process_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(
@@ -113,11 +114,10 @@ class Bench:
     def __init__(self, script: dict, timeout=None, settings=None):
         self._dir = tempfile.TemporaryDirectory()
         self.base = Path(self._dir.name)
-        self.tasks = self.base / "tasks"
         self.results = self.base / "results"
         self.repo = self.base / "repo"
         self.reports = self.base / "reports"
-        for d in (self.tasks, self.results, self.repo, self.reports):
+        for d in (self.results, self.repo, self.reports):
             d.mkdir()
         self.script_path = self.base / "script.json"
         self.set_script(script)
@@ -140,25 +140,20 @@ class Bench:
             timeout=self.timeout,
         )
 
-    def write(self, task_id: str, body: str = "do it", room: str = ROOM_A) -> Path:
-        path = self.tasks / f"task-{task_id}.txt"
-        path.write_text(
-            f"id: {task_id}\nchannel_id: {room}\ntask: {body}\naccess_tier: owner\n"
-        )
-        return path
+    def write(self, task_id: str, body: str = "do it", room: str = ROOM_A):
+        return queued_task(f"task-{task_id}", body, room=room)
 
     def handle(self, task_id: str, body: str = "do it", room: str = ROOM_A,
                ops=None, timeout=60) -> str:
-        path = self.write(task_id, body, room)
+        task = self.write(task_id, body, room)
         # The report is per Task, so the Adapter's command is too — and an
         # Adapter is cheap: what has to survive between Tasks is the store.
         self.adapter = self.adapter_for(task_id)
-        asyncio.run(asyncio.wait_for(
-            handle_one(path, self.adapter, str(self.repo), self.results,
+        return asyncio.run(asyncio.wait_for(
+            handle_one(task, self.adapter, str(self.repo), self.results,
                        None, ops, LadderSettings(throttle=0.0)),
             timeout=timeout,
         ))
-        return (self.results / f"task-{task_id}.txt").read_text()
 
     def report(self, task_id: str):
         path = self.reports / f"{task_id}.json"
@@ -231,15 +226,13 @@ async def _two_rooms():
     a = slow.write("s1", "the slow one", ROOM_A)
     b = fast.write("f1", "the quick one", ROOM_B)
     sessions = {}
-    await asyncio.gather(
+    return await asyncio.gather(
         process_one(a, slow.adapter_for("s1"), str(slow.repo), slow.results, sessions),
         process_one(b, fast.adapter_for("f1"), str(fast.repo), fast.results, sessions),
     )
 
 
-asyncio.run(asyncio.wait_for(_two_rooms(), timeout=60))
-timed_out = (slow.results / "task-s1.txt").read_text()
-survivor = (fast.results / "task-f1.txt").read_text()
+timed_out, survivor = asyncio.run(asyncio.wait_for(_two_rooms(), timeout=60))
 check("half an answer" in timed_out and "deadline" in timed_out,
       "the room that ran long gets its partial answer and its interruption")
 check("answered" in survivor and not survivor.startswith(NO_SEND),

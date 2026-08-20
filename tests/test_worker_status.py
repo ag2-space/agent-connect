@@ -28,9 +28,11 @@ import tempfile
 import time
 from pathlib import Path
 
+from _queue import CHILD_TOKEN, child_env
 from agent_connect.status import (
     DEFAULT_HEARTBEAT,
     ERROR,
+    RELAY_FIELDS,
     SERVING,
     STALE_AFTER,
     STARTING,
@@ -72,15 +74,13 @@ class Worker:
         self.workspace_status = self.dir / "ws" / "status.json"
         self.status = Path(status) if status else self.workspace_status
         self.log = self.dir / "out.log"
-        child = {
-            "PATH": os.environ.get("PATH", ""),
+        child = child_env(**{
             "HOME": str(self.dir),
-            "PYTHONUNBUFFERED": "1",
             "AGENT_CONNECT_WORKSPACE": str(self.dir / "ws"),
             "AGENT_CONNECT_REPO": str(self.dir),
             "AGENT_CONNECT_POLL": "0.05",
             "AGENT_CONNECT_STATUS_HEARTBEAT": heartbeat,
-        }
+        })
         if adapter:
             child["AGENT_CONNECT_ADAPTER"] = adapter
         if status:
@@ -147,6 +147,67 @@ check(later["heartbeat_seconds"] == 0.2,
       "and it states its own refresh interval, so an observer needs nothing out "
       "of band to know what fresh means")
 check(not is_stale(later), "a Worker that is serving is not stale")
+
+
+print("\n-- and it carries the transport's state beside its own --")
+
+# Layered status (transport-seam spec): the Worker's own facts — which Adapter,
+# which Local Agent answered preflight — and the connection state read off the
+# Relay Client's hook, in one file under one name. This child is pointed at a
+# port nothing is listening on, which is the interesting case: an unreachable
+# broker is a fact about the transport, and a Worker that is otherwise perfectly
+# healthy must not report it as its own death.
+relay = worker.wait_for(SERVING).get("relay") or {}
+check(set(relay) == set(RELAY_FIELDS),
+      "the relay block is exactly the documented projection of the library's "
+      "snapshot, not whatever the library happened to be carrying")
+check(doc.get("agent") is not None and doc.get("adapter") == "ollama",
+      "beside the Local Agent's own health, which is this Worker's to report")
+check(relay.get("connected") is False and relay.get("state") == "reconnecting",
+      "a broker that cannot be reached reads as reconnecting, not as an error")
+check(doc.get("state") == SERVING,
+      "— and the Worker itself is still serving, because it is")
+check("127.0.0.1:9" in (relay.get("gateway") or ""),
+      "the gateway is named, so an operator can see where it is pointed")
+check("test-secret" not in json.dumps(doc),
+      "and the credential is not, anywhere in the document: the URL is redacted "
+      "by the library before it is ever persisted")
+
+
+def relay_of(w):
+    return (w.doc().get("relay") or {})
+
+
+# The transport's clock and the Worker's are separate on purpose. The hook runs
+# on the library's poll thread, and a live poll thread says nothing about a
+# wedged event loop — so it must not be able to refresh `updated_at`, which is
+# the third way that promise could have been defeated.
+before = worker.doc()
+deadline = time.monotonic() + 5.0
+while time.monotonic() < deadline and relay_of(worker).get("updated_ts") == \
+        (before.get("relay") or {}).get("updated_ts"):
+    time.sleep(0.05)
+check(relay_of(worker).get("updated_ts") != (before.get("relay") or {}).get("updated_ts"),
+      "the relay block is refreshed as the connection's state changes")
+check("last_ok_ts" in relay_of(worker),
+      "carrying 'last connected when', which is the number an operator wants "
+      "and the one a naive rewrite drops")
+
+frozen = StatusFile(tmp / "layered" / "status.json", heartbeat=10.0,
+                    clock=lambda: 1000.0)
+frozen.serving(detail="serving")
+stamped = json.loads((tmp / "layered" / "status.json").read_text())["updated_at"]
+frozen.relay({name: "changed" for name in RELAY_FIELDS})
+after = json.loads((tmp / "layered" / "status.json").read_text())
+check(after["relay"]["state"] == "changed" and after["updated_at"] == stamped,
+      "a status hook writes the connection through and does NOT beat: freshness "
+      "is the Worker's event loop turning, and the library's thread is not it")
+check(after["state"] == SERVING,
+      "and it says nothing about the Worker's own state, which is not its news")
+frozen.relay(None)
+check(json.loads((tmp / "layered" / "status.json").read_text())["relay"] is None,
+      "no transport at all is null rather than absent — 'no relay' and 'a relay "
+      "that is offline' are different facts about a Worker")
 
 
 print("\n-- stopping on purpose is said out loud --")
