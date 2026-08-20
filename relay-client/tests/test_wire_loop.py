@@ -929,7 +929,20 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
           "exactly what the retired staging protocol did")
 
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
-    # F6: a result POST that fails and is retried must not re-upload.
+    # F6: an answer prepared twice for one task must not put its file in the
+    # room twice.
+    #
+    # **Which retry reaches the ledger, and which does not.** The wire loop's
+    # own result retry re-POSTs the *stored payload* (`_drain_locked`) and never
+    # calls `Outbound.prepare` again — so it cannot duplicate an upload, and a
+    # check written around it is green whatever the ledger does. That is not a
+    # theory: with `Outbound._remember` returning early, the version of this
+    # block that only drained still passed. What does reach the ledger is a
+    # consumer calling `complete` twice for one task — the shape a redelivered
+    # id takes, and the one the ledger exists for. So the drain is still here,
+    # asserting what it can honestly assert, and the second `complete` is what
+    # holds F6 up.
+    uploads = "POST", "/v1/rooms/%21room%3Aag2.space/media"
     workspace = Path(tmp) / "work"
     workspace.mkdir()
     (workspace / "chart.png").write_bytes(b"chart")
@@ -938,13 +951,26 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     broker.on("POST", "/v1/rooms/*/media", json={"mxc": "mxc://ag2/2"})
     broker.on("POST", "/v1/results", status=500, body=b"nope")
     client.poll_once()
-    client.complete("task-f6", "Chart.\n[file: chart.png]", base_dir=workspace)
+    answer = "Chart.\n[file: chart.png]"
+    first = client.complete("task-f6", answer, base_dir=workspace)
+    check(len(broker.took(*uploads)) == 1 and first.uploaded == ("chart.png",),
+          "the chart goes up once when the answer is first prepared")
+
+    again = client.complete("task-f6", answer, base_dir=workspace)
+    check(len(broker.took(*uploads)) == 1,
+          "and preparing the same answer again — a re-completed id, the shape a "
+          "redelivery takes — sends no second copy: one chart in the room, not "
+          f"two (F6) ({len(broker.took(*uploads))} upload(s))")
+    check(again.body == first.body and again.uploaded == ("chart.png",),
+          "the second call still reports the file as sent and re-derives the "
+          "same body, so the room is told the same thing either way")
+
     client._result_retry_at.clear()          # skip the per-result backoff gate
     broker.on("POST", "/v1/results", json={"ok": True})
     client._drain_results()
-    check(len(broker.took("POST", "/v1/rooms/%21room%3Aag2.space/media")) == 1,
-          "a retried result POST re-derives the same body and uploads nothing "
-          "more — one chart in the room, not two (F6)")
+    check(len(broker.took(*uploads)) == 1,
+          "the loop's own retry re-POSTs the body it already built — the upload "
+          "is not on that path at all, which is why it cannot be what proves F6")
     check(client.outbound.already_sent("task-f6") == (),
           "and the ledger is retired by the POST that finally succeeded, "
           "because only success may retire one (F5)")
