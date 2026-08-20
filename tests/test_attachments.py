@@ -238,15 +238,13 @@ class OnlyText:
 
 impl = OnlyText()
 shimmed = ShimAdapter("codex", impl)
-shim_ws = base / "shim"
-(shim_ws / "results").mkdir(parents=True)
 shim_out = asyncio.run(handle_one(
     task("s1", "what is wrong with this?", room="!room:ag2.space",
          attachments=(
              Attachment(locator=str(real), mime="image/png", filename="shot.png"),
              Attachment(locator=str(real), mime="application/pdf", filename="notes.pdf"),
          )),
-    shimmed, str(base), shim_ws / "results"))
+    shimmed, str(base)))
 
 check("I can't read that kind of attachment" in shim_out,
       "an Adapter that cannot take attachments reports it honestly")

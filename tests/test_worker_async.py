@@ -7,7 +7,7 @@ called which.
 
 The fixtures are queue fixtures — a `Task` put on a `FakeClient`, and the
 `complete` / `reject` it recorded. They used to be files in `tasks/` and files
-in `results/`, which is the seam this ticket removed.
+in `results/`, which is the seam that ticket removed.
 
 Run: python3 tests/test_worker_async.py
 """
@@ -17,7 +17,6 @@ import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import ast
 import asyncio
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -36,14 +35,6 @@ def check(cond, name):
     print(("  ok   " if cond else "  FAIL ") + name)
     if not cond:
         fails += 1
-
-
-def workspace():
-    """The outgoing directory, which is all a workspace is to a Turn now."""
-    tmp = Path(tempfile.mkdtemp())
-    results = tmp / "results"
-    results.mkdir()
-    return results
 
 
 class SyncStub:
@@ -108,11 +99,10 @@ check(
 )
 
 native = NativeStub()
-results = workspace()
 client = FakeClient()
 tf = task("c2", "do it", room="!r2:ag2.space", sender_name="Nikita",
           user_id="@n:ag2.space", source_message_id="$m2")
-asyncio.run(handle_one(tf, native, "/repo", results, client=client))
+asyncio.run(handle_one(tf, native, "/repo", client=client))
 seen = native.seen[0]
 check(isinstance(seen, TurnContext), "the Adapter is handed a TurnContext")
 check(
@@ -185,9 +175,8 @@ check(get_adapter("codex").impl is ADAPTERS["codex"], "codex is driven by its ow
 # that prose through verbatim rather than classify it — the error text a person
 # sees for a missing CLI or a timeout is unchanged.
 errs = ShimAdapter("codex-ish", SyncStub(output="agent-connect: codex timed out after 600s."))
-results = workspace()
 out = asyncio.run(process_one(task("x1", "do it", room="!e:ag2.space"),
-                              errs, "/repo", results))
+                              errs, "/repo"))
 check(
     out == "agent-connect: codex timed out after 600s.",
     "an Adapter's own error text reaches the answer unchanged",
@@ -233,7 +222,6 @@ check(
 # -- rooms stop blocking each other ------------------------------------------
 
 slow = ShimAdapter("slow", SyncStub(delay=0.4))
-results = workspace()
 client = FakeClient()
 a = task("r1", "slow one", room="!a:ag2.space")
 b = task("r2", "slow two", room="!b:ag2.space")
@@ -243,8 +231,8 @@ async def _two_rooms():
     sessions = {}
     started = time.monotonic()
     await asyncio.gather(
-        handle_one(a, slow, "/repo", results, sessions, client=client),
-        handle_one(b, slow, "/repo", results, sessions, client=client),
+        handle_one(a, slow, "/repo", sessions, client=client),
+        handle_one(b, slow, "/repo", sessions, client=client),
     )
     return time.monotonic() - started
 
@@ -255,7 +243,6 @@ check(slow.impl.peak == 2, "both Tasks were genuinely in flight together")
 check(client.answered == {"r1", "r2"}, "both rooms got an answer")
 
 same = ShimAdapter("same", SyncStub(delay=0.2))
-results = workspace()
 c = task("s1", "first", room="!same:ag2.space")
 d = task("s2", "second", room="!same:ag2.space")
 
@@ -263,8 +250,8 @@ d = task("s2", "second", room="!same:ag2.space")
 async def _one_session():
     sessions = {}
     await asyncio.gather(
-        process_one(c, same, "/repo", results, sessions),
-        process_one(d, same, "/repo", results, sessions),
+        process_one(c, same, "/repo", sessions),
+        process_one(d, same, "/repo", sessions),
     )
 
 
@@ -274,7 +261,6 @@ check(same.impl.peak == 1, "one Session runs one Turn at a time")
 
 # -- a failing Task is one Task's problem ------------------------------------
 
-results = workspace()
 client = FakeClient()
 boom = task("b1", "explode", room="!x:ag2.space")
 fine = task("b2", "fine", room="!y:ag2.space")
@@ -290,8 +276,8 @@ class Selective:
 async def _one_bad():
     sessions = {}
     await asyncio.gather(
-        handle_one(boom, Selective(), "/repo", results, sessions, client=client),
-        handle_one(fine, Selective(), "/repo", results, sessions, client=client),
+        handle_one(boom, Selective(), "/repo", sessions, client=client),
+        handle_one(fine, Selective(), "/repo", sessions, client=client),
     )
 
 
@@ -309,10 +295,9 @@ check(not client.rejected,
 
 # -- every Task leaves through complete or reject, once -----------------------
 
-results = workspace()
 client = FakeClient()
 counted = NativeStub()
-asyncio.run(handle_one(task("e1", ""), counted, "/repo", results, client=client))
+asyncio.run(handle_one(task("e1", ""), counted, "/repo", client=client))
 check(client.refusal("e1") == EMPTY_TASK,
       "a Task with no prompt in it is dead-lettered rather than dropped: "
       "re-serving it produces the same nothing five times over")
@@ -323,14 +308,14 @@ check(counted.seen == [], "an empty Task never reaches the Adapter")
 # here — the library quarantined it (G2) and deliberately does not fall back to
 # the unstripped text. That is a Task nothing could ever answer, too.
 asyncio.run(handle_one(task("e2", "[room-ops metadata: reply_to=$x]"), counted,
-                       "/repo", results, client=client))
+                       "/repo", client=client))
 check(client.refusal("e2") == EMPTY_TASK,
       "a body that was nothing but a quarantined metadata block is the same "
       "refusal, and still never reaches the Adapter")
 check(counted.seen == [], "— still nothing handed to the Local Agent")
 
 answered = asyncio.run(handle_one(task("e3", "hello", room="!z:ag2.space"),
-                                  Selective(), "/repo", results, client=client))
+                                  Selective(), "/repo", client=client))
 check(answered == "ok" and client.answer("e3") == "ok",
       "and an ordinary Task is completed with what the Turn returned")
 check(len(client.completed) + len(client.rejected) == 3,
@@ -342,13 +327,12 @@ check(len(client.completed) + len(client.rejected) == 3,
 # where that task's content is". Judged on the body alone it reads as empty,
 # and empty is *terminal*: the broker parks it, posts a failure notice, and no
 # retry can recover it, for a screenshot somebody dropped into a room.
-results = workspace()
 client = FakeClient()
 shot = task("e4", "", attachments=(ev.Attachment(
     locator="/tmp/nothing/Screenshot.png", filename="Screenshot.png",
     mime="image/png"),))
 looked = NativeStub()
-body = asyncio.run(handle_one(shot, looked, "/repo", results, client=client))
+body = asyncio.run(handle_one(shot, looked, "/repo", client=client))
 check(client.refusal("e4") is None,
       "a Task carrying a file is never dead-lettered for having no words in it")
 check(client.answer("e4") == body and body,
@@ -360,7 +344,7 @@ check(looked.seen and looked.seen[0].attachments == shot.attachments,
       "and the file travels beside the prompt, never folded into it")
 
 still_empty = task("e5", "")
-asyncio.run(handle_one(still_empty, looked, "/repo", results, client=client))
+asyncio.run(handle_one(still_empty, looked, "/repo", client=client))
 check(client.refusal("e5") == EMPTY_TASK,
       "a Task with neither text nor files is still the reject — emptiness is "
       "judged on both, and `reject` stays reserved for genuinely nothing")
@@ -374,7 +358,6 @@ check(client.refusal("e5") == EMPTY_TASK,
 # by the broker and re-executed, which is right for work that never finished,
 # while a `reject` would be terminal for a Task whose only problem was that the
 # Worker was asked to stop.
-results = workspace()
 client = FakeClient()
 
 
@@ -394,7 +377,7 @@ async def _cancelled():
     adapter = Wedged()
     fut = asyncio.ensure_future(
         handle_one(task("c9", "take your time", room="!c:ag2.space"), adapter,
-                   "/repo", results, client=client))
+                   "/repo", client=client))
     for _ in range(200):
         await asyncio.sleep(0.01)
         if adapter.entered.is_set():
@@ -430,7 +413,7 @@ class Sluggish(FakeClient):
 async def _answering_at_the_stop():
     fut = asyncio.ensure_future(
         handle_one(task("s1", "quick", room="!s:ag2.space"), NativeStub(),
-                   "/repo", workspace(), client=Sluggish()))
+                   "/repo", client=Sluggish()))
     await asyncio.sleep(0.15)                # the answer is on its thread now
     fut.cancel()                             # what the teardown does on SIGTERM
     try:
@@ -449,14 +432,13 @@ check(took < 0.6,
 
 # -- the drain loop keeps going -----------------------------------------------
 
-results = workspace()
 client = FakeClient().offer(task("l1", "explode", room="!l1:ag2.space"),
                             task("l2", "fine", room="!l2:ag2.space"))
 
 
 async def _drain():
     loop = asyncio.ensure_future(
-        serve(Selective(), "/repo", results, client, 0.01))
+        serve(Selective(), "/repo", client, 0.01))
     for _ in range(200):
         await asyncio.sleep(0.01)
         if client.answered == {"l1", "l2"}:
@@ -487,7 +469,7 @@ class Unreadable(FakeClient):
 async def _dead_reader():
     try:
         await asyncio.wait_for(
-            serve(NativeStub(), "/repo", workspace(), Unreadable(), 0.01), 5.0)
+            serve(NativeStub(), "/repo", Unreadable(), 0.01), 5.0)
     except asyncio.TimeoutError:
         return "still serving, receiving nothing"
     except RuntimeError as exc:

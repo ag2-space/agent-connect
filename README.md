@@ -320,21 +320,30 @@ the worker takes the marker out of the text, so the room reads prose and receive
 the file beside it, as one reply. Several files from one turn all arrive, in the
 order the agent named them.
 
-**The route matters more than the feature.** A file goes out by being placed in
-the **outgoing directory** — `<workspace>/results/`, the one directory the send
-allowlist on the other side of the relay client trusts. The worker
-posts no media itself, and that is deliberate: the allowlist is what stops an
-agent from being talked into attaching a private key or somebody's tax return to
-a chat message, and a worker that uploaded files directly would turn any message
-into an exfiltration trigger. Restricting the ACP adapter to the owner narrows
-who can try; it does not close it, because the owner in a room is not necessarily
-the person sitting at the machine.
+**The route matters more than the feature.** A file goes out through the relay
+client's **egress allowlist**: a list of directories, fixed when the worker
+builds the client and impossible to widen afterwards, holding the working
+directory the agent runs in and anything you added in
+`AGENT_CONNECT_EGRESS_ROOTS`. The allowlist is what stops an agent from being
+talked into attaching a private key or somebody's tax return to a chat message.
+Restricting the ACP adapter to the owner narrows who can try; it does not close
+it, because the owner in a room is not necessarily the person sitting at the
+machine.
 
-**A file outside the working directory is not sent, and the room is told so** —
-by name and with the reason, in the same reply. A file that silently fails to
-arrive is indistinguishable from an agent that ignored the request. The same line
-appears for a file that has gone missing, one that is not a regular file, and one
-over `AGENT_CONNECT_OUTGOING_MAX_BYTES`.
+The check runs **inside this process**, on the open file descriptor rather than
+on the path: resolved first, then opened one directory component at a time with
+`O_NOFOLLOW`, then judged by `fstat` for regular-file-ness, size and a single
+hard link. It used to run in a *separate* process, and workspace `docs/adr/0001`
+records the loss of that separation honestly — the guarantee stays permission
+policy, not confinement, which is what it always was, since the worker has always
+held the token.
+
+**A file outside the allowlisted directories is not sent, and the room is told
+so** — by name and with the reason, in the same reply. A file that silently fails
+to arrive is indistinguishable from an agent that ignored the request. The same
+line appears for a file that has gone missing, one that is not a regular file,
+one reached through a symlink pointing out of the permitted area, and one over
+the relay's upload ceiling.
 
 What this does not prevent: an agent talked into *copying* a private file into
 its working directory can then send the copy. The permitted area is a boundary on
@@ -458,9 +467,9 @@ AGENT_CONNECT_REPO=/Users/me/agents/scratch
 AGENT_CONNECT_WORKSPACE=/Users/me/.agent-connect/instances/scratch/workspace
 ```
 
-**Two instances must never share a workspace.** The outgoing directory, the
-relay client's state (its journal of which tasks have been answered), the
-session map and the status file all live in it, and two workers sharing one
+**Two instances must never share a workspace.** The relay client's state (its
+journal of which tasks have been answered), the session map and the status file
+all live in it, and two workers sharing one
 journal each believe the other's tasks are already answered. Two instances
 sharing an *agent token* is the same bug one layer up: one queue, two pullers.
 A new instance means a new Agent Identity.
@@ -630,13 +639,13 @@ table.
 | `AGENT_CONNECT_TOKEN` | your agent identity's relay token, from the Agent Portal. It is a combined `<gateway-url>\|<secret>` credential: the gateway travels inside it, and there is no default to fall back on, so a bare secret needs `REMOTE_TASK_URL` beside it. Without a token the worker refuses to start, because it would have no way of being given any work | *(required)* |
 | `AGENT_CONNECT_ADAPTER` | which adapter runs the task: `codex`, `ollama`, `omnigent`, `cline`, `kilo`, `acp` | *(required)* |
 | `AGENT_CONNECT_REPO` | the working directory the agent operates in. Created for you when it is the default; a path under `~/Documents`, `~/Desktop` or `~/Downloads` is warned about, because macOS privacy protection turns agent file operations there into an unexplained "operation not permitted" | `~/agents` |
-| `AGENT_CONNECT_WORKSPACE` | workspace dir holding the outgoing `results/`, the relay client's state under `relay/`, the session map and the status file | `~/.agent-connect/workspace` |
+| `AGENT_CONNECT_WORKSPACE` | workspace dir holding the relay client's state under `relay/`, the session map and the status file | `~/.agent-connect/workspace` |
 | `AGENT_CONNECT_STATUS_FILE` | the status file this worker owns (see the section above) | `<workspace>/status.json` |
 | `AGENT_CONNECT_STATUS_HEARTBEAT` | seconds between refreshes of the status file's `updated_at`, and the staleness window an observer reads out of it | `15.0` |
 | `AGENT_CONNECT_INSTANCE` | a name for this worker instance: carried into its status file so a supervisor watching several can tell them apart, and used to namespace the relay client's state under `<workspace>/relay/`. Letters, digits, `_` and `-`, at most 32 — a name outside that is refused rather than mangled, because two instances quietly sharing one sanitised name would share one journal | `default` |
 | `AGENT_CONNECT_POLL` | seconds one read of the relay client's task queue waits before the worker looks around. It paces nothing else: a task that arrives wakes the read immediately, and the long-poll cadence on the wire belongs to the relay client | `1.0` |
 | `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` | how much of one attached file is read into a prompt. An attachment over this is reported in the room, never shrunk to fit. `0` means no limit | `10485760` (10 MB) |
-| `AGENT_CONNECT_OUTGOING_MAX_BYTES` | how large a file the agent produced may be and still be sent to the room. The relay refuses more than this anyway; refusing it here means a sentence in the room instead of a log line. `0` means no limit | `26214400` (25 MB) |
+| `AGENT_CONNECT_EGRESS_ROOTS` | extra directories a file the agent produced may be sent to the room *from*, separated by `:`. The working directory (`AGENT_CONNECT_REPO`) is always one; this is for a worker whose agent writes somewhere else as well. Nothing outside these directories is ever uploaded, and the list is fixed when the worker starts | *(none)* |
 
 The ladder (see the section above):
 
@@ -699,6 +708,12 @@ has read them since the worker took the wire over. Setting them now does
 nothing at all — not even to a relay client, because this install starts none.
 An old `launch.sh`, or a launcher of your own, that still exports them can drop
 the lines.
+
+`AGENT_CONNECT_RESULT_DIR` was the exception: it *was* read here, by the
+outgoing-file staging airlock. That protocol is retired, and its replacement is
+`AGENT_CONNECT_EGRESS_ROOTS` above. `AGENT_CONNECT_OUTGOING_MAX_BYTES` went with
+it — the size ceiling is the relay client's own, so there is one number rather
+than two that can disagree.
 
 ## Adapters
 

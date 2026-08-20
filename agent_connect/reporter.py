@@ -74,7 +74,7 @@ from .events import (
     TurnContext,
     final_text,
 )
-from .outgoing import Delivery, Outbox, carries_files, not_sent_notice, only_files_line
+from .outgoing import named_files
 from .roomops import RoomOpError
 
 #: The fleet-wide placeholder copy. Not ours to reword: every agent on the
@@ -90,10 +90,11 @@ REPLIED = "[REPLIED]"
 #: client already knows how to chunk.
 POINTER = "✅ Done — the answer was too long for this message, so it follows below."
 
-#: What the placeholder becomes when the reply carries a file. Same branch, same
-#: reason: the body has to travel the delivery path, because that is the only
-#: path with the send allowlist on it — see `agent_connect.outgoing`. The reply
-#: and its files arrive together, just below.
+#: What the placeholder becomes when the reply carries a file. Same branch, and
+#: now for a sharper reason: the file markers are read by the Relay Client's
+#: `complete`, and a skip marker is **terminal** — a `[REPLIED]` body is never
+#: parsed past, so the file would never leave. The reply and its files arrive
+#: together, just below.
 FILE_POINTER = "✅ Done — the reply and its file follow below."
 FILE_POINTER_MANY = "✅ Done — the reply and its {count} files follow below."
 
@@ -187,19 +188,13 @@ class TurnReporter:
         ops=None,
         settings: Optional[LadderSettings] = None,
         clock=time.monotonic,
-        outbox: Optional[Outbox] = None,
     ):
         self.ops = ops
         self.settings = settings or LadderSettings()
         self._clock = clock
-        #: Where a file the agent produced is staged so the Relay Client's send
-        #: allowlist can see it. Built on demand, because a Turn that names no
-        #: file must not touch the filesystem to find that out.
-        self.outbox = outbox
         #: The placeholder's event identifier; falsy means nothing was posted.
         self.event_id = ""
         self._room = ""
-        self._ctx: Optional[TurnContext] = None
         self._last_edit = 0.0
         self._steps: List[str] = []      # tool titles, in the order they started
         self._failed: set = set()        # titles of tool calls that failed
@@ -212,17 +207,17 @@ class TurnReporter:
         #: True when the Turn ended as a structured rejection — observable so a
         #: caller can tell "nothing was delivered" from "nothing happened".
         self.rejected = False
-        #: The files this Turn put on their way to the room, by the name the room
-        #: will see, and the ones it refused to send.
-        self.delivered: tuple = ()
-        self.not_sent: tuple = ()
+        #: How many files this Turn's answer named. Observable so a caller can
+        #: tell the pointer branch from the ceiling one; *what became of them*
+        #: is not knowable here and is not guessed at — the upload happens
+        #: inside `complete`, and `complete` is what reports it.
+        self.files_named = 0
 
     # -- the Ladder ---------------------------------------------------------
 
     async def start(self, ctx: TurnContext) -> None:
         """Post the placeholder. Silence is what this is here to end."""
         self._room = ctx.room
-        self._ctx = ctx
         if self.ops is None or not self._room or not getattr(self.ops, "available", True):
             return
         try:
@@ -247,7 +242,6 @@ class TurnReporter:
         Turn is waiting must not resurface stapled to the answer.
         """
         self._room = ctx.room
-        self._ctx = ctx
         others = "" if ahead <= 1 else f" ({ahead} messages are ahead of it)"
         return await self.notice(QUEUED.format(others=others), keep=False)
 
@@ -297,22 +291,23 @@ class TurnReporter:
 
         Four endings, and which one happened is visible in the return value.
         The answer fits an edit: the placeholder becomes it, and the result body
-        is the terminal marker, so the delivery path posts nothing. The answer
-        does not fit: the placeholder becomes a short pointer and the answer
-        itself is the result body, which the relay client chunks as it always
-        has. **The reply carries a file**: the same pointer branch, for a
-        different reason — the body has to reach the delivery path, because the
-        send allowlist lives there and a `[REPLIED]` body is archived unread. And
-        there is no answer at all: nothing is edited and the result is a
-        structured rejection — see `reject`.
+        is the terminal marker, so nothing further is posted. The answer does
+        not fit: the placeholder becomes a short pointer and the answer itself
+        is the result body, which the relay chunks as it always has. **The reply
+        carries a file**: the same pointer branch, for a different reason — a
+        `[REPLIED]` body is a skip, a skip is terminal in the marker grammar,
+        and the Relay Client never reads past one to find the file. And there is
+        no answer at all: nothing is edited and the result is a structured
+        rejection — see `reject`.
         """
         ending = _ending(reason, note)
-        files = self._outgoing(answer)
-        answer = files.text or only_files_line(files.sent)
-        # A reply whose whole content was a file marker still has something to
-        # deliver, and one that names a file it may not send still has something
-        # to say. Only a Turn with none of the three produced nothing.
-        if not answer.strip() and not files.asked:
+        # The markers stay in the body on purpose. They are the answer's
+        # instructions to the Relay Client, which reads them in `complete` — the
+        # one parser — and strips them there. Reading them here to decide the
+        # ladder's branch is not a second parse: it is the same parser, asked a
+        # question about one body (`outgoing.named_files`).
+        self.files_named = len(named_files(answer))
+        if not answer.strip():
             if reason not in NORMAL_REASONS or not self.event_id:
                 return self.reject(reason, ending)
             # A Turn that ended *normally* with nothing to say is not a failure,
@@ -324,38 +319,20 @@ class TurnReporter:
             answer = SILENT
         body = _assemble(
             answer, ending, self._steps, self._failed, self._refused, self._unposted,
-            not_sent_notice(files.refused),
         )
-        if files.markers:
-            # Invisible to the room — the delivery path strips them and uploads
-            # what they name. Last, so the prose above is what a person reads.
-            body = body + "\n\n" + "\n".join(files.markers)
         if not self.event_id:
             return body
-        if files.markers or len(body) > self.settings.ceiling:
-            await self._edit(_pointer(files.markers))
+        if self.files_named or len(body) > self.settings.ceiling:
+            # Two reasons to leave the answer in the body. Too long to edit in —
+            # `/v1/results` chunks it. Or it carries a file: `[REPLIED]` is a
+            # skip marker, a skip is terminal in the grammar, and a body nobody
+            # parses past is a body whose attachment never leaves.
+            await self._edit(_pointer(self.files_named))
             return body
         if not await self._edit(body):
             # The final edit is the one failure that must not lose the answer.
             return body
         return f"{REPLIED}\n\n{body}"
-
-    def _outgoing(self, answer: str) -> Delivery:
-        """Stage whatever files this answer named, and take the markers out of it.
-
-        The Worker never uploads anything itself: a file leaves this machine by
-        being placed in the outgoing result directory, which is the one place the
-        Relay Client's send allowlist trusts. See `agent_connect.outgoing` for why
-        the route matters more than the feature.
-        """
-        if not carries_files(answer):
-            return Delivery(text=answer or "")
-        if self.outbox is None:
-            self.outbox = Outbox()
-        delivery = self.outbox.stage(answer, self._ctx)
-        self.delivered = delivery.sent
-        self.not_sent = delivery.refused
-        return delivery
 
     def reject(self, reason: str, ending: str = "") -> str:
         """A Turn that produced nothing: say so to the archive, not to the room.
@@ -448,16 +425,16 @@ class TurnReporter:
         return True
 
 
-def _pointer(markers) -> str:
+def _pointer(count: int) -> str:
     """What the placeholder becomes when the reply travels below it."""
-    if not markers:
+    if not count:
         return POINTER
-    if len(markers) == 1:
+    if count == 1:
         return FILE_POINTER
-    return FILE_POINTER_MANY.format(count=len(markers))
+    return FILE_POINTER_MANY.format(count=count)
 
 
-def _assemble(answer: str, note: str, steps, failed, refused, notices=(), files="") -> str:
+def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str:
     """The answer, its ending, and a compact summary of what was done.
 
     The summary is not a log. It is the two or three lines that let a person see
@@ -471,9 +448,10 @@ def _assemble(answer: str, note: str, steps, failed, refused, notices=(), files=
     dropped: a Worker with no room ops must still be able to say that the
     conversation started over.
 
-    `files` is what could not be sent, and it goes directly after the answer
-    rather than as its own message: someone who asked for a report *and* did not
-    get it is owed both facts in the same breath.
+    A file that could not be sent is *not* assembled here. That refusal is
+    written where the refusing happens — the Relay Client appends
+    `[attachment not sent: …]` to the body it POSTs — because a sentence about a
+    judgement this side did not make would be this side guessing at one.
 
     Only ever called with something to say: a Turn that produced nothing goes to
     `TurnReporter.reject` instead, and does not travel this path at all.
@@ -481,8 +459,6 @@ def _assemble(answer: str, note: str, steps, failed, refused, notices=(), files=
     parts = [n.strip() for n in notices if n and n.strip()]
     if answer.strip():
         parts.append(answer.strip())
-    if files.strip():
-        parts.append(files.strip())
     if note.strip():
         parts.append(note.strip())
     summary = _summary(steps, failed, refused)

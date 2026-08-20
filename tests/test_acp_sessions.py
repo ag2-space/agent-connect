@@ -34,7 +34,6 @@ try:
     from agent_connect.adapters.acp import AcpAdapter
     from agent_connect.events import TurnContext
     from agent_connect.reporter import PLACEHOLDER, REPLIED, LadderSettings
-    from agent_connect.roomops import RoomOps
     from agent_connect.sessions import (
         SessionRecord,
         SessionSettings,
@@ -42,6 +41,7 @@ try:
         store_path,
         workspace_dir,
     )
+    from _queue import room_ops_at
     from _queue import task as queued_task
     from agent_connect.worker import handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
@@ -100,7 +100,7 @@ class FakeRelay:
 
     @property
     def ops_client(self):
-        return RoomOps(f"http://127.0.0.1:{self.server.server_port}", "test-token")
+        return room_ops_at(f"http://127.0.0.1:{self.server.server_port}")
 
     def of(self, kind):
         return [o for o in self.ops if o.get("op") == kind]
@@ -158,7 +158,7 @@ class Bench:
         os.environ["FAKE_ACP_REPORT"] = str(self.reports / f"{task_id}.json")
         try:
             return asyncio.run(asyncio.wait_for(
-                handle_one(task, self.adapter, str(cwd or self.repo), self.results,
+                handle_one(task, self.adapter, str(cwd or self.repo),
                            None, ops, LadderSettings(throttle=0.0)),
                 timeout=30,
             ))

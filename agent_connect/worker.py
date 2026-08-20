@@ -18,12 +18,21 @@ module twice.
 **The library is sync and threaded; this side is asyncio.** Every call across
 that seam runs on a **daemon thread** rather than on the event loop or on the
 default executor: the queue read on one of its own, `complete` and `reject` on
-one apiece. Cadence is a correctness property on the other side of the seam — a
-poll thread that stops polling loses its leases — and a blocked event loop up
-here is a `complete` that never happens down there. The daemon part is the same
-argument at shutdown: `asyncio.run` joins every thread of the default executor
-on its way out, so one answer in flight would hold the process open past the
-point a service manager stops waiting and starts killing.
+one apiece, and every Room Op the Ladder asks for on one of its own too. Cadence
+is a correctness property on the other side of the seam — a poll thread that
+stops polling loses its leases — and a blocked event loop up here is a
+`complete` that never happens down there. The daemon part is the same argument
+at shutdown: `asyncio.run` joins every thread of the default executor on its way
+out, so one answer in flight would hold the process open past the point a
+service manager stops waiting and starts killing. The one function that does
+this lives in `agent_connect.relay`, beside the construction of the thing it
+calls into.
+
+**A file the agent produced goes out through `complete`, not from here.** The
+answer's `[file: …]` markers travel with it, the library reads them in the one
+place that grammar is written down, and it uploads from a path inside the
+allowlist roots this Worker built the client with (`agent_connect.outgoing`).
+There is no staging directory any more, and nothing here reads a marker.
 
 Tasks are processed **concurrently across rooms** and serialised within one
 Session: a ten-minute request in one room no longer silences every other room,
@@ -54,10 +63,10 @@ from .config import CONFIG_ENV, DEFAULT_PATH, ConfigError
 from .config import export as export_config
 from .config import load as load_config
 from .events import Attachment, TurnContext
-from .outgoing import Outbox
 from .pending import queue_for
+from .relay import in_daemon_thread  # noqa: F401 — re-exported
 from .reporter import LadderSettings, TurnReporter
-from .roomops import room_ops_from_env
+from .roomops import room_ops_for
 from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
 from .sessions import workspace_dir
 from .status import StatusFile, from_env as status_from_env
@@ -292,7 +301,6 @@ async def process_one(
     task,
     adapter,
     repo: str,
-    results_dir: Path,
     sessions: dict = None,
     ops=None,
     settings=None,
@@ -324,13 +332,7 @@ async def process_one(
     ctx = turn_context(task, repo)
     if not ctx.prompt:
         return ""
-    # The results directory is also the *outgoing* directory: it is the one place
-    # the Relay Client's send allowlist trusts, so a file the agent produced leaves
-    # this machine by being staged there and named in the result body. The Worker
-    # uploads nothing itself — see `agent_connect.outgoing`. Transport-seam
-    # ticket 09 retires the staging airlock for the library's allowlisted-path
-    # egress; until then this route is unchanged.
-    reporter = TurnReporter(ops, settings, outbox=Outbox(results_dir))
+    reporter = TurnReporter(ops, settings)
 
     async def announce(turn) -> None:
         # Said before the wait rather than after it, and as its own message:
@@ -350,7 +352,6 @@ async def handle_one(
     task,
     adapter,
     repo: str,
-    results_dir: Path,
     sessions: dict = None,
     ops=None,
     settings=None,
@@ -394,7 +395,7 @@ async def handle_one(
     rejected.
     """
     try:
-        body = await process_one(task, adapter, repo, results_dir, sessions, ops, settings)
+        body = await process_one(task, adapter, repo, sessions, ops, settings)
     except asyncio.CancelledError:
         # Written out rather than left to the `Exception` guard's blind spot, so
         # the third exit is visible where the other two are. Nothing is said to
@@ -409,69 +410,36 @@ async def handle_one(
         # "not ready", not an answer), so it must not be able to reach it.
         await _answer(client, "reject", task.id, EMPTY_TASK)
         return ""
-    await _answer(client, "complete", task.id, body)
+    # `repo` travels with the answer as the directory a *relative* path in a
+    # `[file:]` marker is read against — the Turn's working directory, which is
+    # also the root the client was built with. It widens nothing: the library
+    # still judges where the file is, never how it was named.
+    await _answer(client, "complete", task.id, body, repo)
     return body
 
 
-async def in_daemon_thread(call, *args):
-    """Await a blocking call on a thread that cannot outlive this process.
-
-    `asyncio.to_thread` would be the obvious way, and it is the wrong one here.
-    It runs on the loop's default executor, and `asyncio.run` shuts that
-    executor down on the way out by **joining every thread in it**: measured, a
-    SIGTERM during an eight-second call held the interpreter for 8.01 s after
-    the loop had finished. That is the shutdown hang the queue reader is a
-    daemon thread to avoid, and a `complete` can be inside it for the better
-    part of a minute (the library's drain-lock wait plus its result budget, with
-    a twenty-second POST able to start at the end of it).
-
-    Nothing is lost by not waiting. Everything this is used for is durable
-    before its network call — the library journals a result and then POSTs it,
-    and re-POSTs what is owed on the next run — so an abandoned thread costs a
-    round trip, not an answer.
-    """
-    loop = asyncio.get_running_loop()
-    done = loop.create_future()
-
-    def hand_back(setter, value) -> None:
-        # The awaiting Turn may have been cancelled, and the loop may be closed
-        # — both mean nobody is waiting for this any more, and neither is worth
-        # a traceback on the way out.
-        if not done.cancelled():
-            setter(value)
-
-    def run() -> None:
-        try:
-            result = call(*args)
-        except BaseException as exc:  # noqa: BLE001 — carried, not swallowed
-            handed = (done.set_exception, exc)
-        else:
-            handed = (done.set_result, result)
-        try:
-            loop.call_soon_threadsafe(hand_back, *handed)
-        except RuntimeError:
-            pass                            # the loop closed; nobody is waiting
-
-    threading.Thread(target=run, name="agent-connect-answer", daemon=True).start()
-    return await done
-
-
-async def _answer(client, how: str, task_id: str, payload: str) -> None:
+async def _answer(client, how: str, task_id: str, payload: str, *rest) -> None:
     """Tell the library how one Task ended, without blocking the event loop.
 
-    The call is sync and does I/O — `complete` writes the journal and then
-    POSTs — so it goes to a thread of its own (see `in_daemon_thread`: not the
-    default executor, which a stop would have to join). It is also the last
-    thing standing between a finished Turn and the person who asked, so a
-    failure here is said loudly on stderr and nowhere else: raising would take
-    down the drain loop, and swallowing it silently would lose an answer without
-    a trace. The retry is the library's (F5: a result is retained until its POST
-    succeeds), which is why there is none here.
+    The call is sync and does I/O — `complete` reads the answer's markers,
+    uploads whatever it named from an allowlisted path, writes the journal and
+    then POSTs — so it goes to a thread of its own (see
+    `agent_connect.relay.in_daemon_thread`: not the default executor, which a
+    stop would have to join). It is also the last thing standing between a
+    finished Turn and the person who asked, so a failure here is said loudly on
+    stderr and nowhere else: raising would take down the drain loop, and
+    swallowing it silently would lose an answer without a trace. The retry is
+    the library's (F5: a result is retained until its POST succeeds), which is
+    why there is none here.
+
+    A refused attachment is **not** one of the failures this catches, and must
+    not be: the library says so in the answer it POSTs, where the person who
+    asked for the file will read it, rather than by raising into this loop (I1).
     """
     if client is None:
         return
     try:
-        await in_daemon_thread(getattr(client, how), task_id, payload)
+        await in_daemon_thread(getattr(client, how), task_id, payload, *rest)
     except asyncio.CancelledError:
         raise                               # a stop, not a failed answer
     except Exception as exc:  # noqa: BLE001 — one Task's answer, not the loop
@@ -482,7 +450,6 @@ async def _answer(client, how: str, task_id: str, payload: str) -> None:
 async def serve(
     adapter,
     repo: str,
-    results_dir: Path,
     client,
     poll: float,
     ops=None,
@@ -582,7 +549,7 @@ async def serve(
                     "the queue reader stopped: this Worker can no longer be "
                     f"given work ({type(task).__name__}: {task})") from task
             fut = asyncio.ensure_future(
-                handle_one(task, adapter, repo, results_dir, sessions,
+                handle_one(task, adapter, repo, sessions,
                            ops, settings, client=client)
             )
             running.add(fut)
@@ -832,8 +799,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         # is fine. Starting it is what leases work, and leasing work the Worker
         # cannot yet run would be a lease burnt on a Worker that may be about to
         # refuse to start.
+        #
+        # The working directory is resolved *first*, because it is one of the
+        # construction facts: it is the egress allowlist's root, and the roots
+        # are fixed when the client is built and never afterwards. A Worker
+        # that discovered where its agent works later would have to widen an
+        # allowlist to use it, which is the one thing an allowlist may not do.
+        repo = str(_resolve_repo())
         try:
-            client = relay_client.from_env(ws)
+            client = relay_client.from_env(ws, repo=repo)
         except Exception as exc:  # noqa: BLE001 — a refusal, said in words
             raise SystemExit(f"agent-connect: {exc}")
         if client is None:
@@ -854,16 +828,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         stopping.watch(client)
 
         agent = preflight(adapter, status)
-        repo = str(_resolve_repo())
         poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
 
-        results_dir = ws / "results"
-        results_dir.mkdir(parents=True, exist_ok=True)
-
-        # The Ladder: the placeholder and its edits are Room Ops. Still asked
-        # for over `roomops.py` rather than through the client — transport-seam
-        # ticket 09 is where that seam closes too.
-        ops = room_ops_from_env()
+        # The Ladder: the placeholder and its edits are Room Ops, asked for
+        # through the client the Worker already built — one bearer, one gateway,
+        # one speaker. There is no second credential read anywhere above this
+        # line, and nothing here knows a URL.
+        ops = room_ops_for(client)
         settings = LadderSettings.from_env()
 
         detail = f"adapter={adapter_name} repo={repo} ws={ws}"
@@ -872,7 +843,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         client.start()
         try:
             asyncio.run(
-                serve(adapter, repo, results_dir, client, poll, ops, settings,
+                serve(adapter, repo, client, poll, ops, settings,
                       status=status)
             )
         finally:

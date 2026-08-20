@@ -1,5 +1,5 @@
-"""Queue fixtures: a Task as the Relay Client delivers it, and a client to
-answer it to.
+"""Seam fixtures: a Task as the Relay Client delivers it, a client to answer it
+to, and the Room Ops a Ladder climbs.
 
 The suite used to build Tasks by writing `tasks/task-<id>.txt` and read answers
 back out of `results/task-<id>.txt`, because that was the seam. It is not the
@@ -19,7 +19,7 @@ is these five methods.
 
     client = FakeClient()
     body = asyncio.run(handle_one(task("t1", "do it"), adapter, "/repo",
-                                  results, client=client))
+                                  client=client))
     assert client.answer("t1") == body
 """
 from __future__ import annotations
@@ -33,6 +33,31 @@ from ag2_relay_client import Task
 from ag2_relay_client.client import STOP_JOIN_S, _error_code
 from ag2_relay_client.envelope import parse_task
 from ag2_relay_client.state import valid_wire_id
+
+def room_ops_at(url: str, roots=()) -> object:
+    """The Ladder's Room Ops, pointed at a relay listening on `url`.
+
+    Built the way `worker.main` builds them — around a real
+    `ag2_relay_client.roomops.RoomOps` — because there is no other way to build
+    one any more. `agent_connect.roomops` used to take a URL and a bearer and do
+    its own HTTP; it now takes the object the client already made, so a test
+    that wants a relay of its own makes one the same way the Worker does.
+
+    The credential is the combined `<url>|<secret>` form, which is the only form
+    the library takes: there is no compiled-in gateway anywhere below this line.
+    `roots` is the egress allowlist — empty by default, because a Ladder test is
+    not an egress test and a client built with no roots sends no files.
+    """
+    from ag2_relay_client.credentials import TokenSource
+    from ag2_relay_client.egress import EgressAllowlist
+    from ag2_relay_client.roomops import RoomOps as WireRoomOps
+    from ag2_relay_client.transport import RelayHTTP
+
+    from agent_connect.roomops import RoomOps
+
+    http = RelayHTTP(TokenSource(token=f"{url}|test-secret"))
+    return RoomOps(WireRoomOps(http, EgressAllowlist(roots)))
+
 
 #: A credential a child Worker can be started with. Combined and well-formed —
 #: the onboarding token carries its own gateway and the library has no default
@@ -110,6 +135,8 @@ class FakeClient:
         self.completed: list = []
         #: `(id, error_code)` in the order the Worker rejected them.
         self.rejected: list = []
+        #: `(id, base_dir)` — what a relative attachment path is read against.
+        self.base_dirs: list = []
         #: Whatever `on_status` was given, so a test can drive the hook itself.
         self.hook = None
         self.started = 0
@@ -162,10 +189,19 @@ class FakeClient:
         except queue.Empty:
             return None
 
-    def complete(self, broker_id: str, body: str) -> None:
+    def complete(self, broker_id: str, body: str, base_dir=None) -> None:
+        """The real one's signature, including the third argument.
+
+        `base_dir` is what a relative path in a `[file:]` marker is read
+        against, and it is a *parameter* rather than something the library
+        reads: only the consumer knows where its turn ran. Recorded here so a
+        test can assert the Worker passes it — a Worker that forgot to would
+        turn every relatively-named attachment into a refusal, quietly.
+        """
         wire_id = self._wire_id(broker_id)
         if not isinstance(body, str) or not body.strip():
             raise ValueError(f"refusing an empty result for {wire_id}")
+        self.base_dirs.append((wire_id, base_dir))
         self.completed.append((wire_id, body))
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:

@@ -38,6 +38,14 @@ a re-served id the consumer still holds is **re-acked** (never re-delivered),
 and a pause on acking is a pause on delivery, so it is said out loud and it is
 never allowed to swallow a re-ack.
 
+**Both halves of the media move are below the seam.** Inbound, a marker becomes
+a local path before the Task is delivered (below). Outbound, `complete` runs the
+answer through `Outbound` — the one marker parser, the egress allowlist built
+from `egress_roots`, the uploads — so a consumer hands over the text its agent
+wrote and never a path this library has not judged, never a URL, never bytes.
+The room ops the ladder needs are on `client.room_ops`, and a Room Op failure
+degrades to `/v1/results` rather than reaching the consumer (I1).
+
 **Media is resolved before delivery, off this thread.** A task body can carry an
 `[ag2space-media:]` marker, which is a URL and not a file; the stage in
 `media.py` turns it into a local path between the poll and the queue, so a
@@ -67,10 +75,14 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .backoff import Backoff
 from .credentials import TokenSource
+from .egress import DEFAULT_MAX_BYTES, EgressAllowlist
 from .envelope import Task, parse_task
 from .journal import Journal, Reconciler
 from .media import MediaIngress, MediaStore
+from .outbound import MAX_FILES, Outbound, PreparedResult
 from .resolver import BoundedResolver
+from .roomops import COOLDOWN_S as ROOM_OPS_COOLDOWN_S
+from .roomops import RoomOps
 from .singleton import LOST, STALE_AFTER_S, PollerGuard
 from .state import StateLayout, valid_wire_id
 from .status import (
@@ -181,12 +193,12 @@ PROTOCOL_VERSION = 1
 #: the broker's answer to an unknown entry is to ignore it.
 CAPABILITIES = ("task-ack", "heartbeat", "result-skip-markers", "reject")
 
-#: The one marker the wire loop itself needs: "recorded, nothing to post". It
+#: The one marker the wire loop itself writes: "recorded, nothing to post". It
 #: completes the lease without a user-facing reply, which is what makes
 #: re-completing a redelivery possible at all — a skipped `/v1/results` would
 #: leave the lease to expire and the task to come back again. The rest of the
-#: marker grammar (redirect, dm-only, attach) belongs to the Room Ops ticket
-#: and has exactly one parser when it lands.
+#: marker grammar (skip, redirect, dm-only, attach) is read — in the one place
+#: it is written down, `markers.py` — by `Outbound`, which `complete` runs.
 NO_SEND = "[no-send]"
 
 #: The dead-letter code for a task this client cannot even name.
@@ -210,6 +222,15 @@ class RelayClient:
     default), and `media_retention_s` opts out of deleting them when the task is
     answered — for a consumer whose own archives point at those paths.
 
+    **`egress_roots` is the whole of this client's outgoing-file policy**, and
+    it is fixed here. A body answered through `complete` is read for the marker
+    grammar and any file it names is uploaded from an allowlisted path — so the
+    directories in this one list are the only places on this machine a file can
+    leave from, a consumer that passes none sends nothing, and a reviewer
+    asking "what may this program upload?" has exactly one line to read. The
+    media directory is deliberately *not* added: a consumer that wants to send
+    back what arrived says so with an explicit root.
+
     **The authenticated session is private and sealed, and the object has no
     `__dict__`.** `RelayHTTP` is a bearer token with a `.post` on it, and a
     public attribute holding one is the raw-wire escape hatch this library
@@ -226,14 +247,18 @@ class RelayClient:
         "poll_wait", "socket_margin", "heartbeat_interval", "ack_cooldown",
         "auth_recheck_interval", "guard", "standby_recheck", "idle_gap",
         "result_budget", "intake_budget", "tier", "client_name",
-        "capabilities", "tasks", "media", "_reconciler", "_live", "_presence",
+        "capabilities", "tasks", "media", "_room_ops", "outbound",
+        "_reconciler", "_live", "_presence",
         "_ack_disabled_until", "_ack_owed", "_intake_deadline",
         "_result_retry_at", "_heartbeat_disabled", "_last_heartbeat",
         "_deferred_auth", "_drain_lock", "_stop", "_thread",
     )
 
-    #: Written once, in `__init__`, and never again.
-    _SEALED = frozenset({"_http"})
+    #: Written once, in `__init__`, and never again. `_room_ops` is sealed for
+    #: the reason `RoomOps` seals its own two: it holds the allowlist, and an
+    #: allowlist that refuses to be widened is worth nothing if the object
+    #: carrying it can be replaced by one built with wider roots.
+    _SEALED = frozenset({"_http", "_room_ops"})
 
     def __init__(
         self,
@@ -242,6 +267,10 @@ class RelayClient:
         instance: str = "default",
         media_dir=None,
         media_retention_s: Optional[float] = None,
+        egress_roots: Sequence[object] = (),
+        egress_max_bytes: int = DEFAULT_MAX_BYTES,
+        max_files: int = MAX_FILES,
+        room_ops_cooldown: float = ROOM_OPS_COOLDOWN_S,
         http: Optional[RelayHTTP] = None,
         resolver: Optional[BoundedResolver] = None,
         poll_wait: int = POLL_WAIT_S,
@@ -314,6 +343,23 @@ class RelayClient:
             on_auth_rejected=self._defer_auth,
         )
 
+        #: The outbound half, built here so that a consumer gets it by
+        #: consuming the client rather than by remembering to wire it up. The
+        #: allowlist is constructed from `egress_roots` and from nothing else —
+        #: no environment variable, no default root, no directory this library
+        #: chose on the consumer's behalf — because the point of a list fixed
+        #: at construction is that it is the only thing a reviewer has to read.
+        self._room_ops = RoomOps(
+            self._http,
+            EgressAllowlist(egress_roots, max_bytes=egress_max_bytes),
+            cooldown_s=room_ops_cooldown,
+            on_auth_rejected=self._defer_auth,
+        )
+        #: What `complete` runs the answer through: the marker grammar, the
+        #: uploads, the F6 ledger that keeps a retried result POST from putting
+        #: the same file in the room twice.
+        self.outbound = Outbound(self._room_ops, max_files=max_files)
+
         self._reconciler = Reconciler(self.journal)
         #: Ids accepted by *this* run. The journal knows which ids are owed an
         #: answer; only this set knows which of them a consumer could still be
@@ -361,6 +407,22 @@ class RelayClient:
         if name in self._SEALED:
             raise AttributeError(f"{name} is fixed at construction")
         object.__delattr__(self, name)
+
+    @property
+    def room_ops(self) -> RoomOps:
+        """Speaking in a room as this identity — post, edit, react, upload.
+
+        Read-only, and safe to hand around: `RoomOps` seals its own transport
+        and its own allowlist, so what a caller can reach through this is four
+        ops and no bearer. It is *not* a second way out for a file — `upload`
+        goes through the same allowlist `complete` does, built from the same
+        `egress_roots`.
+
+        Consumers need it for the placeholder→edit ladder: post a message, keep
+        the event id, edit it as the work proceeds, and then complete the lease
+        with `[REPLIED]`.
+        """
+        return self._room_ops
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -739,6 +801,12 @@ class RelayClient:
             return 0
 
         wire_id = task.id
+        # I2: the broker put 🫡 on this message when the task was acked, so
+        # nothing here may react to it again. Registered before any of the
+        # journal checks below and not after them, because a *re-serve* names
+        # the same event and reacting to it twice is the same doubled emoji —
+        # and because the whole guard is a bounded dict write that cannot fail.
+        self._room_ops.note_intake_event(task.source_message_id)
         if self.journal.is_done(wire_id):
             # F3: the answer already landed. Re-complete the lease upstream
             # with a skip marker — the broker dedups the result and delivers
@@ -961,7 +1029,8 @@ class RelayClient:
 
     # --- results (F5) ------------------------------------------------------
 
-    def complete(self, broker_id: str, body: str) -> None:
+    def complete(self, broker_id: str, body: str,
+                 base_dir: Optional[object] = None) -> PreparedResult:
         """Answer a task. The answer is durable before this returns.
 
         Delivery is this library's problem from here: the result is retained
@@ -972,6 +1041,24 @@ class RelayClient:
         An empty body is refused rather than sent (H5). A blank answer is "not
         ready", not "an empty answer" — a deliberate silence is `[no-send]`,
         which completes the lease and posts nothing.
+
+        **The body is read for the marker grammar before it goes anywhere**
+        (H2, through `Outbound`), and that is not a formatting pass: `[file:]`,
+        `[send:]` and `[attach:]` are the entrance to egress, so a file the
+        body names is uploaded from an allowlisted path *here*, in this
+        process, before the POST — and one that may not leave is refused with a
+        sentence appended to the answer, so the room learns it did not arrive.
+        A consumer that parsed these markers itself would be a second parser of
+        a grammar whose every copy has drifted, and a consumer that could hand
+        over bytes would make the allowlist decorative. Neither surface exists.
+
+        `base_dir` is what a *relative* path in a marker is read against — the
+        consumer's notion of "where this turn ran". It widens nothing: the
+        destination is still judged against `egress_roots`.
+
+        Returns what was prepared — the body actually POSTed, what was
+        uploaded, what was refused — so a consumer can log or display it.
+        Nothing in it has to be read: the answer is on its way either way.
         """
         wire_id = self._require_wire_id(broker_id)
         if not isinstance(body, str):
@@ -981,7 +1068,19 @@ class RelayClient:
                 f"refusing an empty result for {wire_id}: a blank answer is "
                 f"'not ready', not an answer. To complete the lease with no "
                 f"user-facing reply, send {NO_SEND!r}")
-        self._record_result(wire_id, {"id": wire_id, "body": body})
+        # The room the task came from, out of the journal's F7 sidecar. It is
+        # captured at accept because that is the only moment it is known, and
+        # media goes to a room-scoped route — so an answer produced after a
+        # restart still has somewhere to put its file.
+        prepared = self.outbound.prepare(
+            wire_id, self.journal.room_for(wire_id), body, base_dir=base_dir)
+        # A body that was *only* markers strips to nothing, and posting nothing
+        # is H5's failure at one remove: an empty message in the room. The lease
+        # still has to be completed, so it is completed the way a deliberate
+        # silence is — recorded, delivered to nobody.
+        self._record_result(
+            wire_id, {"id": wire_id, "body": prepared.body or NO_SEND})
+        return prepared
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:
         """Dead-letter a task: terminal, never re-served, nothing posted.
@@ -1087,6 +1186,11 @@ class RelayClient:
             self.journal.retire(wire_id)
             self._live.discard(wire_id)
             self._result_retry_at.pop(wire_id, None)
+            # F6: only a POST that succeeded may retire what this id uploaded.
+            # Forgetting any earlier is the bug — the retry would re-derive the
+            # same body, miss the ledger, and put the same chart in the room
+            # again.
+            self.outbound.forget(wire_id)
             delivered += 1
             log.info("result delivered for %s%s", wire_id,
                      " (the broker had it already)" if duplicate else "")
