@@ -42,6 +42,10 @@ already guards writes against, and the only place a file *a Turn produced* can
 be. An operator with a second one says so in `AGENT_CONNECT_EGRESS_ROOTS`;
 nothing else on the machine is sendable.
 
+The roots are also **checked here, at startup**, rather than discovered one at
+a time at the first upload: see `unsendable`. An allowlist quietly missing a
+root is a Worker that has stopped sending files and has not said so.
+
 What this does **not** prevent, stated so nobody reads more into it: an agent
 that can be talked into copying `~/.ssh/id_rsa` into its own working directory
 can then send the copy. The permitted area is a boundary on paths, not a proof
@@ -53,9 +57,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Mapping, Optional, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 from ag2_relay_client import markers
+from ag2_relay_client.egress import sendable_roots
 
 #: Extra directories a file may be sent from, `os.pathsep`-separated. For a
 #: Worker whose agent writes somewhere other than where it works — a build
@@ -100,6 +105,26 @@ def egress_roots(
         if expanded not in roots:
             roots.append(expanded)
     return tuple(roots)
+
+
+def unsendable(roots: Sequence[object]) -> Tuple[str, ...]:
+    """The roots the library's allowlist would drop, as they were written here.
+
+    A dropped root is not a small loss. The allowlist resolves the roots when
+    the client is built, logs one line for each one it cannot use, and then
+    refuses **every** file named under it for the rest of the run — so a typo in
+    `AGENT_CONNECT_EGRESS_ROOTS`, or an `AGENT_CONNECT_REPO` naming a directory
+    that is not there, is a Worker that has silently stopped attaching files,
+    found out by whoever asked for one. The library keeps `sendable_roots` for
+    exactly this, "so a typo shows up at startup rather than at the first
+    upload"; this is the caller it was waiting for.
+
+    Asked one root at a time on purpose. What comes back from `sendable_roots`
+    is the survivors, resolved past recognition; what an operator needs back is
+    *which of the paths they typed* is the wrong one, spelled the way they typed
+    it.
+    """
+    return tuple(str(root) for root in roots if not sendable_roots([root]))
 
 
 def named_files(text: Optional[str]) -> Tuple[str, ...]:

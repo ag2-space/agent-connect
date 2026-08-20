@@ -32,8 +32,9 @@ construction facts the library asks for and cannot guess:
   copied a file into a directory a *separate process* trusted, and that process
   decided. One process means the check is in-process now, and `outgoing.py`
   chooses the roots (the working directory this Worker's Turns run in, plus
-  anything the operator added). A Worker that passes none sends no files, which
-  is the fail-closed reading and the only safe one.
+  anything the operator added), and `from_env` checks them here rather than
+  letting the allowlist drop one quietly. A Worker that passes none sends no
+  files, which is the fail-closed reading and the only safe one.
 
 This module is also where **sync meets asyncio**. The library is sync and
 threaded on purpose — sutando's shim will call it directly — and this side is
@@ -51,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Mapping, Optional
@@ -58,7 +60,7 @@ from typing import Mapping, Optional
 from ag2_relay_client import RelayClient, TokenSource
 from ag2_relay_client.state import valid_instance_name
 
-from .outgoing import egress_roots
+from .outgoing import EGRESS_ROOTS_ENV, egress_roots, unsendable
 from .status import DEFAULT_INSTANCE as status_default_instance
 from .status import INSTANCE_ENV, instance_name
 
@@ -93,8 +95,12 @@ DEFAULT_INSTANCE = status_default_instance
 def token(env: Optional[Mapping[str, str]] = None) -> str:
     """The onboarding token as written, under either of its names.
 
-    The **one** reader of the credential in this package: `roomops.py` asks here
-    too, so the Ladder and the wire cannot end up holding two different bearers.
+    The **one** reader of the credential in this package, and `from_env` below
+    is its only caller — so there is one bearer in this process and one place
+    the environment is read for it. `roomops.py` used to ask here as well, back
+    when the Ladder built its own speaker; it now takes the Room Ops off the
+    client this function's caller already built, which is the stronger version
+    of the same property: not two readers that agree, one object.
     """
     env = os.environ if env is None else env
     return (env.get(TOKEN_ENV) or env.get(LEGACY_TOKEN_ENV) or "").strip()
@@ -148,13 +154,42 @@ def from_env(
     same directory a Turn runs in, and a file that leaves this machine leaves
     from there. Without it the client is built with no roots and sends nothing:
     a Worker that cannot say where its agent works cannot vouch for a path.
+
+    **A root that is not there is found here**, before the client is built. The
+    allowlist would drop it, log one line, and refuse every file named under it
+    for the rest of the run — a Worker that has stopped attaching things,
+    discovered by the person who asked for one. What that is worth differs, and
+    so does what happens: losing one root of several is said out loud and the
+    Worker starts, because an attachment is not worth a Worker. Losing *all* of
+    them, when roots were named, is a refusal — that is an
+    `AGENT_CONNECT_REPO` pointing at a directory this Worker's Turns were also
+    going to run in, and the operator should read it now rather than after the
+    Local Agent has failed at it. A Worker that named no roots at all is
+    neither: it sends no files on purpose (the fail-closed reading), and that is
+    not a typo.
     """
     env = os.environ if env is None else env
     raw = token(env)
     if not raw:
         return None
     credentials = TokenSource(token=raw, base_url=(env.get(URL_ENV) or "").strip())
-    options.setdefault("egress_roots", egress_roots(repo, env))
+    roots = tuple(options.setdefault("egress_roots", egress_roots(repo, env)))
+    dropped = unsendable(roots)
+    if dropped and len(dropped) == len(roots):
+        raise ValueError(
+            "none of the directories this Worker may send files from is there: "
+            + ", ".join(repr(name) for name in dropped)
+            + f". That is where its Turns run and where a file it produces has "
+            f"to come from, so fix AGENT_CONNECT_REPO (or {EGRESS_ROOTS_ENV}) "
+            f"rather than start a Worker that can neither work nor attach"
+        )
+    for name in dropped:
+        print(
+            f"agent-connect: WARNING — {name!r} is not a directory on this "
+            f"machine, so no file will ever be sent from it. Fix it in "
+            f"{EGRESS_ROOTS_ENV}, or take it out.",
+            file=sys.stderr, flush=True,
+        )
     return RelayClient(
         credentials,
         state_dir=state_dir(workspace),

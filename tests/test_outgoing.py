@@ -33,6 +33,8 @@ from __future__ import annotations
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 import asyncio
+import contextlib
+import io
 import os
 import tempfile
 import urllib.parse
@@ -41,6 +43,7 @@ from pathlib import Path
 from ag2_relay_client import RelayClient, TokenSource
 from ag2_relay_client.outbound import MAX_FILES
 from agent_connect import outgoing
+from agent_connect import relay as relay_module
 from agent_connect.events import COMPLETED, Done, MessageChunk
 from agent_connect.outgoing import named_files
 from agent_connect.reporter import (
@@ -397,6 +400,71 @@ check(outgoing.egress_roots("~/agents", {})[0].startswith(str(Path.home())),
 check(outgoing.egress_roots("/x/repo", {outgoing.EGRESS_ROOTS_ENV: "/x/repo"})
       == ("/x/repo",),
       "and a root named twice is one root")
+
+
+print("\n-- a root that is not there is said at startup, not at the first upload --")
+
+# The allowlist drops a root it cannot resolve, logs one line about it, and
+# sends nothing from it for the rest of the run — which is a Worker that has
+# quietly stopped attaching files, discovered by whoever asked for one. The
+# library has `sendable_roots` "so a typo shows up at startup rather than at the
+# first upload"; nothing on this side was asking it.
+
+real = Path(tempfile.mkdtemp())
+gone = str(real / "not-created")
+
+check(outgoing.unsendable((str(real),)) == (),
+      "a directory that is there is sendable, and nothing is said about it")
+check(outgoing.unsendable((str(real), gone)) == (gone,),
+      "a directory that is not there comes back named, in the spelling the "
+      "operator wrote — the resolved form is no help in finding the typo")
+check(outgoing.unsendable(()) == (),
+      "and a Worker that named no roots has no typo to report: sending nothing "
+      "is the documented fail-closed reading, not a misconfiguration")
+
+# Through the wiring, which is where an operator meets it. Some roots survive:
+# the Worker starts, and says which one it lost.
+said = io.StringIO()
+with contextlib.redirect_stderr(said):
+    built = relay_module.from_env(
+        Path(tempfile.mkdtemp()),
+        {"AGENT_CONNECT_TOKEN": "https://relay.example/relay|s3cret",
+         outgoing.EGRESS_ROOTS_ENV: gone},
+        repo=str(real),
+    )
+check(built is not None, "a Worker that lost one of several roots still starts: "
+                         "an attachment is not worth the whole Worker")
+check(gone in said.getvalue() and outgoing.EGRESS_ROOTS_ENV in said.getvalue(),
+      "and says so while the operator is still looking at the startup, naming "
+      "the path and the setting it came from: " + repr(said.getvalue()[:110]))
+check(built.room_ops.allowlist.roots == (os.path.realpath(str(real)),),
+      "with the roots it can actually use, and no others: "
+      + repr(built.room_ops.allowlist.roots))
+
+# None survive, and roots were named. The Worker was told where its files come
+# from and can use none of it — an `AGENT_CONNECT_REPO` that is not there, which
+# is also the directory its Turns were going to run in.
+try:
+    relay_module.from_env(
+        Path(tempfile.mkdtemp()),
+        {"AGENT_CONNECT_TOKEN": "https://relay.example/relay|s3cret"},
+        repo=gone,
+    )
+    refused = ""
+except ValueError as exc:
+    refused = str(exc)
+check(gone in refused,
+      "a Worker with no usable root at all is refused at startup, by name: "
+      + repr(refused[:120]))
+check(outgoing.EGRESS_ROOTS_ENV in refused or "AGENT_CONNECT_REPO" in refused,
+      "and the refusal names the setting to fix, not just the path")
+
+check(relay_module.from_env(
+        Path(tempfile.mkdtemp()),
+        {"AGENT_CONNECT_TOKEN": "https://relay.example/relay|s3cret"},
+      ) is not None,
+      "while a Worker that named no roots at all is not refused — it sends no "
+      "files on purpose, and that is a different thing from a typo")
 
 # Box 4: nothing anywhere in the package reads the retired airlock's setting.
 PACKAGE = "\n".join(p.read_text()
