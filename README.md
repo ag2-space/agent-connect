@@ -394,8 +394,9 @@ exactly like a setting that did not work. A key written **twice** takes the last
 line, as it would in any file of this shape, and the repetition is named too —
 that one is worth being sure about when the setting is a token.
 
-**There is exactly one parser, and the launchers ask it.** The relay client
-needs the same settings the worker does, so `launch.sh` and `run-agent.sh` run
+**There is exactly one parser, and the launchers ask it.** A launcher has to
+know a setting or two of its own — whether there is a token at all, which
+workspace's pidfile to clear — so `launch.sh` and `run-agent.sh` run
 
 ```bash
 _cfg="$(agent-connect --export-config)" || exit 1
@@ -423,22 +424,26 @@ by default. Re-running the installer keeps the previous file as
 `config.env.bak` and carries across every key it does not manage itself, so a
 setting you added by hand survives a re-run of the one-liner.
 
-(`--sutando-workspace` relay-only mode writes no config file: agent-connect is
-not installed there, so nothing could read one. Its launcher holds the token
-and is written mode 0700 instead — one private file either way, and still
-nothing in the plist.)
-
 ## Running more than one agent on one machine
 
-**The launch unit is one worker plus one relay client, pointed at one config
-file.** That is the contract a supervisor builds on, and it is deliberately not
-a process count or a wire: today the installer's `launch.sh` starts both
-halves, and what a supervisor should depend on is the pair, named by the config
-file it was given.
+**The launch unit is one worker pointed at one config file.** That is the
+contract a supervisor builds on, and it is deliberately not a wire: what a
+supervisor should depend on is the unit, named by the config file it was given.
 
 ```bash
 agent-connect --config ~/.agent-connect/instances/scratch/config.env
 ```
+
+**Today that unit is one process, and a supervisor may rely on it.** The worker
+carries its own relay client (workspace ADR 0001), so there is nothing to start
+beside it — `install.sh` writes a `launch.sh` that execs the worker and nothing
+else. It was a pair once, worker plus a separate `ag2-sparrow` process, and the
+pair was not merely one process too many: both halves long-polled the gateway
+with the same bearer and excluded each other from nothing, so whichever won a
+given long-poll took the task. When ag2-sparrow won, the task went into a
+directory the worker no longer reads, and the person who sent the message got
+no answer and no error. If you are supervising a worker installed before this
+changed, re-run `install.sh` — an old `launch.sh` still starts both.
 
 **An instance is a config file and a workspace, and they come together.** Give
 each instance its own config file, and in it its own `AGENT_CONNECT_WORKSPACE`
@@ -685,9 +690,15 @@ one it calls the old name, so a `REMOTE_TASK_TOKEN` forgotten in an old launchd
 plist cannot quietly beat a token you have just rotated. And a gateway that
 travels *inside* a combined token wins over `REMOTE_TASK_URL`, for the wire and
 for the room ops alike: the URL that arrived with a credential is the one that
-credential belongs to. `AGENT_CONNECT_TASK_DIR`,
-`AGENT_CONNECT_RESULT_DIR` and `AGENT_CONNECT_STATE_DIR` are `ag2-sparrow`'s and
-are read by nothing in this package.
+credential belongs to.
+
+**Retired: `AGENT_CONNECT_TASK_DIR`, `AGENT_CONNECT_RESULT_DIR` and
+`AGENT_CONNECT_STATE_DIR`.** They were the directory interface of `ag2-sparrow`,
+the separate process that used to carry the wire, and nothing in this package
+has read them since the worker took the wire over. Setting them now does
+nothing at all — not even to a relay client, because this install starts none.
+An old `launch.sh`, or a launcher of your own, that still exports them can drop
+the lines.
 
 ## Adapters
 
@@ -721,9 +732,14 @@ The framework is agent-agnostic; the relay client + onboarding + access-tiers ar
    export AGENT_CONNECT_TOKEN=<token from the portal>
    export AGENT_CONNECT_ADAPTER=codex
    export AGENT_CONNECT_REPO=/path/to/the/repo/codex/should/work/in
-   ./run-agent.sh
+   agent-connect
    ```
 3. In an allowed room: `!codex summarize this repo` → your Codex replies.
+
+**`agent-connect` is the whole thing to run.** The worker carries its own relay
+client (workspace ADR 0001), so it long-polls the gateway itself — there is no
+second process to start. From a checkout of this repo, `./run-agent.sh` is the
+same single process with a pidfile that clears the last one.
 
 ## Tests
 

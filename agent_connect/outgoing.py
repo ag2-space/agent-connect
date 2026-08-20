@@ -20,11 +20,11 @@ the relay client's, read from its own source rather than invented here:
   task's own room and *then* posts the body — one reply, its files beside it —
   and appends `[attachment not sent: … (reason)]` to the body for any it refused.
 * `ag2_sparrow/send_allowlist.is_path_sendable` is what it refuses with: a
-  **regular file** whose `realpath` is the outgoing result directory
-  (`AGENT_CONNECT_RESULT_DIR`, the same directory the Worker writes results into)
-  or something under it — plus a couple of `/tmp/` prefixes belonging to another
-  app. Nothing else on the machine is sendable, by design, and richer policy is
-  injected by an embedding app through `register_extra_roots()`.
+  **regular file** whose `realpath` is the outgoing result directory — the same
+  directory the Worker writes results into — or something under it, plus a couple
+  of `/tmp/` prefixes belonging to another app. Nothing else on the machine is
+  sendable, by design, and richer policy is injected by an embedding app through
+  `register_extra_roots()`.
 
 **The Worker must not post media itself.** It holds a relay token and a room id,
 so it could — and that is exactly the exfiltration route the allowlist exists to
@@ -81,7 +81,6 @@ from typing import List, Optional, Sequence, Tuple
 from .sessions import workspace_dir
 
 MAX_BYTES_ENV = "AGENT_CONNECT_OUTGOING_MAX_BYTES"
-RESULT_DIR_ENV = "AGENT_CONNECT_RESULT_DIR"
 
 #: The relay's own upload ceiling (`remote_gateway_bridge.MAX_MEDIA_BYTES`). The
 #: same number on this side is not a second policy — it is the same refusal,
@@ -187,17 +186,19 @@ def only_files_line(sent: Sequence[str]) -> str:
 def result_dir(env: Optional[dict] = None) -> Path:
     """The outgoing result directory — the one the send allowlist trusts.
 
-    Read the way the relay client reads it (`ag2_sparrow/_dirs.result_dir`):
-    `AGENT_CONNECT_RESULT_DIR` when the launcher set it, and otherwise the
-    Worker's own `<workspace>/results`, which is what the installer points that
-    variable at. A Worker whose results the relay client cannot find has a larger
-    problem than outgoing files.
+    It hangs off the workspace and has no setting of its own. There used to be
+    one, `AGENT_CONNECT_RESULT_DIR`, because a separate relay-client process had
+    to be pointed at the same directory and the launcher named it for both.
+    That process is gone (transport-seam ticket 10, workspace ADR 0001), and
+    with it the only reason two things ever had to agree about this path: an
+    override that nothing on the far side reads is a way to move the staging
+    area somewhere the Worker itself will not look for it.
+
+    The directory itself outlives the variable. Transport-seam ticket 09 is
+    where the staging airlock retires for the library's allowlisted-path
+    egress; until then a file leaves by being placed here.
     """
-    env = os.environ if env is None else env
-    explicit = (env.get(RESULT_DIR_ENV) or "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return workspace_dir(env) / "results"
+    return workspace_dir(os.environ if env is None else env) / "results"
 
 
 def max_bytes(env: Optional[dict] = None) -> int:
