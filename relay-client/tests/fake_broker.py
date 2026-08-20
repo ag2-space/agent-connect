@@ -16,6 +16,12 @@ last queued response repeats once the queue is drained — so a test that cares
 about a sequence programs a sequence, and one that does not programs a single
 answer and stops thinking about it.
 
+A path may carry a `*` (`/v1/tasks/*/ack`), which matches any single segment
+run. The ack route carries the task id *in the path*, and a suite that had to
+name every id it was about to invent would program its fixtures twice; an exact
+route always wins over a pattern, so a test can still answer one id differently
+from the rest — which is the whole shape of the ack-404 scar (F4).
+
 The base path (`/relay`) is deliberate: it is where the real deployment lives,
 and it catches a client that builds URLs from the host instead of the base.
 """
@@ -24,6 +30,7 @@ from __future__ import annotations
 import json as jsonlib
 import threading
 import time
+from fnmatch import fnmatchcase
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, NamedTuple, Optional
 from urllib.parse import urlsplit
@@ -135,6 +142,8 @@ class FakeBroker:
     def next_answer(self, method: str, path: str) -> _Answer:
         key = (method.upper(), path)
         with self._lock:
+            if key not in self._answers:
+                key = self._pattern_for(key) or key
             queued = self._answers.get(key)
             if not queued:
                 return _Answer(404, b'{"error":"no route"}',
@@ -145,8 +154,35 @@ class FakeBroker:
             self._served[key] = self._served.get(key, 0) + 1
             return queued[index]
 
+    def _pattern_for(self, key: tuple) -> Optional[tuple]:
+        """The programmed pattern route matching `key`, longest first.
+
+        Longest-first so `/v1/tasks/task-1/ack` beats `/v1/tasks/*/ack` when a
+        test programmed both — an exact answer is never shadowed by a general
+        one, which is what lets one stale lease be tested against a host that
+        keeps acking everything else.
+        """
+        method, path = key
+        candidates = [k for k in self._answers
+                      if k[0] == method and "*" in k[1] and fnmatchcase(path, k[1])]
+        candidates.sort(key=lambda k: len(k[1]), reverse=True)
+        return candidates[0] if candidates else None
+
     # --- reading
     def took(self, method: str, path: str) -> List[Recorded]:
-        """Every request that arrived for `method` on `path`."""
+        """Every request that arrived for `method` on `path` (`*` allowed)."""
         full = self.base_path + path
-        return [r for r in self.requests if r.method == method.upper() and r.path == full]
+        return [r for r in self.requests
+                if r.method == method.upper()
+                and (r.path == full or ("*" in full and fnmatchcase(r.path, full)))]
+
+    def forget(self) -> "FakeBroker":
+        """Drop the request log, keeping the programmed answers.
+
+        A test that has finished setting a scene and wants to assert on what
+        happens next reads much better than one counting offsets into a log of
+        everything since the client started.
+        """
+        with self._lock:
+            self.requests = []
+        return self
