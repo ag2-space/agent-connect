@@ -334,13 +334,11 @@ check(str(real) not in (impl.seen or ""),
 # nobody could download is absent, and only the library's reason says which of
 # the two happened.
 impl = OnlyText()
-shim_ws2 = base / "shim2"
-(shim_ws2 / "results").mkdir(parents=True)
 shim_gone = asyncio.run(handle_one(
     task("s2", "what is wrong with this?", room="!room:ag2.space",
          attachments=(Resolved(mime="image/jpeg", name="photo.jpg", ok=False,
                                reason=UNREACHABLE),)),
-    ShimAdapter("codex", impl), str(base), shim_ws2 / "results"))
+    ShimAdapter("codex", impl), str(base)))
 check("photo.jpg" in shim_gone and UNREACHABLE in shim_gone,
       "a file that never arrived is named to the room with the reason it did not")
 check("I answered the text." in shim_gone,
