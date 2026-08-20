@@ -49,6 +49,13 @@ AUTH_WAIT = "auth-wait"
 #: The bearer was rejected and there is nothing to re-read. The loop has
 #: stopped; only a reconfiguration changes this.
 FATAL = "fatal"
+#: Another poller holds this bearer's singleton guard (J1). Not polling — two
+#: pollers on one bearer double-deliver every task — but still asking, so a
+#: holder that dies is taken over from without anybody intervening.
+STANDBY = "standby"
+#: This client held the guard and another poller took it. Polling has stopped
+#: for good; the consumer decides whether anything starts again.
+DISPLACED = "displaced"
 #: `stop()` was called.
 STOPPED = "stopped"
 

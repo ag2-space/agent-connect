@@ -15,7 +15,9 @@ knew.
 Run: python3 tests/test_heartbeat.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
+import json
 import tempfile
+import time
 
 from fake_broker import FakeBroker
 
@@ -37,6 +39,20 @@ def wire_task(wire_id, **over):
             "user_id": "@alice:ag2.space", "access_tier": "owner"}
     task.update(over)
     return task
+
+
+def bury(client):
+    """Age a killed client's singleton record, the way its death would.
+
+    A process that dies does not release the bearer's guard (J1) — it stops
+    re-stamping it, and the replacement takes over once the record goes stale.
+    That is what "the process dies here" means below.
+    """
+    if client.guard is None or not client.layout.singleton_path.exists():
+        return
+    record = json.loads(client.layout.singleton_path.read_text())
+    record["heartbeat_ts"] = time.time() - 10_000
+    client.layout.singleton_path.write_text(json.dumps(record))
 
 
 def client_for(broker, tmp, **kwargs):
@@ -175,6 +191,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     first.poll_once()
     first.next_task(timeout=1)
     # ...and the process dies here, with the Task in memory and no answer.
+    bury(first)
 
     second = client_for(broker, tmp)
     check(second.inflight() == ["task-lost"],

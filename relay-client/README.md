@@ -23,9 +23,9 @@ URL-encoded separator) had to be learned twice too. They live here once now.
 
 Under construction. What ships today is the whole task path — poll, lease,
 journal, ack, results, heartbeat, auth recovery, status — the whole outbound
-half — Room Ops, the egress allowlist and the result-marker grammar — and the
-optional events channel, all behind the seam below. Media ingress (marker
-resolution on the way in) and the singleton-per-bearer guard follow.
+half — Room Ops, the egress allowlist and the result-marker grammar — the
+singleton-per-bearer guard, and the optional events channel, all behind the seam
+below. Media ingress (marker resolution on the way in) follows.
 
 ## The seam
 
@@ -88,6 +88,46 @@ once (a rotation may already have happened), and otherwise the loop holds at a
 slow cadence, saying so every pass, until one lands — then resumes live, no
 restart. A token file that starts naming a *different* gateway is a
 reconfiguration and is refused.
+
+## One poller per bearer
+
+A bearer's queue tolerates exactly one concurrent poller. The broker does not
+detect a second one and does not reject it — two clients simply split the lease
+stream and **deliver every task twice**. The guarantee therefore cannot come
+from the wire, and it is not left to the consumer either: every client arbitrates
+for the bearer through a lock file in its own state dir, and nobody has to
+remember to switch it on.
+
+```python
+client.snapshot()["singleton"]   # "held" | "lost" | "degraded" | "off"
+```
+
+Four properties, and each one is an incident:
+
+- **Atomic acquire.** Two clients starting in the same millisecond produce one
+  winner, because the whole decision — read, judge, write — happens under an
+  exclusive lock on the guard file.
+- **Liveness is heartbeat freshness, never pid-alive.** The holder re-stamps the
+  record once per turn of its poll loop; a holder that stops loses the guard
+  after ~2 minutes, however alive its pid may be. The ghost that prompted this
+  was alive-but-stale for *days*, and pid recycling makes "is that pid running?"
+  a question about somebody else's process. There is no `os.kill` in the guard,
+  and a test asserts there never will be.
+- **A definitive loser stops immediately.** A client that never held the guard
+  stands by and keeps asking — so a holder that dies without releasing is taken
+  over from with nobody in the loop — while a client whose claim is *taken* stops
+  polling on that same turn and stays stopped, saying `displaced` in its status.
+  Coming back is the consumer's decision, never the loop's.
+- **It fails open.** An I/O error, a filesystem without locking, a bug in the
+  guard: all of them mean *poll anyway*, loudly logged and visible as
+  `"degraded"` in the status. A lock that fails closed silences delivery
+  entirely, and the worst case on the other side is the doubled message the
+  guard was there to prevent in the first place.
+
+A clean `stop()` releases the guard, so a restart takes it back at once rather
+than waiting out a freshness window. `RelayClient(..., singleton=False)` turns
+the whole thing off for a consumer that has its own singleton mechanism; it logs
+a warning, because nothing else here prevents a second poller.
 
 ## Credentials
 

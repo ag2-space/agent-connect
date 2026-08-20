@@ -38,11 +38,15 @@ SOURCES = sorted(PACKAGE.glob("*.py"))
 #: short list of it — every entry here is a deliberate decision.
 ALLOWED = {
     "__future__", "base64", "collections", "contextlib", "dataclasses", "email",
-    "errno", "hashlib", "http", "io", "json", "logging", "mimetypes", "os",
-    "pathlib", "queue", "re", "shutil", "socket", "ssl", "stat", "sys",
+    "errno", "fcntl", "hashlib", "http", "io", "json", "logging", "mimetypes",
+    "os", "pathlib", "queue", "re", "shutil", "socket", "ssl", "stat", "sys",
     "tempfile", "threading", "time", "traceback", "types", "typing", "urllib",
     "uuid",
 }
+#: `fcntl` is the one entry that is not portable, and it is imported in a `try`
+#: for that reason: it is how the singleton guard is atomic, and a platform
+#: without it gets a guard that degrades to polling rather than an ImportError
+#: at startup (J1's fail-open rule, applied to the import itself).
 
 # --- no third-party imports, and no asyncio
 for source in SOURCES:
