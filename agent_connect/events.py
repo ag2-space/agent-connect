@@ -44,11 +44,20 @@ class Attachment:
     """One file that arrived with a room message, already on this machine.
 
     The Relay Client resolves the wire's media markers and downloads whatever
-    someone attached *before* the Task is delivered, so `locator` is a local
-    path and nothing on this side of the boundary fetches anything over the
-    network. Everything else here is what the Relay Client was *told* about the
+    someone attached *before* the Task is delivered, so `path` is a local path
+    and nothing on this side of the boundary fetches anything over the network.
+    It is called `path` and not `locator` because that is now the only thing it
+    can be: on the wire the same word means a URL to fetch, and one word for two
+    referents a seam apart is how a client ends up opening one when it meant the
+    other. Everything else here is what the Relay Client was *told* about the
     file by the platform it came from: `mime` and `filename` are labels, not
     facts, and neither decides what bytes are read.
+
+    **A file that never arrived is still one of these.** The Relay Client
+    delivers a Task whose fetch failed rather than holding or rejecting it, and
+    such an attachment has no `path` and a `reason` instead — a room-facing
+    sentence carrying neither the URL nor the host. An Adapter is expected to
+    say so and carry on; the Turn is not lost over it.
 
     Deliberately metadata-only — no bytes and no file handle. An Adapter that
     cannot accept attachments at all (every shimmed one) has to be able to *see*
@@ -57,12 +66,17 @@ class Attachment:
     happens.
     """
 
-    locator: str
+    path: str = ""
     mime: str = ""
     filename: str = ""
     size: int = 0
-    sha256: str = ""
-    id: str = ""
+    #: Why there are no bytes, or `""` when there are. Never both.
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """Whether this file reached the machine at all."""
+        return not self.reason
 
 
 @dataclass(frozen=True)

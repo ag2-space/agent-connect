@@ -158,45 +158,16 @@ def task_attachments(task) -> Tuple[Attachment, ...]:
     Read off the delivered Task and from nowhere else. The library resolves the
     `[ag2space-media: …]` markers on the wire and hands over local paths, so
     there is no marker and no URL on this side of the seam to parse — and there
-    is no `attachments:` header any more either, because there is no file for a
-    header to be written into. The relay used to dual-write a
-    `[File attached: <path>]` line into the body as well; whatever of that a
-    sender types is left exactly where it is, because a path read out of a body
-    would be a path the sender chose.
+    never was an `attachments:` header to parse either. The relay used to
+    dual-write a `[File attached: <path>]` line into the body as well; whatever
+    of that a sender types is left exactly where it is, because a path read out
+    of a body would be a path the sender chose.
 
-    Tolerant of a library that has not grown the tuple yet: transport-seam
-    ticket 03 is media ingress and ticket 08 is where `agent_connect.attachments`
-    stops parsing and starts consuming these directly. A library without the
-    tuple delivers a Task that carries none, and a Turn sees none.
+    The crossing itself — the library's vocabulary into the Adapter boundary's,
+    a failed fetch's reason included — is `attachments.delivered`, which is the
+    module that owns both sides of it.
     """
-    return tuple(_as_attachment(one)
-                 for one in (getattr(task, "attachments", ()) or ()))
-
-
-def _as_attachment(one) -> Attachment:
-    """One delivered attachment, in the words the Adapter boundary uses.
-
-    The Relay Client resolves a marker into an attachment of its own — `path`,
-    `name`, and an `ok`/`reason` pair for a fetch that did not happen — and the
-    boundary's vocabulary calls the same two facts `locator` and `filename`.
-    They are the same file under different names, so the rename happens here,
-    once, instead of in every Adapter: without it `attachments.label` reads a
-    field that is not there and a Turn carrying any file at all dies as a
-    "worker error" the person cannot act on.
-
-    A fetch that failed carries no path, and an Attachment with no locator is
-    already what the Adapters report as unreadable — the room is told, in their
-    words rather than the library's. Carrying the library's own sentence for
-    *why* across this seam is ticket 08's, with the rest of the ingress.
-    """
-    if isinstance(one, Attachment):
-        return one
-    return Attachment(
-        locator=getattr(one, "path", "") or "",
-        mime=getattr(one, "mime", "") or "",
-        filename=getattr(one, "name", "") or "",
-        size=getattr(one, "size", 0) or 0,
-    )
+    return att.delivered(task.attachments)
 
 
 def uncaptioned_prompt(attachments) -> str:

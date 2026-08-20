@@ -55,7 +55,13 @@ UNREAD = (
 )
 UNREAD_ONE = "the attachment on your message"
 UNREAD_MANY = "the {count} attachments on your message"
-UNREAD_LINE = "• {label} ({mime})"
+UNREAD_LINE = "• {label} ({mime}){why}"
+
+#: Appended for a file the Relay Client never managed to fetch. Without it the
+#: room is told a true sentence about the wrong failure: this kind of Adapter
+#: takes text only, but that is not why a file nobody could download is absent,
+#: and only the library's own reason says which of the two happened.
+UNREAD_WHY = " — {reason}"
 
 
 def unread_notice(ctx: TurnContext) -> str:
@@ -65,7 +71,9 @@ def unread_notice(ctx: TurnContext) -> str:
     what = (UNREAD_ONE if len(ctx.attachments) == 1
             else UNREAD_MANY.format(count=len(ctx.attachments)))
     lines = "\n".join(
-        UNREAD_LINE.format(label=att.label(a), mime=att.mime_of(a))
+        UNREAD_LINE.format(
+            label=att.label(a), mime=att.mime_of(a),
+            why="" if a.ok else UNREAD_WHY.format(reason=a.reason))
         for a in ctx.attachments
     )
     return UNREAD.format(what=what, lines=lines)

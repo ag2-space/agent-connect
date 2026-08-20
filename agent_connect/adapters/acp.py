@@ -370,6 +370,18 @@ ACCEPTS_NOTHING = "\nThis agent accepts no attachments at all — only text."
 #: allowed to add: what the person typed is repeated verbatim after it.
 ATTACHED = "Attached to this message, and included below as content: {names}.\n\n"
 
+#: How the prompt's text block accounts for a file that never reached this
+#: machine. The Relay Client fetches what someone attached before the Task is
+#: delivered, and one it could not fetch arrives with a reason instead of bytes
+#: — delivered rather than dead-lettered, because an agent that can say "you
+#: attached something and I could not read it" is more use than a question
+#: nobody ever answered. So the agent is told in band, in the framing, and the
+#: room is told separately; neither notice touches what the person typed.
+UNAVAILABLE = (
+    "Attached to this message but not readable, so it is not included below: "
+    "{names}. Say so if it matters to the answer.\n\n"
+)
+
 #: Why the previous conversation ended, in the four ways it can.
 WHY_REFUSED = "the agent could not restore our previous one ({detail})"
 WHY_RETIRED = "the previous one was retired because {reason}"
@@ -509,7 +521,8 @@ def _truthy(value: Optional[str]) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def preamble(ctx: TurnContext, attached: Sequence[str] = ()) -> str:
+def preamble(ctx: TurnContext, attached: Sequence[str] = (),
+             unavailable: Sequence[str] = ()) -> str:
     """What the Local Agent is told about the situation it is answering in.
 
     Written here rather than inherited from the shim's sandbox preamble, which
@@ -518,7 +531,10 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = ()) -> str:
     confinement that is not there.
 
     `attached` names the files that follow as content blocks, so the agent can
-    tell which block is which when someone says "the second screenshot". It is
+    tell which block is which when someone says "the second screenshot".
+    `unavailable` names the ones the Relay Client could not fetch at all, so the
+    agent knows a file was meant to be there and can say it is not, rather than
+    answering a question about a screenshot as if none had been sent. Both are
     part of the framing and never part of the message: what the person typed is
     appended after this, unchanged, whatever they attached to it.
 
@@ -537,6 +553,8 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = ()) -> str:
     )
     if attached:
         framing += ATTACHED.format(names=", ".join(attached))
+    if unavailable:
+        framing += UNAVAILABLE.format(names=", ".join(unavailable))
     return framing
 
 
@@ -596,13 +614,27 @@ def prompt_blocks(
     one per attachment that did not make it, which the caller turns into a
     single `Notice`: several files failing is one fact about the run, not
     several messages about it.
+
+    A file the Relay Client never fetched is answered before anything else is
+    asked about it. Its reason is the library's, which is honest about what
+    happened; running it past `promptCapabilities` first would report an agent's
+    advertisement as the cause of an absence that had nothing to do with the
+    agent — and would do it under a media type read off a marker hint. It is
+    also the one failure the agent itself is told about, because it is the one
+    where a file was meant to be in this conversation and is not.
     """
     passed: List[str] = []
+    missing: List[str] = []
     blocks: List[dict] = []
     problems: List[str] = []
     for attachment in ctx.attachments:
         name = att.label(attachment)
         mime = att.mime_of(attachment)
+        if not attachment.ok:
+            missing.append(name)
+            problems.append(
+                UNREAD_LINE.format(label=name, mime=mime, why=attachment.reason))
+            continue
         modality = att.modality(attachment)
         capability = _capability(modality)
         if agent is None or not agent.accepts_prompt_content(capability):
@@ -619,7 +651,8 @@ def prompt_blocks(
         passed.append(name)
     # The text block is built last and put first: it names what follows it, and
     # what follows it is only known once every attachment has been tried.
-    return [{"type": "text", "text": preamble(ctx, passed) + ctx.prompt}] + blocks, problems
+    text = preamble(ctx, passed, missing) + ctx.prompt
+    return [{"type": "text", "text": text}] + blocks, problems
 
 
 def unread_notice(problems: Sequence[str], agent) -> str:

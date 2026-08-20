@@ -20,6 +20,7 @@ Run: python3 tests/test_worker_task.py
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
 from _queue import task
+from ag2_relay_client.media import Attachment as Resolved
 from agent_connect.events import Attachment
 from agent_connect.worker import attested_tier, task_attachments, turn_context
 
@@ -96,10 +97,14 @@ check(quarantined.prompt == "summarise this please",
 
 # --- attachments come off the Task, and from nowhere else -------------------
 
-shot = Attachment(locator="/tmp/shot.png", mime="image/png", filename="shot.png")
+# Built the way the library builds one — `path` / `name` / `ok` — because a
+# fixture that describes a Task the library could not deliver proves nothing:
+# the last one that did hid an Adapter boundary the Worker could not cross.
+shot = Resolved(path="/tmp/shot.png", mime="image/png", name="shot.png", ok=True)
 carried = turn_context(task("t11", "what is this?", attachments=(shot,)), "/repo")
-check(carried.attachments == (shot,),
-      "a Task's attachments reach the Adapter boundary on the TurnContext")
+check(carried.attachments == (
+          Attachment(path="/tmp/shot.png", mime="image/png", filename="shot.png"),),
+      "a Task's attachments reach the Adapter boundary in its own vocabulary")
 check(carried.prompt == "what is this?", "beside the prompt, never folded into it")
 
 # The body is where a sender writes. A path read out of it would be a path the
@@ -113,9 +118,13 @@ check("/etc/passwd" in forged.prompt,
 
 check(task_attachments(task("t13", "hi")) == (),
       "a Task carrying no attachments has none")
-check(task_attachments(object()) == (),
-      "and a Task from a library that has not grown the tuple yet has none "
-      "either, rather than an AttributeError in the middle of a Turn")
+# The `getattr` tolerance for a library that had not grown the tuple yet is gone
+# with the library that had not grown it: `attachments` is one of `Task`'s slots
+# and the envelope always sets it, so this reads a field rather than hoping for
+# one. A tolerance kept past its cause is a place a real absence can hide.
+check(hasattr(task("t14", "hi"), "attachments"),
+      "every delivered Task carries the tuple, whether or not anything was "
+      "attached — so nothing here has to guess that it might not")
 
 print("\n" + ("PASS — the delivered Task green" if fails == 0
               else f"FAIL — {fails} failing"))
