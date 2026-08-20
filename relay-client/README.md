@@ -23,7 +23,8 @@ URL-encoded separator) had to be learned twice too. They live here once now.
 
 Under construction. What ships today is the foundation the wire loop is built
 on: credentials, name resolution, the request core, backoff, and the state-dir
-layout. The Task queue and the outbound surface follow.
+layout — plus the optional events channel, which needs nothing above it. The
+Task queue and the outbound surface follow.
 
 ## Credentials
 
@@ -78,6 +79,37 @@ layout.ensure()         # 0700; holds the journal, the status file, the lock
 
 Per-instance by construction: one host may run clients against several gateways,
 and broker task ids are unique only *within* a gateway.
+
+## Events (optional, off unless asked for)
+
+A Server-Sent Events channel on `/v1/events/stream`, for a consumer that wants
+workspace events durably. Nothing in this library starts it and no module here
+imports it — the only way one exists is this call:
+
+```python
+from ag2_relay_client.events import events
+
+channel = events(http, sink)   # starts its own thread
+channel.health()               # {"status": "connected", "last_cursor": 41, ...}
+channel.stop()
+```
+
+`sink` is the consumer's durable store, duck-typed on two methods:
+`durable_cursor()` returns the cursor of the last event that is durable, and
+`commit(event)` **returning** is what makes one durable. Resume uses the durable
+cursor, so a crash between "received" and "durable" replays the event rather
+than losing it — the sink must be idempotent.
+
+The channel is **isolated by construction**: its own thread, connection, backoff
+and cursor, and a loop that swallows everything. A dead network, a revoked
+bearer, a garbled frame, a sink that raises — none of them can reach task
+delivery, which is the whole reason the module is shaped this way. Beyond that:
+a 120 s read timeout, because a black-holed TCP path never says anything;
+unusable frames skipped and not resumed from, because handing one to a sink that
+raises means replaying it forever; `404` fatal and `401`/`403` retryable only
+while a durable token source could still deliver a rotation. The bearer is read
+through the same credential the poll loop rotates, so a rotation reaches the
+stream on its next connect without a restart.
 
 ## License
 
