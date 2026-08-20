@@ -52,8 +52,11 @@ Portal makes:
 
 > The broker attests every task's sender; the Worker trusts the attestation;
 > owner tier → workspace write; guest → read-only sandbox on the codex path and
-> a polite refusal on the ACP path; `allow @user` grants guest, `trust @user`
-> grants owner; the host may explicitly override a specific sender locally.
+> a polite refusal on the ACP path; anyone in the room is attested guest
+> already, and `allow @user` / `trust @user` — said in a **direct message to
+> the concierge**, `@sutando-concierge:<your homeserver>` — set which tier a
+> sender is attested at; the host may explicitly override a specific sender
+> locally.
 
 Unpacked:
 
@@ -66,9 +69,42 @@ unrecognised is **treated as `guest`, never `owner`**: the absence of an
 attestation is not a grant of one (`docs/adr/0003`).
 
 **Owner is a trust level, not a person.** You, who registered the agent, are
-owner. `trust @user` makes someone else owner too. `allow @user` lets someone
-address the agent at all, as a guest. Both are yours to give and yours to take
-back.
+owner. `trust @user` makes someone else owner too; `allow @user` names someone
+as a guest. Both are yours to give and yours to take back.
+
+**They are a dial, not a door.** Somebody who is in a room with your agent can
+address it already: they arrive attested `guest` by default and get whatever
+guest gets on your adapter, `allow` or no `allow`. What these two commands
+change is *which tier* a sender is attested at — they are not what lets anyone
+in, and withholding one keeps nobody out. The way to keep somebody out is to not
+have them in the room.
+
+**Both are commands to the concierge, and to nothing else.** Say them in a
+**direct message to `@sutando-concierge:<your homeserver>`** — the same bot that
+registered the agent for you. Typed anywhere else they are not commands at all:
+in your agent's room, or in a direct message to the agent, `trust @user` is
+ordinary text arriving at a language model. The platform answers such a message
+with a one-line pointer back to the concierge rather than acting on it, and
+nothing is granted. The concierge is deliberately not a member of your agent's
+rooms, so looking around will not find it — this line is where the recipient is
+written down.
+
+**`trust` hands over more than the word suggests.** Both of the following are
+standing behaviour rather than rough edges awaiting a fix, and both are worth
+knowing *before* you grant it:
+
+- **It applies to every agent you own, not the one you had in mind.** Trust is
+  modelled as a relationship between *people*, so a single `trust @user` makes
+  that person owner on all of your agents at once — the concierge's reply lists
+  which ones. `untrust @user` takes it back everywhere in the same one go.
+- **They do not get a session of their own — they continue yours.** A session is
+  keyed by room *and* access tier together (see [The agent remembers the
+  conversation](#the-agent-remembers-the-conversation-acp)), so a second
+  owner-tier sender in the same room lands in the *same* session you left there:
+  the same session id, the same working directory, and whatever context your own
+  conversation has already accumulated in it. `trust` therefore shares a live
+  conversation as well as workspace write. This was weighed and kept
+  deliberately — it is part of what owner tier means here.
 
 **What each tier gets depends on the adapter, and the difference is not
 cosmetic:**
@@ -112,9 +148,11 @@ different from every other adapter's, and weaker. Read this before enabling it.*
   would be offering a limit that only looks like one. The refusal is **said in
   the room**, as the reply to the message that asked: it takes over the same
   `⏳ On it...` placeholder every other task gets, so it is one message rather
-  than a placeholder left hanging beside an apology, and it names what would
-  change the answer (`trust @user`). A guest who hears nothing cannot tell a
-  refusal from a broken worker, and reports the wrong problem.
+  than a placeholder left hanging beside an apology, and it names both what would
+  change the answer (`trust @user`) and who has to be told — the concierge, by
+  full MXID, because an instruction whose recipient is missing is not one. A
+  guest who hears nothing cannot tell a refusal from a broken worker, and reports
+  the wrong problem.
 
 Name your agent and the worker knows what to run:
 
