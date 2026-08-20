@@ -432,6 +432,71 @@ check(took < 0.6,
       f"than holding the process for the length of the answer's POST")
 
 
+# And the same shutdown, one seam further in: the Adapter's own run. A
+# synchronous Adapter is a blocking `run()` that shells out to codex or ollama,
+# and it went off on `asyncio.to_thread` — the default executor, which
+# `asyncio.run` shuts down by joining every thread in it. So a SIGTERM during a
+# Turn held the interpreter until the Local Agent finished, which for these
+# Adapters is up to their own 600 s timeout, against a `STOP_BUDGET_S` of 12 and
+# a launchd that sends SIGKILL twenty seconds after its SIGTERM. What is lost is
+# not the answer — the Turn was going to be abandoned by the cancel either way —
+# it is everything the stop was still going to do: the `stopped` record, and the
+# singleton guard's release, whose absence costs the next Worker three minutes
+# of standby.
+
+
+class Sluggish:
+    """A synchronous Adapter mid-run when the stop arrives."""
+
+    def run(self, task, sandbox, cwd):
+        time.sleep(1.0)
+        return "eventually"
+
+
+async def _stopped_mid_run():
+    adapter = ShimAdapter("sluggish", Sluggish())
+
+    async def drain():
+        async for _ in adapter.turn(TurnContext(
+                prompt="something long", access_tier="owner",
+                sandbox="read-only", cwd="/repo")):
+            pass
+
+    running = asyncio.ensure_future(drain())
+    await asyncio.sleep(0.15)               # the Adapter is on its thread now
+    running.cancel()                        # what the teardown does on SIGTERM
+    try:
+        await running
+    except asyncio.CancelledError:
+        pass
+
+
+began = time.monotonic()
+asyncio.run(_stopped_mid_run())
+took = time.monotonic() - began
+check(took < 0.6,
+      f"a stop during a synchronous Adapter's run returns at once ({took:.2f}s), "
+      f"rather than holding the process until the Local Agent is finished — the "
+      f"seconds a stop has are for the `stopped` record and the singleton guard")
+
+# Keeping it out is this check. `asyncio.to_thread` is the obvious spelling and
+# the reason it is wrong is two modules away from any call site, so the next
+# blocking call added to this package will reach for it exactly as this one did.
+
+
+to_thread_users = []
+for path in sorted((_bootstrap.ROOT / "agent_connect").rglob("*.py")):
+    for node in ast.walk(ast.parse(path.read_text())):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_thread"):
+            to_thread_users.append(f"{path.name}:{node.lineno}")
+check(not to_thread_users,
+      "nothing in this package hands work to the default executor: that is the "
+      "one `asyncio.run` joins on the way out, and `offthread.in_daemon_thread` "
+      f"is the same handover onto a thread nothing joins ({to_thread_users or 'none'})")
+
+
 # -- the drain loop keeps going -----------------------------------------------
 
 client = FakeClient().offer(task("l1", "explode", room="!l1:ag2.space"),

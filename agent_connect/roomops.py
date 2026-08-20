@@ -17,7 +17,7 @@ speaker, not two.
 
 What is left is the shape of the seam: **the library is sync, this side is
 asyncio.** So every op is awaited on a daemon thread of its own
-(`agent_connect.relay.in_daemon_thread`) rather than on the event loop.
+(`agent_connect.offthread.in_daemon_thread`) rather than on the event loop.
 
 Two ops are all the Ladder needs: post the placeholder and keep its identifier,
 then edit that same message. Reactions are not among them — **the broker places
@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .relay import in_daemon_thread
+from .offthread import in_daemon_thread
 
 
 class RoomOpError(Exception):

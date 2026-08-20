@@ -33,14 +33,25 @@ distinguish them are the ACP Adapter's business.
 
 Concurrency comes for free: off-thread means two rooms' Tasks overlap, and the
 Adapters gained that without a line changing inside them.
+
+**Which thread, though, is not free.** `asyncio.to_thread` puts the Adapter's
+`run()` on the loop's default executor, and `asyncio.run` shuts that executor
+down by joining every thread in it — so a SIGTERM in the middle of a Turn held
+the whole process until `codex` or `ollama` finished, up to the Adapter's own
+600 s timeout. The Worker's stop budget is twelve seconds and launchd's SIGKILL
+comes at twenty, so what that hang costs is not this Turn — the cancel abandoned
+it either way, and the broker re-serves an unanswered Task — but the `stopped`
+record and the release of the singleton guard, whose absence stands the next
+Worker down for three minutes. `agent_connect.offthread.in_daemon_thread` is the
+same handover onto a thread nothing joins.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any, AsyncIterator
 
 from .. import attachments as att
 from ..events import COMPLETED, Done, MessageChunk, Notice, TurnContext, TurnEvent
+from ..offthread import in_daemon_thread
 from ..sandbox import sandbox_preamble
 
 #: What the room is told when a Task carried files this kind of Adapter has no
@@ -109,7 +120,7 @@ class ShimAdapter:
         # the attachments is folded into it — not a filename, and above all not
         # a path.
         prompt = sandbox_preamble(ctx.sandbox, ctx.access_tier) + ctx.prompt
-        text = await asyncio.to_thread(self.impl.run, prompt, ctx.sandbox, ctx.cwd)
+        text = await in_daemon_thread(self.impl.run, prompt, ctx.sandbox, ctx.cwd)
         text = text if isinstance(text, str) else str(text)
         if text:
             yield MessageChunk(text=text)

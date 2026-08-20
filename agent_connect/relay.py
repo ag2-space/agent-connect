@@ -36,11 +36,12 @@ construction facts the library asks for and cannot guess:
   letting the allowlist drop one quietly. A Worker that passes none sends no
   files, which is the fail-closed reading and the only safe one.
 
-This module is also where **sync meets asyncio**. The library is sync and
-threaded on purpose — sutando's shim will call it directly — and this side is
-asyncio, so every call across the seam goes through `in_daemon_thread` below.
-That is one function rather than a habit, because the reason it is not
-`asyncio.to_thread` is a shutdown hang nobody would re-derive at the call site.
+The library is sync and threaded on purpose — sutando's shim will call it
+directly — and this side is asyncio, so every call across the seam goes through
+`agent_connect.offthread.in_daemon_thread`. That is one function rather than a
+habit, because the reason it is not `asyncio.to_thread` is a shutdown hang
+nobody would re-derive at the call site; it lives in a module of its own because
+the Adapter shim needs it too and must not import this one to get it.
 
 **No credential is a refusal, not a degradation.** A Worker without one has no
 inbound seam at all: it would start, report `serving`, and never receive a
@@ -50,10 +51,8 @@ Adapter is handled.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
-import threading
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -196,53 +195,3 @@ def from_env(
         instance=instance(env),
         **options,
     )
-
-
-async def in_daemon_thread(call, *args):
-    """Await a blocking call on a thread that cannot outlive this process.
-
-    Every crossing of this seam uses it — the queue read, `complete`, `reject`,
-    and every Room Op the Ladder asks for — because the library is sync and
-    threaded and this side is asyncio, and a blocking call on the event loop is
-    a Worker that has stopped doing everything else.
-
-    `asyncio.to_thread` would be the obvious way, and it is the wrong one here.
-    It runs on the loop's default executor, and `asyncio.run` shuts that
-    executor down on the way out by **joining every thread in it**: measured, a
-    SIGTERM during an eight-second call held the interpreter for 8.01 s after
-    the loop had finished. That is the shutdown hang the queue reader is a
-    daemon thread to avoid, and a `complete` can be inside it for the better
-    part of a minute (the library's drain-lock wait plus its result budget, with
-    a twenty-second POST able to start at the end of it — and now an upload
-    before that).
-
-    Nothing is lost by not waiting. Everything this is used for is durable
-    before its network call — the library journals a result and then POSTs it,
-    and re-POSTs what is owed on the next run — so an abandoned thread costs a
-    round trip, not an answer. A Room Op abandoned this way costs a decoration,
-    which is what I1 already says it is worth.
-    """
-    loop = asyncio.get_running_loop()
-    done = loop.create_future()
-
-    def hand_back(setter, value) -> None:
-        # The awaiting Turn may have been cancelled, and the loop may be closed
-        # — both mean nobody is waiting for this any more, and neither is worth
-        # a traceback on the way out.
-        if not done.cancelled():
-            setter(value)
-
-    def run() -> None:
-        try:
-            result = call(*args)
-        except BaseException as exc:  # noqa: BLE001 — carried, not swallowed
-            handed = (done.set_exception, exc)
-        else:
-            handed = (done.set_result, result)
-        try:
-            loop.call_soon_threadsafe(hand_back, *handed)
-        except RuntimeError:
-            pass                            # the loop closed; nobody is waiting
-
-    threading.Thread(target=run, name="agent-connect-answer", daemon=True).start()
-    return await done

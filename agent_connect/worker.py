@@ -64,7 +64,7 @@ from .config import export as export_config
 from .config import load as load_config
 from .events import Attachment, TurnContext
 from .pending import queue_for
-from .relay import in_daemon_thread  # noqa: F401 — re-exported
+from .offthread import in_daemon_thread  # noqa: F401 — re-exported
 from .reporter import LadderSettings, TurnReporter
 from .roomops import room_ops_for
 from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
@@ -395,7 +395,7 @@ async def _answer(client, how: str, task_id: str, payload: str, *rest) -> None:
     The call is sync and does I/O — `complete` reads the answer's markers,
     uploads whatever it named from an allowlisted path, writes the journal and
     then POSTs — so it goes to a thread of its own (see
-    `agent_connect.relay.in_daemon_thread`: not the default executor, which a
+    `agent_connect.offthread.in_daemon_thread`: not the default executor, which a
     stop would have to join). It is also the last thing standing between a
     finished Turn and the person who asked, so a failure here is said loudly on
     stderr and nowhere else: raising would take down the drain loop, and
