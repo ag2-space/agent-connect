@@ -25,8 +25,9 @@ stops polling loses its leases — and a blocked event loop up here is a
 at shutdown: `asyncio.run` joins every thread of the default executor on its way
 out, so one answer in flight would hold the process open past the point a
 service manager stops waiting and starts killing. The one function that does
-this lives in `agent_connect.relay`, beside the construction of the thing it
-calls into.
+this is `agent_connect.offthread.in_daemon_thread`, in a module under neither
+side of the seam, because the Adapter shim needs it too and has no business
+importing the relay wiring to borrow a thread.
 
 **A file the agent produced goes out through `complete`, not from here.** The
 answer's `[file: …]` markers travel with it, the library reads them in the one
@@ -55,6 +56,8 @@ import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from ag2_relay_client.status import DISPLACED, FATAL
 
 from . import attachments as att
 from . import relay as relay_client
@@ -418,6 +421,54 @@ async def _answer(client, how: str, task_id: str, payload: str, *rest) -> None:
               file=sys.stderr, flush=True)
 
 
+class RelayStopped(Exception):
+    """The Relay Client's poll loop ended, and only a new client resumes it."""
+
+
+#: The two connection states the library never comes back from by itself.
+#:
+#: Everything else it can report is the library *waiting*, and waiting is not
+#: dying: `reconnecting` retries by itself, `auth-wait` holds at a slow cadence
+#: until a rotation lands, and `standby` keeps asking for a bearer another
+#: poller holds so that a holder which died is taken over from with no operator
+#: in the loop. These two are different in kind — the loop has stopped, and the
+#: library's own contract is that coming back is the consumer's decision:
+#:
+#: * `fatal` — the bearer was rejected and there is nothing to re-read (this
+#:   Worker passes its token by value, so that is every rejection it can meet).
+#: * `displaced` — another poller took this bearer's guard. Re-acquiring by
+#:   itself would be the reaped-process incident with extra steps, so the loop
+#:   stops for good (J1).
+RELAY_ENDED = (FATAL, DISPLACED)
+
+
+def relay_stopped_for_good(client) -> Optional[RelayStopped]:
+    """Why this Worker can never be given work again, or `None`.
+
+    A Worker whose Relay Client has stopped is the failure this module's `serve`
+    docstring already names about the queue reader — "alive by every measure
+    anybody has, and no longer an agent" — reached from the other side. The
+    reader is fine; what it is reading from has ended. Nothing used to notice:
+    the connection state went into the status file's `relay` block, where it was
+    true and unread, while the document's own `state` went on saying `serving`
+    and the process went on beating it, for ever, receiving nothing.
+    """
+    snapshot = getattr(client, "snapshot", None)
+    if snapshot is None:
+        return None                         # a caller driving Tasks by hand
+    try:
+        state = (snapshot() or {}).get("state")
+    except Exception:  # noqa: BLE001 — an observer is never a delivery blocker
+        return None
+    if state not in RELAY_ENDED:
+        return None
+    return RelayStopped(
+        f"the Relay Client stopped for good ({state}) — it holds no bearer it "
+        f"can poll, and only a restart re-enters the arbitration. See the "
+        f"`relay` block of the status file for what it last said"
+    )
+
+
 async def serve(
     adapter,
     repo: str,
@@ -462,6 +513,15 @@ async def serve(
     whatever ended it back to this loop, which raises it: the status file gets
     an `error` with the reason in it, the process exits, and a service manager
     restarts something that can be given work.
+
+    **And so does a Relay Client that has stopped for good.** The same failure
+    from the other side: the reader is fine, the thing it reads from has ended
+    — a bearer rejected with nothing to re-read, or a singleton guard another
+    poller took. The library says so in its snapshot and stops its poll thread;
+    nothing above it used to ask, so the state was written into the status
+    file's `relay` block and the document's own `state` went on saying
+    `serving`. `relay_stopped_for_good` is the asking, on the idle path of the
+    queue read, and it ends the Worker the same way.
     """
     sessions: dict = {}
     running: set = set()
@@ -499,7 +559,14 @@ async def serve(
             while not stop.is_set():
                 task = client.next_task(poll)
                 if task is None:
-                    continue                # nothing arrived in `poll` seconds
+                    # Nothing arrived in `poll` seconds — which is the ordinary
+                    # case, and also the only moment this Worker can notice that
+                    # the thing feeding it has stopped for good.
+                    ended = relay_stopped_for_good(client)
+                    if ended is not None and not stop.is_set():
+                        hand_over(ended)
+                        return
+                    continue
                 if not hand_over(task):
                     return
         except BaseException as exc:  # noqa: BLE001 — reported, never silent
@@ -515,6 +582,9 @@ async def serve(
     try:
         while True:
             task = await inbound.get()
+            if isinstance(task, RelayStopped):
+                raise RuntimeError(
+                    f"this Worker can no longer be given work: {task}") from task
             if isinstance(task, BaseException):
                 raise RuntimeError(
                     "the queue reader stopped: this Worker can no longer be "

@@ -213,5 +213,39 @@ with tempfile.TemporaryDirectory() as tmp:
     check(loaded.inflight_ids() == ["task-ok"] and not loaded.done_ids(),
           "only ids this client would have been willing to write survive a load")
 
+# --- the lock a write could not take must not cost a descriptor ------------
+# The give-up path is the *expected* one under J1: a standby exists by design, a
+# takeover has both views live at once, and a consumer may answer from somewhere
+# else — so a contended write is ordinary, not exotic. It used to `yield False`
+# with the lock file still open, which leaks one descriptor per contended write
+# and ends in `EMFILE` on the poll thread: a client that can no longer open a
+# socket, arrived at through the very condition the lock exists for.
+if hasattr(os, "listdir") and Path("/dev/fd").exists():
+    import fcntl
+
+    import ag2_relay_client.journal as journal_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        journal = fresh(tmp)
+        rival = os.open(str(Path(tmp) / "journal.jsonl.lock"),
+                        os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(rival, fcntl.LOCK_EX)
+        was, journal_module.LOCK_WAIT_S = journal_module.LOCK_WAIT_S, 0.01
+        try:
+            before = len(os.listdir("/dev/fd"))
+            for index in range(20):
+                journal.accept("task-%d" % index, room="!room:ag2.space")
+            after = len(os.listdir("/dev/fd"))
+        finally:
+            journal_module.LOCK_WAIT_S = was
+            os.close(rival)
+        check(after == before,
+              "twenty writes made while another process holds the lock leak no "
+              "descriptors — the give-up path closes the file it opened")
+        check(fresh(tmp).load().inflight() == 20,
+              "and every one of them still landed: the lock is a merge, never a "
+              "precondition (D4)")
+
+
 print("\n" + ("PASS — journal green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

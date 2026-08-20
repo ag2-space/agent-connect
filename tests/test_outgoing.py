@@ -434,37 +434,41 @@ with contextlib.redirect_stderr(said):
     )
 check(built is not None, "a Worker that lost one of several roots still starts: "
                          "an attachment is not worth the whole Worker")
-check(gone in said.getvalue() and outgoing.EGRESS_ROOTS_ENV in said.getvalue(),
-      "and says so while the operator is still looking at the startup, naming "
-      "the path and the setting it came from: " + repr(said.getvalue()[:110]))
+check(outgoing.UNSENDABLE.format(name=gone) in said.getvalue(),
+      "and says so in that sentence while the operator is still looking at the "
+      "startup — the path, and the setting to fix it in, not the library's own "
+      "log line about dropping a root")
 check(built.room_ops.allowlist.roots == (os.path.realpath(str(real)),),
       "with the roots it can actually use, and no others: "
       + repr(built.room_ops.allowlist.roots))
 
-# None survive, and roots were named. The Worker was told where its files come
-# from and can use none of it — an `AGENT_CONNECT_REPO` that is not there, which
-# is also the directory its Turns were going to run in.
-try:
-    relay_module.from_env(
+# And none surviving is the same answer, louder — not a refusal. A Worker that
+# cannot attach a file can still answer the question, and a missing attachment
+# root is not worth taking the whole Worker off the air; the fail-closed reading
+# of "no usable roots" is the one this file already documents for "no roots".
+said = io.StringIO()
+with contextlib.redirect_stderr(said):
+    only_bad = relay_module.from_env(
         Path(tempfile.mkdtemp()),
         {"AGENT_CONNECT_TOKEN": "https://relay.example/relay|s3cret"},
         repo=gone,
     )
-    refused = ""
-except ValueError as exc:
-    refused = str(exc)
-check(gone in refused,
-      "a Worker with no usable root at all is refused at startup, by name: "
-      + repr(refused[:120]))
-check(outgoing.EGRESS_ROOTS_ENV in refused or "AGENT_CONNECT_REPO" in refused,
-      "and the refusal names the setting to fix, not just the path")
+check(only_bad is not None,
+      "a Worker whose every root is missing still starts and still answers — "
+      "refusing to start would be a bigger outage than the one being reported")
+check(only_bad.room_ops.allowlist.roots == (),
+      "with an empty allowlist, which is exactly what a Worker given no roots "
+      "gets: it sends no files, and says so, rather than sending the wrong one")
+check(outgoing.UNSENDABLE.format(name=gone) in said.getvalue(),
+      "and the path it cannot use is named on the way past, in the same "
+      "sentence")
 
 check(relay_module.from_env(
         Path(tempfile.mkdtemp()),
         {"AGENT_CONNECT_TOKEN": "https://relay.example/relay|s3cret"},
       ) is not None,
-      "while a Worker that named no roots at all is not refused — it sends no "
-      "files on purpose, and that is a different thing from a typo")
+      "while a Worker that named no roots at all has nothing to report — "
+      "it sends no files on purpose, and that is not a typo")
 
 # Box 4: nothing anywhere in the package reads the retired airlock's setting.
 PACKAGE = "\n".join(p.read_text()

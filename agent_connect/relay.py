@@ -59,7 +59,7 @@ from typing import Mapping, Optional
 from ag2_relay_client import RelayClient, TokenSource
 from ag2_relay_client.state import valid_instance_name
 
-from .outgoing import EGRESS_ROOTS_ENV, egress_roots, unsendable
+from .outgoing import UNSENDABLE, egress_roots, unsendable
 from .status import DEFAULT_INSTANCE as status_default_instance
 from .status import INSTANCE_ENV, instance_name
 
@@ -154,41 +154,23 @@ def from_env(
     from there. Without it the client is built with no roots and sends nothing:
     a Worker that cannot say where its agent works cannot vouch for a path.
 
-    **A root that is not there is found here**, before the client is built. The
-    allowlist would drop it, log one line, and refuse every file named under it
-    for the rest of the run — a Worker that has stopped attaching things,
-    discovered by the person who asked for one. What that is worth differs, and
-    so does what happens: losing one root of several is said out loud and the
-    Worker starts, because an attachment is not worth a Worker. Losing *all* of
-    them, when roots were named, is a refusal — that is an
-    `AGENT_CONNECT_REPO` pointing at a directory this Worker's Turns were also
-    going to run in, and the operator should read it now rather than after the
-    Local Agent has failed at it. A Worker that named no roots at all is
-    neither: it sends no files on purpose (the fail-closed reading), and that is
-    not a typo.
+    **A root that is not there is said here**, before the client is built. The
+    allowlist would otherwise drop it, log one line at the first upload, and
+    refuse every file named under it for the rest of the run — a Worker that has
+    stopped attaching things, found out by the person who asked for one. Said,
+    and not refused: a Worker that cannot attach a file can still answer the
+    question, and stopping it from answering at all would be a worse outage than
+    the one being reported. `outgoing` owns both the check and the sentence,
+    because it owns the roots.
     """
     env = os.environ if env is None else env
     raw = token(env)
     if not raw:
         return None
     credentials = TokenSource(token=raw, base_url=(env.get(URL_ENV) or "").strip())
-    roots = tuple(options.setdefault("egress_roots", egress_roots(repo, env)))
-    dropped = unsendable(roots)
-    if dropped and len(dropped) == len(roots):
-        raise ValueError(
-            "none of the directories this Worker may send files from is there: "
-            + ", ".join(repr(name) for name in dropped)
-            + f". That is where its Turns run and where a file it produces has "
-            f"to come from, so fix AGENT_CONNECT_REPO (or {EGRESS_ROOTS_ENV}) "
-            f"rather than start a Worker that can neither work nor attach"
-        )
-    for name in dropped:
-        print(
-            f"agent-connect: WARNING — {name!r} is not a directory on this "
-            f"machine, so no file will ever be sent from it. Fix it in "
-            f"{EGRESS_ROOTS_ENV}, or take it out.",
-            file=sys.stderr, flush=True,
-        )
+    roots = options.setdefault("egress_roots", egress_roots(repo, env))
+    for name in unsendable(roots):
+        print(UNSENDABLE.format(name=name), file=sys.stderr, flush=True)
     return RelayClient(
         credentials,
         state_dir=state_dir(workspace),

@@ -71,9 +71,10 @@ WIRE_MODULES = {
 #: bearer access" under *Deliberately absent*. The Local Agent exemption below
 #: is for a server on **this machine**; there is nothing local about this one.
 #: What this package may import out of the library is its named surface —
-#: `RelayClient`, `markers`, `credentials`, `state` — and this is the one name
-#: under it that hands back the wire itself.
-RELAY_INTERNALS = {"ag2_relay_client.transport"}
+#: `RelayClient`, `markers`, `credentials`, `state`, `egress` — and this is the
+#: one name under it that hands back the wire itself. Matched as a prefix, so a
+#: submodule of it is refused too.
+RELAY_INTERNALS = ("ag2_relay_client.transport",)
 
 #: The Adapters that may open a socket, and what for. A local model server is
 #: not the relay; a new name here is a decision somebody made on purpose.
@@ -170,7 +171,8 @@ excused = set()
 for path, tree in sources():
     for name in imported(tree):
         head = name.split(".")[0]
-        internal = name in RELAY_INTERNALS
+        internal = any(name == refused or name.startswith(refused + ".")
+                       for refused in RELAY_INTERNALS)
         if not (internal or name in WIRE_MODULES or head in WIRE_MODULES):
             continue
         if (not internal and path.parent.name == "adapters"

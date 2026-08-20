@@ -42,9 +42,12 @@ already guards writes against, and the only place a file *a Turn produced* can
 be. An operator with a second one says so in `AGENT_CONNECT_EGRESS_ROOTS`;
 nothing else on the machine is sendable.
 
-The roots are also **checked here, at startup**, rather than discovered one at
-a time at the first upload: see `unsendable`. An allowlist quietly missing a
-root is a Worker that has stopped sending files and has not said so.
+The roots are also **checked at startup**, rather than discovered one at a time
+at the first upload: see `unsendable` and the sentence beside it. An allowlist
+quietly missing a root is a Worker that has stopped sending files and has not
+said so. What it is *not* is a reason to refuse to start — a Worker that cannot
+attach a file can still answer the question, and the fail-closed reading of no
+roots at all is the same one either way.
 
 What this does **not** prevent, stated so nobody reads more into it: an agent
 that can be talked into copying `~/.ssh/id_rsa` into its own working directory
@@ -105,6 +108,17 @@ def egress_roots(
         if expanded not in roots:
             roots.append(expanded)
     return tuple(roots)
+
+
+#: What an operator is told about a root the allowlist would drop. It lives
+#: beside the setting it names, like `INSTRUCTION` above: the sentence and the
+#: rule it describes change together or not at all.
+UNSENDABLE = (
+    "agent-connect: WARNING — {name!r} is not a directory on this machine, so "
+    "no file will ever be sent from it. Fix it in " + EGRESS_ROOTS_ENV +
+    " (or AGENT_CONNECT_REPO, if that is where it came from), or take it out. "
+    "This Worker starts either way: an attachment is not worth a Worker."
+)
 
 
 def unsendable(roots: Sequence[object]) -> Tuple[str, ...]:

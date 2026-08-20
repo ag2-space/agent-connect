@@ -419,42 +419,56 @@ def _across_processes(path: Path) -> Iterator[bool]:
     every wait in this library is bounded: the poll loop is what keeps leases
     alive, and a call in it that can wait forever is how a client stops
     delivering without ever looking broken (F1).
+
+    **One `finally` closes the descriptor, on every exit.** The give-up path
+    used to `yield False` and return with the file still open, so every write
+    made while another process held the lock leaked one descriptor — measured,
+    twenty contended `accept()` calls cost twenty of them. It is exactly the
+    shape J1 tolerates by design (a standby exists, a takeover has both views
+    live at once), so the leak is *paced by the condition this lock exists for*,
+    and it ends in `EMFILE` on the poll thread: not a lost journal write, a
+    client that can no longer open a socket. `singleton.py`'s `_locked` had it
+    right — its `os.close` is in a `finally` — and this is the same shape.
     """
     if fcntl is None:  # pragma: no cover — non-POSIX
         yield False
         return
     handle = None
+    locked = False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
-        deadline = time.monotonic() + LOCK_WAIT_S
-        while True:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    log.warning("the journal lock at %s stayed held for %ss — "
-                                "writing without it; a concurrent writer's "
-                                "change to another id may be lost", path,
-                                LOCK_WAIT_S)
-                    yield False
-                    return
-                time.sleep(0.005)
-    except OSError as exc:
-        log.debug("no cross-process journal lock at %s (%s)", path, exc)
-        if handle is not None:
-            os.close(handle)
-        yield False
-        return
-    try:
-        yield True
-    finally:
         try:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-        except OSError:  # pragma: no cover — closing releases it anyway
-            pass
-        os.close(handle)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+            locked = _flock_within(handle, path)
+        except OSError as exc:
+            log.debug("no cross-process journal lock at %s (%s)", path, exc)
+            locked = False
+        yield locked
+    finally:
+        if handle is not None:
+            if locked:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                except OSError:  # pragma: no cover — closing releases it anyway
+                    pass
+            os.close(handle)
+
+
+def _flock_within(handle: int, path: Path) -> bool:
+    """Take the exclusive lock inside `LOCK_WAIT_S`, or say it could not be."""
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                log.warning("the journal lock at %s stayed held for %ss — "
+                            "writing without it; a concurrent writer's "
+                            "change to another id may be lost", path,
+                            LOCK_WAIT_S)
+                return False
+            time.sleep(0.005)
 
 
 class Reconciler:

@@ -37,12 +37,14 @@ The precedence rules are part of the grammar, not of any consumer:
   line still in it, because emptying somebody's example is the same silent
   rewrite the standalone-only rule above exists to prevent.
 
-- **A marker whose value is a placeholder is being described, not issued.**
-  `[file: <path>]` is how the consumer's own instruction to the agent is
-  written, so it is also what an agent repeating that instruction produces — in
-  ordinary prose, where no mask reaches. Detection and stripping are narrowed
+- **A marker whose value is *entirely* a placeholder is being described, not
+  issued.** `[file: <path>]` is how the consumer's own instruction to the agent
+  is written, so it is also what an agent repeating that instruction produces —
+  in ordinary prose, where no mask reaches. Detection and stripping are narrowed
   together, so the explanation is delivered exactly as written and no file is
-  refused in it.
+  refused in it. A value that merely *contains* `<…>` is a path: an angle
+  bracket is legal in a filename, and declining one would leave a live marker in
+  the room as literal text, which is the leak at the top of this file.
 
 The masking has one invariant, and it is the one worth checking a change
 against: **a marker is either issued and stripped, or masked and left visible —
@@ -123,11 +125,15 @@ _ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
 #: the "neither" case is a marker that vanishes *and* does nothing, not one that
 #: is left exactly as the agent wrote it.
 #:
-#: Nothing sendable is lost. No filesystem this client uploads from has a file
-#: called `<path>`, so the only outcomes on offer were a mangled sentence and a
-#: false refusal; and a genuine path with an angle bracket in it now arrives in
-#: the room whole and visible, which is the direction a person can see and act
-#: on rather than the one that hides.
+#: **The whole value, or it is a path.** `<…>` has to be all there is between
+#: the colon and the `]`, because an angle bracket is legal in a POSIX filename
+#: and a rule that matched `[file: /reports/q<1>.png]` would decline to send a
+#: real file *and* leave its marker in the room as literal text — with no
+#: `[attachment not sent: …]` either, since nothing was attempted. That is
+#: precisely the leak this module is named after, re-entered through the fix for
+#: it. Anchored, the only thing declined is a value no filesystem this client
+#: uploads from has a file for, and the two outcomes on offer for it were a
+#: mangled sentence and a false refusal.
 _PLACEHOLDER_RE = re.compile(r"<[^<>]*>")
 
 #: An **unterminated** marker: an opening tag with no closing `]` before the end
@@ -273,14 +279,14 @@ def parse(text: Optional[str]) -> ParseResult:
 
     def _issued(found) -> bool:
         return (not in_code(found.start())
-                and not _PLACEHOLDER_RE.search(found.group(1)))
+                and not _PLACEHOLDER_RE.fullmatch(found.group(1).strip()))
 
     for found in _ATTACH_RE.finditer(body):
         if _issued(found):
             actions.append(Action("attach", found.group(1).strip()))
 
     body = _ATTACH_RE.sub(
-        lambda m: "" if _issued(m) else m.group(0), body
+        lambda found: "" if _issued(found) else found.group(0), body
     )
 
     # 5. UNTERMINATED — an opening tag the body ran out before closing. It named

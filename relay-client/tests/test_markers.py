@@ -203,15 +203,24 @@ check(parsed.body == taught,
       + repr(parsed.body))
 
 for shown in ("[file: <path>]", "see [send: <absolute path>] for that",
-              "[attach: ~/<name>.png]"):
+              "[attach:   <the file>  ]"):
     parsed = markers.parse(shown)
     check(parsed.attachments == () and parsed.body == shown,
           f"...whichever spelling it is written in ({shown!r})")
 
-check(markers.parse("[file: /a/real<1>.png]").attachments == (),
-      "a real path with angle brackets in it goes the same way — it is left "
-      "whole and visible rather than sent, which is the direction that shows "
-      "up in the room instead of hiding there")
+# But only when `<…>` is the WHOLE value. An angle bracket is legal in a POSIX
+# filename, and a rule that matched a path merely containing one would decline
+# to send a real file *and* leave its marker in the room as literal text, with
+# no `[attachment not sent: …]` either, because nothing was attempted — the leak
+# this module is named after, re-entered through the fix for it.
+for real in ("/a/real<1>.png", "~/<name>.png", "notes/<draft>/a.md"):
+    parsed = markers.parse(f"here [file: {real}]")
+    check(parsed.attachments == (real,),
+          f"a path that merely contains angle brackets is a path ({real!r})")
+    check("[file:" not in parsed.body,
+          "and is stripped like any other, so nothing reaches the room as "
+          "literal marker text — a file that cannot go is refused by name, "
+          "which is the outcome a person can act on")
 
 # --- nothing at all
 check(markers.parse("").body == "" and markers.parse(None).actions == (),

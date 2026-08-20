@@ -423,6 +423,77 @@ check(late.released and time.monotonic() - began < 0.3,
 check(RelayStop(budget=1.0).finish() is None,
       "and a Worker that never got as far as having a client stops cleanly")
 
+print("\n-- a Relay Client that stopped for good takes the Worker with it --")
+
+# The failure `serve` already names about its queue reader, reached from the
+# other side: the reader is fine and the thing it reads from has ended. The
+# library stops its poll thread on exactly two verdicts — a bearer rejected with
+# nothing to re-read (`fatal`), and a singleton guard another poller took
+# (`displaced`) — and its own contract is that coming back is the consumer's
+# decision. Nothing above it asked. The state went into the status file's
+# `relay` block, where it was true and unread, while the document's own `state`
+# went on saying `serving` and the heartbeat went on beating it, receiving
+# nothing, for ever.
+
+
+class Ended:
+    """A client whose queue is empty because its poll loop has stopped."""
+
+    def __init__(self, state):
+        self.state = state
+        self.reads = 0
+
+    def next_task(self, timeout=None):
+        self.reads += 1
+        time.sleep(0.01)
+        return None
+
+    def snapshot(self):
+        return {"state": self.state}
+
+
+async def _drains_until_it_cannot(client):
+    try:
+        await asyncio.wait_for(serve(Answers(), "/repo", client, 0.01), timeout=5)
+    except RuntimeError as exc:
+        return str(exc)
+    except asyncio.TimeoutError:
+        return ""
+
+
+for state in (FATAL, DISPLACED):
+    said = asyncio.run(_drains_until_it_cannot(Ended(state)))
+    check(state in said and "can no longer be given work" in said,
+          f"a client in `{state}` ends the drain loop with the reason in the "
+          f"sentence, so the status file gets an `error` and the process exits")
+
+# The other half, and the one that must not regress: everything else the library
+# can report is the library *waiting*, and waiting is not dying. A `standby`
+# keeps asking for a bearer another poller holds — that is how a holder which
+# died is taken over from with no operator in the loop — and `auth-wait` holds
+# at a slow cadence until a rotation lands. A Worker that exited on those would
+# turn its own patience into a restart loop.
+for state in (RECONNECTING, AUTH_WAIT, STANDBY, STOPPED, CONNECTED):
+    waiting = Ended(state)
+    check(asyncio.run(_drains_until_it_cannot(waiting)) == "" and waiting.reads > 1,
+          f"`{state}` is the library waiting, and the Worker waits with it")
+
+# And a caller driving Tasks by hand may have no snapshot to ask at all.
+
+
+class ByHand:
+    """The consumer surface without the observer half of it."""
+
+    def next_task(self, timeout=None):
+        time.sleep(0.01)
+        return None
+
+
+check(asyncio.run(_drains_until_it_cannot(ByHand())) == "",
+      "a client with no snapshot is a caller driving Tasks by hand, and the "
+      "absence of an observer is not a verdict about the wire")
+
+
 print("\n" + ("PASS — the Worker on the real client green" if fails == 0
               else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)
