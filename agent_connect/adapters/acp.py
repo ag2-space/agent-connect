@@ -241,10 +241,33 @@ PRESETS: Dict[str, Preset] = {
     ),
 }
 
+#: Who `trust` is a command *to*. It is a message to the concierge and nothing
+#: else: `relay_allowlist.parse_command` on the AG2 Space side is only ever
+#: reached from a direct message to that user, so the same words typed in a room
+#: — or in a DM to the agent — arrive here as an ordinary prompt and are answered
+#: as a question. Named here rather than left to the reader because ticket 14
+#: watched an owner spend four Turns discovering it, and nothing said a word.
+#:
+#: Spelled with the domain left off deliberately. The local half is the backend's
+#: `CONCIERGE_USER` default and is not overridden on prd, but the homeserver is
+#: the deployment's, and the Worker never learns its own MXID — so a full MXID
+#: here would be a guess presented as a fact. There is no setting for it either:
+#: an operator who has to configure the name of the bot they are being sent to
+#: has already lost the thread this sentence exists to hand them.
+CONCIERGE = "@sutando-concierge"
+
 #: What a guest is told, in the room, instead of being ignored. It is the Turn's
 #: answer — the Ladder edits the placeholder into it — because a refusal nobody
 #: can see is indistinguishable from a Worker that is simply broken. It says
 #: what happened, why this Adapter in particular, and what would change it.
+#:
+#: Since 2026-08-20 it is also the *default* thing the platform says to anyone
+#: who is not the owner: the Agent Portal's Connect flow now opens on Claude
+#: Code, so the ACP path is what a new agent is unless its owner chooses
+#: otherwise. That is why the last two paragraphs carry more than they used to.
+#: The pointer has to be followable — an instruction with no recipient is not one
+#: — and it has to be honest about what it asks for: `trust` is owner tier on
+#: every agent the owner owns, not a visitor's pass to this conversation.
 REFUSAL = (
     "I only answer my owner over this connection.\n\n"
     "This agent is driven through the Agent Client Protocol, which — unlike the "
@@ -254,8 +277,13 @@ REFUSAL = (
     "stopped by it. Rather than offer a limit that only looks like one, "
     "agent-connect does not run this connection for anyone but the person who "
     "registered the agent.\n\n"
-    "Nothing is wrong with your message: my owner can `trust` you, which grants "
-    "owner tier, and then I will answer it."
+    "Nothing is wrong with your message. My owner can `trust` you, and then I "
+    "will answer it — but that grants owner tier, which is their own level of "
+    "access on every agent they own, not a guest pass to this room.\n\n"
+    f"Where it has to be said: in a direct message to the concierge, "
+    f"`{CONCIERGE}` on this homeserver. Sent anywhere else, `trust @user` is not "
+    "a command at all — in this room, or in a direct message to me, I read it as "
+    "an ordinary question and answer it as one."
 )
 
 #: What the room is told when its conversation starts over. One sentence, in

@@ -191,6 +191,25 @@ check(STOP_LINES[REFUSED] in edits[-1],
       "and marked as a refusal, so it does not read as the agent's own opinion")
 check("trust" in edits[-1],
       "with what would change it — the owner can `trust` them")
+
+# The refusal is no longer an edge case: since 2026-08-20 the Agent Portal's
+# Connect flow opens on Claude Code, so this is the platform's DEFAULT answer to
+# anyone who is not the owner. That raises the bar on the one instruction it
+# gives. Ticket 14's live run watched an owner spend four whole Turns typing
+# `trust`/`allow` in the room and in a DM to the agent, where they are read as
+# ordinary prompts and answered as questions; `relay_allowlist.parse_command` is
+# only ever reached from a DM to the concierge, and nothing anywhere said so.
+# "the owner can `trust` you" without a recipient is therefore an instruction
+# that cannot be followed, so what is asserted is that it names one.
+check("concierge" in edits[-1].lower(),
+      "and WHERE to say it — the concierge, the only recipient `trust` is a "
+      "command to. An instruction with no recipient sent an owner round four "
+      "wasted Turns (ticket 14)")
+check("direct message" in edits[-1].lower() or " DM" in edits[-1],
+      "as a direct message, which is the form the concierge reads")
+check("this room" in edits[-1].lower(),
+      "and it says the room is NOT that recipient — the mistake actually made, "
+      "named, rather than left to be made again")
 check(out.startswith(REPLIED),
       "and the result completes the lease, so the delivery path posts nothing more")
 bench.stop()
