@@ -35,6 +35,7 @@ from ag2_relay_client.egress import EgressAllowlist
 from ag2_relay_client.media import (
     CAP_BYTES,
     DEFAULT_MIME,
+    MARKER_TAG,
     TOO_LARGE,
     UNFETCHABLE,
     MediaStore,
@@ -503,6 +504,19 @@ check(body == "and" and "attacker.test" not in body,
 
 check(strip_markers("[ag2space-media: https://attacker.test/x")[0] == "",
       "a body that is only an unterminated marker degrades to empty (G2)")
+
+# --- the strip that re-formed the marker it took apart (2026-08-21 review) --
+#
+# Same shape as the room-ops block next door, and it reconstitutes a *valid*
+# marker: the leading `[` is not part of any match, so it survives to join the
+# tail the inner marker's removal exposes. The result reached the consumer as
+# literal text this module had promised to remove.
+body, markers = strip_markers("[[ag2space-media: a]ag2space-media: mxc://evil/server/id]")
+check(MARKER_TAG not in body,
+      "a nested marker does not re-form a marker the strip then walks past")
+check([m.url for m in markers] == ["a"],
+      "and a marker that exists only because a strip re-formed it is deleted, "
+      "never fetched — reading it would widen the surface being closed")
 
 print("\n" + ("PASS — media ingress green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

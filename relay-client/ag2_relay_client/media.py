@@ -91,7 +91,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Callable, List, NamedTuple, Optional, Tuple
 
-from .envelope import Task
+from .envelope import Task, strip_to_fixpoint
 from .transport import (
     AuthRejected,
     RelayHTTP,
@@ -234,8 +234,16 @@ def strip_markers(body: str) -> Tuple[str, Tuple[Marker, ...]]:
     # The strip is unconditional: a marker with nothing usable inside it names
     # no attachment and is still a marker, so it still must not reach anyone.
     # The unterminated tail goes second, after the well-formed markers are out,
-    # so a body carrying one of each loses both.
-    stripped = UNTERMINATED_RE.sub("", MARKER_RE.sub("", body))
+    # so a body carrying one of each loses both — and the pair runs to a
+    # fixpoint, because one pass can re-form the marker it just took apart
+    # (`[[ag2space-media: a]ag2space-media: mxc://...]`, 2026-08-21 review).
+    #
+    # The markers above are read from the body as it arrived and from nowhere
+    # else: a marker that only exists *because* a strip re-formed it is deleted
+    # rather than honoured. Reading later passes would turn a body someone
+    # composed into a URL this client fetches, which is a wider surface than
+    # the bug being closed.
+    stripped, _ = strip_to_fixpoint(body, MARKER_RE, UNTERMINATED_RE)
     return stripped.strip(), tuple(found)
 
 
