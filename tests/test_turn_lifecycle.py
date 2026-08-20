@@ -1,8 +1,8 @@
 """Tests for what happens when a Turn does not simply produce an answer.
 
 Three situations, all asserted the way the outside world sees them — the Room
-Ops a **real local HTTP relay** recorded, and the body written as the Task's
-result. Nothing here asserts on which internal object called which.
+Ops a **real local HTTP relay** recorded, and the body the Task was completed
+with. Nothing here asserts on which internal object called which.
 
 * **A message arriving while the Session is busy** is queued, and the person is
   told so before the wait rather than after it.
@@ -51,8 +51,9 @@ from agent_connect.reporter import (
     LadderSettings,
     TurnReporter,
 )
+from _queue import FakeClient, task
 from agent_connect.roomops import RoomOps
-from agent_connect.worker import process_one
+from agent_connect.worker import handle_one, process_one
 
 ROOM_A = "!alpha:ag2.space"
 ROOM_B = "!beta:ag2.space"
@@ -114,19 +115,11 @@ def relay_ops():
 
 
 def workspace():
+    """The outgoing directory, which is all a workspace is to a Turn now."""
     tmp = Path(tempfile.mkdtemp())
-    tasks, results = tmp / "tasks", tmp / "results"
-    tasks.mkdir()
+    results = tmp / "results"
     results.mkdir()
-    return tasks, results
-
-
-def write_task(tasks: Path, task_id: str, body: str, room: str = ROOM_A) -> Path:
-    path = tasks / f"task-{task_id}.txt"
-    path.write_text(
-        f"id: {task_id}\nchannel_id: {room}\ntask: {body}\naccess_tier: owner\n"
-    )
-    return path
+    return results
 
 
 def ctx_for(room=ROOM_A, task_id="task-1"):
@@ -187,19 +180,20 @@ print("\n-- a second message is queued, announced, and answered afterwards --")
 
 async def _queueing():
     relay, ops = relay_ops()
-    tasks, results = workspace()
-    first = write_task(tasks, "q1", "the long one", ROOM_A)
-    second = write_task(tasks, "q2", "the follow-up", ROOM_A)
-    other = write_task(tasks, "q3", "another room", ROOM_B)
+    results = workspace()
+    client = FakeClient()
+    delivered = (task("task-q1", "the long one", room=ROOM_A),
+                 task("task-q2", "the follow-up", room=ROOM_A),
+                 task("task-q3", "another room", room=ROOM_B))
     adapter = Gated()
     adapter.gate = asyncio.Event()
     sessions = {}
     running = [
         asyncio.ensure_future(
-            process_one(p, adapter, "/repo", results, sessions, ops,
-                        LadderSettings(throttle=0.0))
+            handle_one(one, adapter, "/repo", results, sessions, ops,
+                       LadderSettings(throttle=0.0), client=client)
         )
-        for p in (first, second, other)
+        for one in delivered
     ]
     await settle()
     mid = {
@@ -209,10 +203,10 @@ async def _queueing():
     }
     adapter.gate.set()
     await asyncio.gather(*running)
-    return relay, results, adapter, mid
+    return relay, client, adapter, mid
 
 
-relay, results, adapter, mid = asyncio.run(_queueing())
+relay, client, adapter, mid = asyncio.run(_queueing())
 
 check("task-q2" not in mid["started"],
       "while the first Turn is open, the second Task has not reached the Adapter")
@@ -238,10 +232,9 @@ check(adapter.started[-1] == "task-q2"
       and adapter.started.index("task-q1") < adapter.started.index("task-q2"),
       f"the queued Task ran after the one it waited for ({adapter.started})")
 check(adapter.peak <= 2, "and never two Turns at once on the one Session")
-for tid in ("q1", "q2", "q3"):
-    body = (results / f"task-{tid}.txt").read_text()
-    check(f"answer for task-{tid}" in body, f"task-{tid} was answered")
-check("queued" not in (results / "task-q2.txt").read_text(),
+for tid in ("task-q1", "task-q2", "task-q3"):
+    check(f"answer for {tid}" in (client.answer(tid) or ""), f"{tid} was answered")
+check("queued" not in client.answer("task-q2"),
       "and the queue announcement is not repeated in the answer it preceded")
 relay.stop()
 

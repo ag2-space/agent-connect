@@ -42,6 +42,7 @@ try:
         store_path,
         workspace_dir,
     )
+    from _queue import task as queued_task
     from agent_connect.worker import handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(
@@ -129,11 +130,10 @@ class Bench:
     def __init__(self, script=None, settings=None):
         self._dir = tempfile.TemporaryDirectory()
         self.base = Path(self._dir.name)
-        self.tasks = self.base / "tasks"
         self.results = self.base / "results"
         self.repo = self.base / "repo"
         self.reports = self.base / "reports"
-        for d in (self.tasks, self.results, self.repo, self.reports):
+        for d in (self.results, self.repo, self.reports):
             d.mkdir()
         self.script_path = self.base / "script.json"
         self.store_path = self.base / "sessions.json"
@@ -154,20 +154,16 @@ class Bench:
 
     def handle(self, task_id: str, body: str = "do it", room: str = ROOM_A,
                tier: str = "owner", ops=None, cwd=None) -> str:
-        lines = [f"id: {task_id}", f"channel_id: {room}", f"task: {body}",
-                 f"access_tier: {tier}"]
-        path = self.tasks / f"task-{task_id}.txt"
-        path.write_text("\n".join(lines) + "\n")
+        task = queued_task(task_id, body, room=room, tier=tier)
         os.environ["FAKE_ACP_REPORT"] = str(self.reports / f"{task_id}.json")
         try:
-            asyncio.run(asyncio.wait_for(
-                handle_one(path, self.adapter, str(cwd or self.repo), self.results,
+            return asyncio.run(asyncio.wait_for(
+                handle_one(task, self.adapter, str(cwd or self.repo), self.results,
                            None, ops, LadderSettings(throttle=0.0)),
                 timeout=30,
             ))
         finally:
             os.environ.pop("FAKE_ACP_REPORT", None)
-        return (self.results / f"task-{task_id}.txt").read_text()
 
     def report(self, task_id: str):
         path = self.reports / f"{task_id}.json"

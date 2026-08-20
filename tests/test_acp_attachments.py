@@ -29,7 +29,9 @@ from pathlib import Path
 try:
     from agent_connect.adapters.acp import AcpAdapter
     from agent_connect.attachments import MAX_BYTES_ENV
+    from agent_connect.events import Attachment
     from agent_connect.sessions import SessionStore
+    from _queue import task as queued_task
     from agent_connect.worker import handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(
@@ -64,7 +66,6 @@ class Bench:
         self._dir = tempfile.TemporaryDirectory()
         base = Path(self._dir.name)
         self.base = base
-        self.tasks = base / "tasks"
         self.results = base / "results"
         self.repo = base / "repo"
         # Where the relay client already downloaded what someone attached. It
@@ -72,7 +73,7 @@ class Bench:
         # something the Worker was handed, not something the agent may go and
         # find for itself.
         self.media = base / "relay-media"
-        for d in (self.tasks, self.results, self.repo, self.media):
+        for d in (self.results, self.repo, self.media):
             d.mkdir()
         self.script_path = base / "script.json"
         self.script_path.write_text(json.dumps(script))
@@ -87,22 +88,24 @@ class Bench:
         path.write_bytes(data)
         return path
 
-    def handle(self, task_id: str, body: str, attachments=None, **headers) -> str:
-        """Run one Task — with an `attachments:` header — through the Worker."""
-        lines = [f"id: {task_id}"]
-        lines += [f"{k}: {v}" for k, v in headers.items() if k != "access_tier"]
-        lines.append(f"task: {body}")
-        if attachments is not None:
-            lines.append("attachments: " + json.dumps(attachments,
-                                                      separators=(",", ":")))
-        lines.append(f"access_tier: {headers.get('access_tier', 'owner')}")
-        path = self.tasks / f"task-{task_id}.txt"
-        path.write_text("\n".join(lines) + "\n")
+    def handle(self, task_id: str, body: str, attachments=None, **fields) -> str:
+        """Run one Task — carrying resolved local paths — through the Worker.
+
+        `attachments` is written the way the relay used to describe them,
+        because that is what these tests are about; `_queue` turns each dict
+        into the `Attachment` the library hands over. There is no header to
+        write it into any more, and no file to write the header in.
+        """
+        fields.setdefault("tier", fields.pop("access_tier", "owner"))
+        task = queued_task(
+            task_id, body,
+            attachments=tuple(Attachment(**a) for a in (attachments or ())),
+            **fields)
         previous = os.environ.get("FAKE_ACP_REPORT")
         os.environ["FAKE_ACP_REPORT"] = str(self.report_path)
         try:
-            asyncio.run(asyncio.wait_for(
-                handle_one(path, self.adapter, str(self.repo), self.results),
+            return asyncio.run(asyncio.wait_for(
+                handle_one(task, self.adapter, str(self.repo), self.results),
                 timeout=30,
             ))
         finally:
@@ -110,7 +113,6 @@ class Bench:
                 os.environ.pop("FAKE_ACP_REPORT", None)
             else:
                 os.environ["FAKE_ACP_REPORT"] = previous
-        return (self.results / f"task-{task_id}.txt").read_text()
 
     def report(self):
         if not self.report_path.exists():

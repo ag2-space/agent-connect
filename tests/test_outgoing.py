@@ -46,6 +46,7 @@ from agent_connect.reporter import (
 )
 from agent_connect.roomops import RoomOps
 from agent_connect.sandbox import sandbox_preamble
+from _queue import task
 from agent_connect.worker import handle_one
 
 ROOM = "!room:ag2.space"
@@ -187,10 +188,10 @@ def answers(text):
 def workspace():
     """A repo the agent works in and a results dir the transport reads."""
     tmp = Path(tempfile.mkdtemp())
-    repo, results, tasks = tmp / "repo", tmp / "results", tmp / "tasks"
-    for d in (repo, results, tasks):
+    repo, results = tmp / "repo", tmp / "results"
+    for d in (repo, results):
         d.mkdir()
-    return tmp, repo, results, tasks
+    return tmp, repo, results
 
 
 def ctx_for(repo, room=ROOM, task_id="task-1"):
@@ -198,11 +199,6 @@ def ctx_for(repo, room=ROOM, task_id="task-1"):
                        access_tier="owner", cwd=str(repo))
 
 
-def write_task(tasks, task_id, body, room=ROOM):
-    path = tasks / f"task-{task_id}.txt"
-    path.write_text(f"id: {task_id}\nchannel_id: {room}\ntask: {body}\n"
-                    f"access_tier: owner\n")
-    return path
 
 
 def report(reporter, adapter, ctx):
@@ -211,7 +207,7 @@ def report(reporter, adapter, ctx):
 
 print("\n-- a file the agent produced arrives in the room --")
 
-tmp, repo, results, tasks = workspace()
+tmp, repo, results = workspace()
 (repo / "report.md").write_text("# what I found\n")
 relay, ops = relay_ops()
 body = report(
@@ -265,7 +261,7 @@ check(FILE_POINTER.startswith("✅"),
 
 print("\n-- a file outside the permitted area is not sent, and the room is told --")
 
-tmp, repo, results, tasks = workspace()
+tmp, repo, results = workspace()
 secret = tmp / "private.key"
 secret.write_text("-----BEGIN PRIVATE KEY-----\n")
 (repo / "link.key").symlink_to(secret)
@@ -325,7 +321,7 @@ check("[file:" not in body and "outside" in body,
 
 print("\n-- several files produced by one Turn are all delivered --")
 
-tmp, repo, results, tasks = workspace()
+tmp, repo, results = workspace()
 (repo / "report.md").write_text("one")
 (repo / "chart.png").write_bytes(b"\x89PNG two")
 (repo / "diff.patch").write_text("three")
@@ -373,7 +369,7 @@ check(body.count("no more than") == 3 and "3 files" in body,
 
 print("\n-- a reply whose whole content is a file --")
 
-tmp, repo, results, tasks = workspace()
+tmp, repo, results = workspace()
 (repo / "chart.png").write_bytes(b"chart")
 body = asyncio.run(TurnReporter(None, LadderSettings(), outbox=Outbox(results)).run(
     answers("[file: chart.png]"), ctx_for(repo)))
@@ -402,7 +398,7 @@ check("passwd" in body and "not be sent" in body,
 
 print("\n-- what may be staged, and what may not --")
 
-tmp, repo, results, tasks = workspace()
+tmp, repo, results = workspace()
 (repo / "fine.txt").write_text("ok")
 (repo / "folder").mkdir()
 os.mkfifo(str(repo / "pipe"))
@@ -502,13 +498,12 @@ check("[file:" not in reader,
 
 print("\n-- through the Worker's seam, end to end --")
 
-tmp, repo, results, tasks = workspace()
+tmp, repo, results = workspace()
 (repo / "report.md").write_text("the whole report")
 relay, ops = relay_ops()
-path = write_task(tasks, "W1", "write me a report")
-asyncio.run(handle_one(path, answers("Here it is.\n\n[file: report.md]"), str(repo),
-                       results, None, ops, LadderSettings(throttle=0.0)))
-body = (results / "task-W1.txt").read_text()
+body = asyncio.run(handle_one(task("W1", "write me a report", room=ROOM),
+                              answers("Here it is.\n\n[file: report.md]"), str(repo),
+                              results, None, ops, LadderSettings(throttle=0.0)))
 sent = DeliveryPath(results).run(body)
 check(len(sent.uploads) == 1 and sent.uploads[0][1] == b"the whole report",
       "one Task through the Worker puts one file in the room")
@@ -521,22 +516,20 @@ check(str(results) in body and str(repo) not in body,
 relay.stop()
 
 # The same Task with no relay at all: the answer and the file both still travel.
-tmp, repo, results, tasks = workspace()
+tmp, repo, results = workspace()
 (repo / "report.md").write_text("no relay here")
-path = write_task(tasks, "W2", "write me a report")
-asyncio.run(handle_one(path, answers("Here it is.\n\n[file: report.md]"), str(repo),
-                       results, None, None, None))
-body = (results / "task-W2.txt").read_text()
+body = asyncio.run(handle_one(task("W2", "write me a report", room=ROOM),
+                              answers("Here it is.\n\n[file: report.md]"), str(repo),
+                              results, None, None, None))
 sent = DeliveryPath(results).run(body)
 check(len(sent.uploads) == 1, "a Worker holding no relay token still delivers the file")
 check("Here it is." in sent.posted, "and the answer with it")
 
 # And a Task whose file may not be sent leaves a room that knows why.
-tmp, repo, results, tasks = workspace()
-path = write_task(tasks, "W3", "send me the keys")
-asyncio.run(handle_one(path, answers("Sure.\n\n[file: /etc/hosts]"), str(repo),
-                       results, None, None, None))
-body = (results / "task-W3.txt").read_text()
+tmp, repo, results = workspace()
+body = asyncio.run(handle_one(task("W3", "send me the keys", room=ROOM),
+                              answers("Sure.\n\n[file: /etc/hosts]"), str(repo),
+                              results, None, None, None))
 sent = DeliveryPath(results).run(body)
 check(not sent.uploads, "nothing is uploaded")
 check("/etc/hosts" in sent.posted and "not be sent" in sent.posted,
@@ -550,7 +543,7 @@ print("\n-- another Task's archived reply is not a file this Task may send --")
 # other Task's archived answer. Only the *staging* subdirectory inside it is the
 # permitted area, or one room could ask for another room's reply by name and the
 # allowlist — which trusts that directory — could not tell the difference.
-tmp, repo, results, tasks = workspace()
+tmp, repo, results = workspace()
 victim = results / "task-other.txt"
 victim.write_text("the other room's private answer\n")
 box = Outbox(results)

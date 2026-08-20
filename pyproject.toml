@@ -17,7 +17,16 @@ keywords = ["ag2space", "codex", "matrix", "agent", "bridge"]
 # execution seam. Verified interoperating with
 # @agentclientprotocol/claude-agent-acp 0.64.2 at 0.12.0; pinned below 1.0
 # because it is pre-1.0 and its callback signatures are not yet stable.
-dependencies = ["agent-client-protocol>=0.12,<1.0"]
+#
+# `ag2-relay-client` is the transport, built in `relay-client/` in this same
+# repository and published as its own distribution — a *version* of it, never a
+# copy, because sutando will take the same version later and vendoring is the
+# disease its drift tests already treat. It is stdlib-only, so this adds no
+# dependency tree; the floor is the version that first carried the wire loop.
+dependencies = [
+    "agent-client-protocol>=0.12,<1.0",
+    "ag2-relay-client>=0.1.0",
+]
 
 [project.scripts]
 agent-connect = "agent_connect.worker:main"

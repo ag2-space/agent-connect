@@ -43,11 +43,12 @@ NORMAL_REASONS = frozenset({COMPLETED})
 class Attachment:
     """One file that arrived with a room message, already on this machine.
 
-    The relay client downloads whatever someone attached *before* the Task file
-    is written, so `locator` is a local path and nothing on this side of the
-    boundary fetches anything over the network. Everything else here is what the
-    relay was *told* about the file by the platform it came from: `mime` and
-    `filename` are labels, not facts, and neither decides what bytes are read.
+    The Relay Client resolves the wire's media markers and downloads whatever
+    someone attached *before* the Task is delivered, so `locator` is a local
+    path and nothing on this side of the boundary fetches anything over the
+    network. Everything else here is what the transport was *told* about the
+    file by the platform it came from: `mime` and `filename` are labels, not
+    facts, and neither decides what bytes are read.
 
     Deliberately metadata-only — no bytes and no file handle. An Adapter that
     cannot accept attachments at all (every shimmed one) has to be able to *see*
