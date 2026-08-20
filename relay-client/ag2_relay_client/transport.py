@@ -26,6 +26,12 @@ site the last time they were spread out:
 
 The base URL comes from the credential (I3) — there is no compiled-in gateway
 anywhere in this package.
+
+`fetch` is the one request that goes to an *absolute* URL rather than a path
+under that base — the media ingress follows a URL the broker wrote — and it is
+here, beside the bearer, because deciding whether that URL gets one is the whole
+of G4. `same_origin` and `under_base` are that decision, written as two
+functions a test can call directly.
 """
 from __future__ import annotations
 
@@ -36,7 +42,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, NamedTuple, Optional
 
 from .credentials import TokenSource
 from .resolver import BoundedResolver
@@ -81,6 +87,72 @@ class AuthRejected(RelayHTTPError):
     Its own class so that a best-effort call site cannot absorb it as one more
     optional failure — auth recovery has to see it.
     """
+
+
+class ResponseTooLarge(Exception):
+    """The body ran past the ceiling the caller set, and was not read further.
+
+    Its own class because it is the one fetch failure that must never be
+    retried: a file does not shrink, and the second attempt would cost the same
+    bandwidth to reach the same answer.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = int(limit)
+        super().__init__(f"the answer ran past the {self.limit}-byte ceiling")
+
+
+class Fetched(NamedTuple):
+    """Bytes from an absolute URL, and the two facts about how they arrived."""
+
+    body: bytes
+    #: The response's `Content-Type`, verbatim and possibly empty. What the
+    #: *fetch* said the bytes are — which outranks whatever a marker claimed.
+    content_type: str
+    #: Whether this bearer was sent. Carried so a caller can log the routing
+    #: decision it did not make itself.
+    credentialed: bool
+
+
+def same_origin(url: str, base: str) -> bool:
+    """True when `url` shares scheme, host and port with `base`.
+
+    **Parsed, never string-prefix.** `https://relay.example.evil` starts with
+    `https://relay.example`, and a substring comparison is how a bearer reaches
+    a look-alike host (review 2026-07-03). The default port is filled in on both
+    sides so `https://host` and `https://host:443` are the one origin they are.
+
+    The whole body is guarded: `.port` raises `ValueError` at *access* time for
+    a malformed authority (`https://host:bad/`), and a gateway-written URL must
+    never crash task intake. Unparseable means no match, which means no bearer.
+    """
+    try:
+        one, other = urllib.parse.urlsplit(url), urllib.parse.urlsplit(base)
+        if not one.scheme or not one.hostname or one.scheme != other.scheme:
+            return False
+        default = {"https": 443, "http": 80}.get(one.scheme)
+        return (one.hostname.lower() == (other.hostname or "").lower()
+                and (one.port or default) == (other.port or default))
+    except ValueError:
+        return False
+
+
+def under_base(url: str, base: str) -> bool:
+    """True when `url` is genuinely served by `base` — origin *and* base path.
+
+    The path half matters as much as the origin: a gateway at
+    `https://host/relay` does not vouch for `https://host/relay-evil/…`, and the
+    boundary that tells those apart is a real `/`. Same guard as `same_origin`:
+    malformed is False, never an exception.
+    """
+    if not base or not same_origin(url, base):
+        return False
+    try:
+        base_path = urllib.parse.urlsplit(base).path.rstrip("/")
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:  # pragma: no cover — same_origin already parsed both
+        return False
+    return path == base_path or path.startswith(base_path + "/")
 
 
 class RelayHTTP:
@@ -163,6 +235,63 @@ class RelayHTTP:
             raise RelayHTTPError(
                 status, raw, url, f"answer from {url} was not JSON: {raw[:200]}"
             ) from None
+
+    def fetch(self, url: str, cap: int, timeout: Optional[float] = None) -> Fetched:
+        """GET an absolute URL for its bytes, deciding for itself about the bearer.
+
+        The media ingress is the one caller: the URL it follows was written by
+        the broker, into a body a room member composed, so *this* method decides
+        the credential routing rather than trusting the caller to (G4).
+
+        - The bearer goes out **only** when `under_base` says the URL is the
+          gateway's own — exact parsed origin, at or under the base path with a
+          real `/` boundary. Everything else is fetched anonymously. There is no
+          second credential here: on the AG2 Space wire the broker downloads
+          from the homeserver box-side as the agent, so a worker never needs a
+          Matrix token to read an attachment.
+        - **No redirect is followed, credentialed or not.** urllib re-sends the
+          `Authorization` header across a hop, so following one while
+          credentialed hands this bearer to whatever host the answer named. The
+          uncredentialed case is held to the same rule on purpose: the softer
+          alternative is a second opener that does follow, and a second opener
+          is a second place a bearer could end up.
+        - **`cap + 1` bytes are read**, and one over the cap is a refusal rather
+          than a truncated file. `Content-Length` is not consulted at all — a
+          missing or lying one was the OOM vector this replaced.
+
+        Raises `AuthRejected` (401/403), `RelayHTTPError` (any other unusable
+        answer, a 3xx included), `ResponseTooLarge`, or the `OSError` family
+        urllib raises for a network that did not answer.
+        """
+        cap = int(cap)
+        credentialed = under_base(url, self.base_url)
+        request = urllib.request.Request(url, method="GET")
+        request.add_header("User-Agent", self.user_agent)  # B1, on every request
+        request.add_header("Accept", "*/*")
+        if credentialed:
+            request.add_header("Authorization", f"Bearer {self.credentials.secret}")
+
+        try:
+            deadline = self.timeout if timeout is None else timeout
+            with self._opener.open(request, timeout=deadline) as response:
+                status = getattr(response, "status", 200)
+                if 300 <= status < 400:  # pragma: no cover — the opener refuses
+                    # first. Kept because "a 3xx is a failure" must not depend
+                    # on which layer noticed: saving a redirect page's body as
+                    # if it were the media is the outcome being refused.
+                    raise RelayHTTPError(status, "", url,
+                                         f"refusing a {status} redirect from a fetch")
+                content_type = response.headers.get("Content-Type") or ""
+                data = response.read(cap + 1)
+        except urllib.error.HTTPError as exc:
+            body = _drain(exc)
+            if exc.code in (401, 403):
+                raise AuthRejected(exc.code, body, url) from None
+            raise RelayHTTPError(exc.code, body, url) from None
+
+        if len(data) > cap:
+            raise ResponseTooLarge(cap)
+        return Fetched(data, content_type, credentialed)
 
     def open_stream(
         self,

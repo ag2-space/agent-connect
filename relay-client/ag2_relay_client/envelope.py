@@ -94,8 +94,10 @@ class Task:
     no `original_body`, nothing that hands back the text G2 just stripped. A
     consumer that could reach the unstripped body would eventually reach for it.
 
-    Attachments (0..N resolved local paths) join this object with the media
-    ticket; the consumer never sees a marker or a URL either way.
+    `attachments` is 0..N `media.Attachment`s — resolved local paths by the time
+    this object leaves the queue, because the media stage runs between the poll
+    and the delivery. The consumer never sees a marker or a URL either way: a
+    fetch that failed is an attachment carrying a reason, not a URL to retry.
     """
 
     __slots__ = (
@@ -103,6 +105,7 @@ class Task:
         "requested_access_tier", "collaborator", "sensitive_data_filter",
         "priority", "timestamp", "room_name", "sender_name", "reply_to_event",
         "reply_to_me", "source_message_id", "attempt", "metadata_stripped",
+        "attachments",
     )
 
     def __init__(
@@ -124,6 +127,7 @@ class Task:
         source_message_id: str = "",
         attempt: int = 0,
         metadata_stripped: bool = False,
+        attachments: Tuple = (),
     ):
         self.id = id
         #: The message text, metadata blocks removed (G2).
@@ -157,6 +161,11 @@ class Task:
         #: Whether a metadata block was quarantined out of `body`. For logging;
         #: the block itself is gone.
         self.metadata_stripped = metadata_stripped
+        #: 0..N `media.Attachment` — local paths, or an honest reason why not.
+        #: Filled by the media stage, which is why it is not a parse-time field:
+        #: `parse_task` reads the wire, and the wire has no attachment field at
+        #: all. See `media.py`.
+        self.attachments = tuple(attachments)
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<Task {self.id} room={self.room_id} tier={self.access_tier!r}>"
