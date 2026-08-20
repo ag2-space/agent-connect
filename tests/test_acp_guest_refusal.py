@@ -35,7 +35,9 @@ from pathlib import Path
 
 try:
     from agent_connect.adapters.acp import OWNER as ADAPTER_OWNER
-    from agent_connect.adapters.acp import REFUSAL, AcpAdapter
+    from agent_connect.adapters.acp import (CONCIERGE_LOCALPART, REFUSAL,
+                                            AcpAdapter, concierge_for, refusal)
+    from agent_connect.events import TurnContext
     from agent_connect.reporter import PLACEHOLDER, REPLIED, STOP_LINES, LadderSettings
     from agent_connect.events import REFUSED
     from agent_connect.roomops import RoomOps
@@ -53,6 +55,9 @@ except ImportError as exc:  # pragma: no cover — an environment problem, not a
 
 FAKE = str(Path(__file__).parent / "fake_acp_agent.py")
 ROOM = "!room:ag2.space"
+#: The Turn a Bench builds, as far as the refusal is concerned: the room is what
+#: carries the homeserver, so this is what `refusal()` is expected to produce.
+TASK_CTX = TurnContext(prompt="", room=ROOM)
 
 fails = 0
 
@@ -184,7 +189,7 @@ check(len(bench.relay.ops_of("message")) == 1
 edits = bench.bodies("edit")
 check(edits and "only answer my owner" in edits[-1],
       "which was edited into the refusal: the guest is told, not ignored")
-check(REFUSAL in edits[-1],
+check(refusal(TASK_CTX) in edits[-1],
       "in the Adapter's own words, whole and unabbreviated — a refusal cut off "
       "halfway explains nothing, so the whole of it is what is asserted")
 check(STOP_LINES[REFUSED] in edits[-1],
@@ -201,15 +206,36 @@ check("trust" in edits[-1],
 # only ever reached from a DM to the concierge, and nothing anywhere said so.
 # "the owner can `trust` you" without a recipient is therefore an instruction
 # that cannot be followed, so what is asserted is that it names one.
-check("concierge" in edits[-1].lower(),
-      "and WHERE to say it — the concierge, the only recipient `trust` is a "
-      "command to. An instruction with no recipient sent an owner round four "
-      "wasted Turns (ticket 14)")
-check("direct message" in edits[-1].lower() or " DM" in edits[-1],
+# Spelled out, NOT built from `CONCIERGE_LOCALPART`: the name is a fact about
+# another system — the backend's `CONCIERGE_USER` default, which prd does not
+# override — and not this module's to choose. Asserting the constant against
+# itself would stay green through a rename that sends every refused guest's
+# owner to a user who does not exist.
+check("@sutando-concierge:ag2.space" in edits[-1],
+      "and WHERE to say it, as an MXID that can be pasted into a start-a-DM "
+      "box — not the word 'concierge', which is no more a recipient than the "
+      "instruction that sent an owner round four wasted Turns (ticket 14)")
+check("direct message" in edits[-1].lower(),
       "as a direct message, which is the form the concierge reads")
 check("this room" in edits[-1].lower(),
       "and it says the room is NOT that recipient — the mistake actually made, "
       "named, rather than left to be made again")
+
+# The domain is not in the constant; it is filled in from the Turn. A homeserver
+# this Worker has never heard of must produce that homeserver's concierge, or
+# the MXID is a hard-coded guess wearing an assertion.
+check(concierge_for(TurnContext(prompt="", room="!elsewhere:example.org"))
+      == f"@{CONCIERGE_LOCALPART}:example.org",
+      "on whichever homeserver the conversation is on, taken from the Turn and "
+      "not from a constant")
+check(concierge_for(TurnContext(prompt="", user_id="@a:one.example",
+                                room="!r:two.example"))
+      == f"@{CONCIERGE_LOCALPART}:one.example",
+      "the sender's own homeserver first — they are the one who has to be told "
+      "where to send their owner")
+check(concierge_for(TurnContext(prompt="")) == f"@{CONCIERGE_LOCALPART}",
+      "and a Task carrying neither degrades to the bare localpart: worth less, "
+      "but not a guess")
 check(out.startswith(REPLIED),
       "and the result completes the lease, so the delivery path posts nothing more")
 bench.stop()

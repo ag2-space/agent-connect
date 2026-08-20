@@ -124,6 +124,16 @@ the sender can write. Confinement means the operating system refuses; an agent t
 declines to ask is still stopped. Contrast [[Permission Policy]].
 _Avoid_: mode, policy, isolation
 
+**Concierge**:
+The AG2 Space bot that grants and revokes an [[Access Tier]] — `allow`, `trust`,
+`untrust`, `remove`. It is a *recipient*, and that is the whole of why it is in this
+glossary: those words are only commands in a direct message to it. Sent in a room, or
+in a DM to the agent, they reach the Local Agent as an ordinary prompt and are answered
+as a question. `@sutando-concierge` on the deployment's homeserver; the Worker never
+speaks to it, but the ACP refusal has to name it, so the name is product vocabulary
+rather than an implementation detail.
+_Avoid_: the bot, admin, allowlist bot
+
 ### Speaking to the room
 
 **Room Op**:

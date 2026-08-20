@@ -248,13 +248,32 @@ PRESETS: Dict[str, Preset] = {
 #: as a question. Named here rather than left to the reader because ticket 14
 #: watched an owner spend four Turns discovering it, and nothing said a word.
 #:
-#: Spelled with the domain left off deliberately. The local half is the backend's
-#: `CONCIERGE_USER` default and is not overridden on prd, but the homeserver is
-#: the deployment's, and the Worker never learns its own MXID — so a full MXID
-#: here would be a guess presented as a fact. There is no setting for it either:
-#: an operator who has to configure the name of the bot they are being sent to
-#: has already lost the thread this sentence exists to hand them.
-CONCIERGE = "@sutando-concierge"
+#: The local half only. It is the backend's `CONCIERGE_USER` default and is not
+#: overridden on prd; there is deliberately no setting for it, because an
+#: operator who has to configure the name of the bot they are being sent to has
+#: already lost the thread this sentence exists to hand them.
+CONCIERGE_LOCALPART = "sutando-concierge"
+
+
+def concierge_for(ctx: TurnContext) -> str:
+    """The concierge's MXID, on the homeserver of whoever is being refused.
+
+    A localpart is not a recipient. The whole defect this addresses is an
+    instruction that cannot be carried out, and "message the concierge" is still
+    one if the reader cannot paste it into a client's start-a-DM box — so the
+    domain is filled in rather than described.
+
+    The Worker never learns its own MXID, but it does not need to: everyone in
+    this conversation is on one homeserver, so the sender's own MXID carries the
+    domain, and the room identifier carries it again if the sender's is missing.
+    A Task with neither degrades to the bare localpart, which is worth less but
+    is not a guess.
+    """
+    for identifier in (ctx.user_id, ctx.room):
+        _, sep, domain = (identifier or "").partition(":")
+        if sep and domain:
+            return f"@{CONCIERGE_LOCALPART}:{domain}"
+    return f"@{CONCIERGE_LOCALPART}"
 
 #: What a guest is told, in the room, instead of being ignored. It is the Turn's
 #: answer — the Ladder edits the placeholder into it — because a refusal nobody
@@ -280,11 +299,16 @@ REFUSAL = (
     "Nothing is wrong with your message. My owner can `trust` you, and then I "
     "will answer it — but that grants owner tier, which is their own level of "
     "access on every agent they own, not a guest pass to this room.\n\n"
-    f"Where it has to be said: in a direct message to the concierge, "
-    f"`{CONCIERGE}` on this homeserver. Sent anywhere else, `trust @user` is not "
-    "a command at all — in this room, or in a direct message to me, I read it as "
-    "an ordinary question and answer it as one."
+    "Where it has to be said: in a direct message to the concierge, "
+    "`{concierge}`. Sent anywhere else, `trust @user` is not a command at all — "
+    "in this room, or in a direct message to me, I read it as an ordinary "
+    "question and answer it as one."
 )
+
+
+def refusal(ctx: TurnContext) -> str:
+    """`REFUSAL`, addressed to a recipient the reader can act on."""
+    return REFUSAL.format(concierge=concierge_for(ctx))
 
 #: What the room is told when its conversation starts over. One sentence, in
 #: the room's own terms — a person needs to know that the agent no longer
@@ -784,7 +808,7 @@ class AcpAdapter:
         """One Turn: refuse, or run it over ACP and report what happened."""
         # --- the whole non-owner restriction, in one place -----------------
         if ctx.access_tier != OWNER:
-            yield Done(reason=REFUSED, text=REFUSAL)
+            yield Done(reason=REFUSED, text=refusal(ctx))
             return
 
         try:
