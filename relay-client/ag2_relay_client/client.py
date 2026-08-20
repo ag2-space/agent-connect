@@ -31,6 +31,12 @@ every one of them ran again.
 consumer reads `task.attachments` and never a marker. The fetch has its own
 thread for one reason: a 25 MiB download on this one is a stalled loop, and a
 stalled loop is duplicate delivery.
+**One poller per bearer, enforced here (J1).** The wire cannot tell you that a
+second client is polling the same queue — it just splits the lease stream and
+delivers everything twice. So every turn of this loop starts by asking the
+singleton guard in the state dir whether this client is still the poller of
+record; a client that loses the guard stops, and a client that cannot read the
+guard keeps polling, because a lock bug must never be what silences delivery.
 
 **Never health-probe with `GET /v1/tasks`** — it leases tasks. `healthz()` is
 here so the question has an answer that costs nothing.
@@ -50,12 +56,15 @@ from .envelope import Task, parse_task
 from .journal import Journal, Reconciler
 from .media import MediaIngress, MediaStore
 from .resolver import BoundedResolver
+from .singleton import LOST, STALE_AFTER_S, PollerGuard
 from .state import StateLayout, valid_wire_id
 from .status import (
     AUTH_WAIT,
     CONNECTED,
+    DISPLACED,
     FATAL,
     RECONNECTING,
+    STANDBY,
     STOPPED,
     StatusReporter,
 )
@@ -84,6 +93,12 @@ HEARTBEAT_INTERVAL_S = 60.0
 #: gets asked again, because a permanent latch means a broker that *gains* the
 #: endpoint in a deploy is never picked up until the worker restarts.
 ACK_COOLDOWN_S = 300.0
+
+#: How long a client that lost the singleton race waits before asking for the
+#: bearer again (J1). It is not backoff — nothing failed — and it is short
+#: because the thing it is waiting for is a holder that died without releasing:
+#: delivery resumes one staleness window plus one of these after the death.
+STANDBY_RECHECK_S = 15.0
 
 #: C2's re-check cadence. Slow on purpose: the client is waiting for a human or
 #: a connect flow to rotate a token, and hammering the gateway while it waits is
@@ -142,6 +157,9 @@ class RelayClient:
         heartbeat_interval: float = HEARTBEAT_INTERVAL_S,
         ack_cooldown: float = ACK_COOLDOWN_S,
         auth_recheck_interval: float = AUTH_RECHECK_S,
+        singleton: bool = True,
+        singleton_stale_after: float = STALE_AFTER_S,
+        standby_recheck: float = STANDBY_RECHECK_S,
         idle_gap: float = 0.0,
         tier: str = "owner",
         client_name: str = "ag2-relay-client",
@@ -160,6 +178,16 @@ class RelayClient:
         self.heartbeat_interval = float(heartbeat_interval)
         self.ack_cooldown = float(ack_cooldown)
         self.auth_recheck_interval = float(auth_recheck_interval)
+        #: The J1 guard: exactly one poller per bearer, arbitrated through the
+        #: state dir this client was pointed at. It lives here rather than in
+        #: the consumer so that every consumer inherits it — and it is on by
+        #: default for the same reason. `singleton=False` is for a caller who
+        #: has *another* singleton mechanism, and it is a loud choice: nothing
+        #: else in this library stops a second poller on the same bearer.
+        self.guard: Optional[PollerGuard] = (
+            PollerGuard(self.layout.singleton_path,
+                        stale_after=singleton_stale_after) if singleton else None)
+        self.standby_recheck = float(standby_recheck)
         #: What the loop waits after a *healthy* poll. Zero: the long poll is
         #: the pacing. A test with an instant broker sets it to keep the loop
         #: from spinning.
@@ -237,6 +265,10 @@ class RelayClient:
         # has aged out — a consumer whose archives point at those paths said so
         # at construction).
         self.media.start()
+        if self.guard is None:
+            log.warning("this client runs with no singleton guard — nothing "
+                        "here prevents a second poller on the same bearer, and "
+                        "the wire does not detect one (J1)")
         log.info("relay client %r on %s — connection status in %s",
                  self.layout.instance, self.status.snapshot().get("gateway"),
                  self.layout.status_path)
@@ -261,6 +293,13 @@ class RelayClient:
         # matters more, and a late fetch can only put a Task on a queue nobody
         # is reading and leave a file for the next run's sweep.
         self.media.stop()
+        if self.guard is not None:
+            # After the join, not before: a guard released while this loop is
+            # still turning is a bearer two clients may poll at once. Released
+            # at all — rather than left to go stale — because a restart that
+            # has to wait out a freshness window it does not need is two
+            # minutes of a user's messages going nowhere.
+            self.guard.release()
         self._update_status(STOPPED)
 
     def _run(self) -> None:
@@ -285,6 +324,11 @@ class RelayClient:
         returning (D2). The 2026-07-25 wedge was invisible because the stall
         happened with no status write at all.
         """
+        not_ours = self._guard_turn()
+        if not_ours is not None:
+            # Standing by, or displaced. Either way nothing reaches the wire on
+            # this turn: the bearer is somebody else's to poll (J1).
+            return not_ours
         try:
             # Both of these are best-effort and swallow their own failures;
             # what they are not allowed to swallow is a rejected bearer, which
@@ -315,6 +359,51 @@ class RelayClient:
         self.backoff.after_success()
         self._update_status(CONNECTED)
         return self.idle_gap
+
+    # --- the singleton guard (J1) -----------------------------------------
+
+    def _guard_turn(self) -> Optional[float]:
+        """May this client poll at all? `None` means yes.
+
+        Asked once per turn, before anything reaches the wire, because the
+        thing being prevented is *this* turn leasing tasks a second poller is
+        also leasing. Two clients on one bearer split the lease stream and
+        double-deliver every task, and the broker neither detects nor rejects
+        the second one.
+
+        Three answers, and the third is the one that matters:
+
+        - **held** — poll.
+        - **lost** — do not. A client that never held the guard stands by and
+          keeps asking, so that a holder which died without releasing is taken
+          over from with no operator in the loop. A client that *held* it and
+          was displaced stops for good: the incident is a reaped process and
+          its replacement both pulling, and a loop that re-acquired by itself
+          would be that incident with extra steps.
+        - **degraded** — the guard could not be evaluated, so poll. A lock bug
+          must never silence task delivery: the worst case on this side is the
+          dual poller the guard was already there to catch, and the worst case
+          on the other side is a user whose agent has simply gone quiet.
+        """
+        if self.guard is None:
+            return None
+        if self.guard.claim() != LOST:
+            return None
+        if self.guard.displaced:
+            log.error("another poller took this bearer's guard — polling stops "
+                      "now. Whatever this client had in flight will be "
+                      "re-served to the holder; answering alongside it is the "
+                      "double delivery the guard exists to prevent (J1)")
+            self._update_status(
+                DISPLACED,
+                error="another poller holds this bearer; this client stopped")
+            self._stop.set()
+            return 0.0
+        self._update_status(
+            STANDBY,
+            error="another poller holds this bearer's guard",
+            backoff_s=self.standby_recheck)
+        return self.standby_recheck
 
     def _intake_all(self, answer: Any) -> int:
         """Every task in one poll answer, accepted or explained."""
@@ -703,6 +792,11 @@ class RelayClient:
             state,
             inflight=self.journal.inflight(),
             pending_results=len(self.journal.pending_results()),
+            # The guard's own verdict rides along on every write, because
+            # "polling anyway with a guard it could not read" and "polling with
+            # the guard held" look identical from outside and are not the same
+            # operational situation.
+            singleton=self.guard.state if self.guard is not None else "off",
             **fields)
 
     def _require_wire_id(self, broker_id: Any) -> str:

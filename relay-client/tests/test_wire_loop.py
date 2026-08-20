@@ -63,6 +63,22 @@ def client_for(broker, tmp, **kwargs):
     return client
 
 
+def bury(client):
+    """Age a killed client's singleton record, the way its death would.
+
+    A process that dies does not release the bearer's guard (J1) — it simply
+    stops re-stamping it, and the next client takes it over once the record goes
+    stale. Every "and then the process dies here" below means that, so it is
+    written down once here rather than by giving the replacement a special
+    client that skips the guard.
+    """
+    if client.guard is None or not client.layout.singleton_path.exists():
+        return
+    record = json.loads(client.layout.singleton_path.read_text())
+    record["heartbeat_ts"] = time.time() - 10_000
+    client.layout.singleton_path.write_text(json.dumps(record))
+
+
 class JournalWatchingHTTP:
     """A request path that remembers what the journal held at each call.
 
@@ -208,6 +224,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
           "and the answer itself is on disk, not only in memory")
 
     # The process dies here. `first` is never stopped, never drained again.
+    bury(first)
     broker.forget()
     broker.on("POST", "/v1/results", json={"ok": True})
     broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(attempt=2)]})
