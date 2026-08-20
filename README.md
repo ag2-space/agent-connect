@@ -382,6 +382,97 @@ A new instance means a new Agent Identity.
 Each instance also owns a **status file** under its own workspace, which is how
 a supervisor watching several of them tells one worker's state from another's.
 
+## The status file: what the worker says about itself
+
+**Path:** `<workspace>/status.json` — by default
+`~/.agent-connect/workspace/status.json`, or wherever `AGENT_CONNECT_STATUS_FILE`
+says. This is part of the service contract: anything watching a worker (the
+desktop app's badge first, `cat` second) reads that file and needs to know
+nothing about the transport underneath.
+
+```json
+{
+  "version": 1,
+  "state": "serving",
+  "detail": "adapter=acp repo=/Users/me/agents ws=/Users/me/.agent-connect/workspace",
+  "pid": 4711,
+  "adapter": "acp",
+  "agent": "acp: Claude Code 2.1.0",
+  "repo": "/Users/me/agents",
+  "workspace": "/Users/me/.agent-connect/workspace",
+  "instance": "scratch",
+  "tasks_running": 1,
+  "oldest_task_seconds": 12.4,
+  "started_at": 1755600000.0,
+  "updated_at": 1755600123.0,
+  "uptime_seconds": 123.0,
+  "heartbeat_seconds": 15.0,
+  "last_error": null
+}
+```
+
+**Four states, and that is all of them:** `starting` (the file exists before
+anything can go wrong, so a worker that dies in preflight still leaves the
+reason), `serving`, `stopped` (it was asked to stop, and said so), and `error`
+— which carries the sentence the operator has to act on, in `detail` and in
+`last_error`.
+
+**Is it alive?** Compare the clocks: a worker is **stale** when
+`now - updated_at > 3 x heartbeat_seconds`. `updated_at` is refreshed every
+half-interval while the worker is running, and the file states that interval
+itself so a reader needs nothing out of band. The slack is deliberate — one
+missed write is a busy machine, six is nobody home. A `kill -9`, a panic, a
+closed laptop lid: none of them get to write "stopped", and all of them show up
+as staleness. A worker that stops on purpose says so, so the ordinary case is
+not something anyone has to wait out.
+
+**Nothing else paces the heartbeat.** It is its own task, so no other setting
+can switch this promise off — `AGENT_CONNECT_POLL` in particular does not
+change how fresh this file is. It also runs during startup, so a worker waiting
+on an ACP bridge that takes a minute to answer `initialize` stays visibly
+`starting` instead of reading as dead.
+
+**What "serving" proves, and what it does not.** A fresh file means the process
+is alive and its loop is turning. It does **not** mean any turn is making
+progress: turns run as separate tasks, so a worker whose every turn is wedged on
+an unresponsive local agent keeps beating `serving` quite happily. That is what
+`tasks_running` and `oldest_task_seconds` are for — one turn that has been
+running for two hours is visible as exactly that, and an observer that cares
+about *work* rather than *process* reads those two fields. Cancelling a wedged
+turn is `AGENT_CONNECT_TURN_TIMEOUT`'s job; this file reports, it does not
+adjudicate.
+
+**One clock caveat, stated rather than papered over.** `updated_at` is the wall
+clock, because it has to be comparable across processes. If the system clock
+steps *backwards* — an NTP correction after a long sleep — a dead worker's last
+write can sit in the future and read as fresh until real time catches up.
+`uptime_seconds` is monotonic and sits beside it, so a reader that cares can
+notice a document whose uptime stopped advancing.
+
+**One file per instance.** The path hangs off the workspace, and a workspace
+belongs to exactly one worker (see § Running more than one agent on one
+machine), so N instances write N status files with nothing extra to configure.
+`instance` carries `AGENT_CONNECT_INSTANCE` — whatever name the supervisor that
+started this worker calls it — so N files can be matched to N rows without
+having to recognise a path.
+
+**Fields you do not recognise are not errors.** `version` goes up only for a
+change a reader could not survive; ignore what you do not know.
+
+Writes are atomic (write beside, rename over), so a reader never catches half a
+document. A status file that cannot be written is complained about once, on
+stderr, and never fails a task — an observer falls back on staleness, which is
+what it has for the `kill -9` case anyway.
+
+**One cost, named.** So that a service manager's `SIGTERM` can write "stopped"
+rather than leaving an observer to wait out staleness, the worker turns it into
+an ordinary exit. That exit is raised at whatever bytecode the interpreter
+happens to be on, so a task result being written at that instant can be left
+truncated, where an unhandled `SIGTERM` would have killed the process between
+syscalls. The answer itself has already gone to the room up the ladder; what is
+at risk is one archived result file.
+
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**
@@ -396,6 +487,9 @@ table.
 | `AGENT_CONNECT_ADAPTER` | which adapter runs the task: `codex`, `ollama`, `omnigent`, `cline`, `kilo`, `acp` | *(required)* |
 | `AGENT_CONNECT_REPO` | the working directory the agent operates in. Created for you when it is the default; a path under `~/Documents`, `~/Desktop` or `~/Downloads` is warned about, because macOS privacy protection turns agent file operations there into an unexplained "operation not permitted" | `~/agents` |
 | `AGENT_CONNECT_WORKSPACE` | workspace dir holding `tasks/` + `results/` | `~/.agent-connect/workspace` |
+| `AGENT_CONNECT_STATUS_FILE` | the status file this worker owns (see the section above) | `<workspace>/status.json` |
+| `AGENT_CONNECT_STATUS_HEARTBEAT` | seconds between refreshes of the status file's `updated_at`, and the staleness window an observer reads out of it | `15.0` |
+| `AGENT_CONNECT_INSTANCE` | a name for this worker instance, carried into its status file so a supervisor watching several can tell them apart. Nothing else reads it | *(unset)* |
 | `AGENT_CONNECT_POLL` | seconds between scans for new tasks | `1.0` |
 | `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` | how much of one attached file is read into a prompt. An attachment over this is reported in the room, never shrunk to fit. `0` means no limit | `10485760` (10 MB) |
 | `AGENT_CONNECT_OUTGOING_MAX_BYTES` | how large a file the agent produced may be and still be sent to the room. The relay refuses more than this anyway; refusing it here means a sentence in the room instead of a log line. `0` means no limit | `26214400` (25 MB) |

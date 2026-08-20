@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -39,6 +41,7 @@ from .reporter import LadderSettings, TurnReporter
 from .roomops import room_ops_from_env
 from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
 from .sessions import workspace_dir
+from .status import StatusFile, from_env as status_from_env
 
 
 def _ws() -> Path:
@@ -192,6 +195,17 @@ async def run_turn(adapter, ctx: TurnContext, ops=None, settings=None, reporter=
     return await (reporter or TurnReporter(ops, settings)).run(adapter, ctx)
 
 
+async def _preflight(check, status: Optional[StatusFile]):
+    """Run the Adapter's check with the status file beating underneath it."""
+    heartbeat = (asyncio.ensure_future(status.beating())
+                 if status is not None else None)
+    try:
+        return await check()
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+
+
 class _NoLock:
     """Stand-in for a Session lock when the caller is not serialising."""
 
@@ -285,25 +299,59 @@ async def serve(
     poll: float,
     ops=None,
     settings=None,
+    *,
+    status: Optional[StatusFile] = None,
 ) -> None:
-    """Scan for Tasks forever, starting each one without waiting for the last."""
+    """Scan for Tasks forever, starting each one without waiting for the last.
+
+    `status` — when given — gets a heartbeat task of its own, paced by the
+    status file and by nothing here. It used to be beaten once per scan, which
+    quietly made `AGENT_CONNECT_POLL` able to defeat staleness: a poll longer
+    than three heartbeats left a healthy Worker permanently stale. One setting
+    must not be able to switch another one's promise off.
+
+    What the heartbeat reports is what only this function knows: how many Turns
+    are in flight and how long the oldest has been running. A beat proves the
+    loop is turning; those two numbers are what an observer needs to tell that
+    apart from work actually moving. Keyword-only because it is an observer, not
+    a parameter of the job.
+    """
     seen: set = set()
     sessions: dict = {}
     running: set = set()
-    while True:
-        for task_path in sorted(tasks_dir.glob("task-*.txt")):
-            if task_path.name in seen:
-                continue
-            seen.add(task_path.name)
-            fut = asyncio.ensure_future(
-                handle_one(task_path, adapter, repo, results_dir, sessions, ops, settings)
-            )
-            running.add(fut)
-            fut.add_done_callback(running.discard)
-        await asyncio.sleep(poll)
+    started: dict = {}                      # future → when its Turn began
+
+    def liveness() -> dict:
+        now = time.monotonic()
+        return {
+            "tasks_running": len(running),
+            "oldest_task_seconds": round(max((now - t for t in started.values()),
+                                             default=0.0), 1),
+        }
+
+    heartbeat = (asyncio.ensure_future(status.beating(liveness))
+                 if status is not None else None)
+    try:
+        while True:
+            for task_path in sorted(tasks_dir.glob("task-*.txt")):
+                if task_path.name in seen:
+                    continue
+                seen.add(task_path.name)
+                fut = asyncio.ensure_future(
+                    handle_one(task_path, adapter, repo, results_dir, sessions,
+                               ops, settings)
+                )
+                running.add(fut)
+                started[fut] = time.monotonic()
+                fut.add_done_callback(running.discard)
+                fut.add_done_callback(started.pop)
+            await asyncio.sleep(poll)
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
 
 
-def preflight(adapter) -> None:
+def preflight(adapter, status: Optional[StatusFile] = None) -> str:
     """Stop here, not in a room, if the Adapter cannot serve.
 
     An Adapter may offer `preflight()` — a coroutine returning `None` when it is
@@ -313,16 +361,27 @@ def preflight(adapter) -> None:
     where they expected an answer, hours after the operator walked away.
 
     Adapters without one start as they always did.
+
+    Returns the Adapter's own one-line description of what it found, for the
+    startup log and for the status file — "what is actually running behind this
+    identity" is the first question anyone watching a Worker asks.
+
+    `status` keeps beating while the check runs. An ACP bridge can take the
+    better part of a minute to answer `initialize`, and a Worker that is
+    starting must not read as one that has died.
     """
     check = getattr(adapter, "preflight", None)
     if check is None:
-        return
-    problem = asyncio.run(check())
+        return ""
+    problem = asyncio.run(_preflight(check, status))
     if problem:
         raise SystemExit(f"agent-connect: {problem}")
     describe = getattr(adapter, "describe", None)
-    if describe is not None:
-        print(f"agent-connect: {describe()}")
+    if describe is None:
+        return ""
+    found = describe()
+    print(f"agent-connect: {found}")
+    return found
 
 
 USAGE = f"""usage: agent-connect [--config PATH] [--export-config]
@@ -370,46 +429,104 @@ def parse_args(argv: List[str]) -> Tuple[Optional[str], bool]:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    # ---- the startup order is a contract -------------------------------------
-    # Settings first: a config file may name the workspace, so nothing that
-    # reads a setting may run before it — and every setting an Adapter reads
-    # for itself sees the same environment whether the operator exported it or
-    # wrote it down. What the environment already says is never overwritten;
-    # see `agent_connect.config`. The workspace is resolved next, because
-    # everything the Worker owns on disk hangs off it.
-    config_path, export_only = parse_args(
-        sys.argv[1:] if argv is None else list(argv))
+    # A service manager stops a Worker with SIGTERM, and the default disposition
+    # is death without a word — which an observer could only read as staleness,
+    # a minute later. Turning it into an ordinary exit lets the handlers below
+    # write "stopped" while the observer is still watching. The cost is real and
+    # small: `sys.exit` is raised at whatever bytecode the interpreter is on, so
+    # a Task result being written at that instant can be left truncated, where
+    # an unhandled SIGTERM would have killed the process between syscalls. One
+    # Task's result file against every observer's ability to tell a stop from a
+    # crash; the archived result is also not the answer, which has already gone
+    # to the room up the Ladder.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    status: Optional[StatusFile] = None
     try:
-        if export_only:
-            export_config(config_path)
-            return
-        load_config(config_path)
-    except ConfigError as exc:
-        raise SystemExit(f"agent-connect: {exc}")
-    ws = _ws()
-    adapter_name = os.environ.get("AGENT_CONNECT_ADAPTER")
-    if not adapter_name:
-        raise SystemExit(
-            "set AGENT_CONNECT_ADAPTER (e.g. codex) — in the environment, or in "
-            "a config file (--config PATH; see README.md § Settings)"
+        # ---- the startup order is a contract ------------------------------
+        # Settings first: a config file may name the workspace, so nothing that
+        # reads a setting may run before it — and every setting an Adapter reads
+        # for itself sees the same environment whether the operator exported it
+        # or wrote it down. What the environment already says is never
+        # overwritten; see `agent_connect.config`. The workspace is second
+        # because everything the Worker owns on disk hangs off it, the status
+        # file third because it lives in the workspace, and only then anything
+        # that can fail. A config file that cannot be read is therefore reported
+        # on stderr with no status file to its name, which is right: the config
+        # is what says where the status file goes.
+        config_path, export_only = parse_args(
+            sys.argv[1:] if argv is None else list(argv))
+        try:
+            if export_only:
+                export_config(config_path)
+                return
+            load_config(config_path)
+        except ConfigError as exc:
+            raise SystemExit(f"agent-connect: {exc}")
+        ws = _ws()
+        status = status_from_env()
+        status.starting(workspace=str(ws))
+        adapter_name = os.environ.get("AGENT_CONNECT_ADAPTER")
+        if not adapter_name:
+            raise SystemExit(
+                "set AGENT_CONNECT_ADAPTER (e.g. codex) — in the environment, or in "
+                "a config file (--config PATH; see README.md § Settings)"
+            )
+        try:
+            adapter = get_adapter(adapter_name)
+        except KeyError as exc:
+            raise SystemExit(f"agent-connect: {exc}")
+        status.starting(adapter=adapter_name)
+        agent = preflight(adapter, status)
+        repo = str(_resolve_repo())
+        poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
+
+        tasks_dir = ws / "tasks"
+        results_dir = ws / "results"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        # The Ladder, if this Worker holds a relay token: the placeholder and its
+        # edits are Room Ops, and without a token there is nobody to ask for one.
+        ops = room_ops_from_env()
+        settings = LadderSettings.from_env()
+
+        detail = f"adapter={adapter_name} repo={repo} ws={ws}"
+        print(f"agent-connect worker: {detail}")
+        status.serving(detail=detail, agent=agent, repo=repo)
+        asyncio.run(
+            serve(adapter, repo, results_dir, tasks_dir, poll, ops, settings,
+                  status=status)
         )
-    adapter = get_adapter(adapter_name)
-    preflight(adapter)
-    repo = str(_resolve_repo())
-    poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
+    except KeyboardInterrupt:
+        _record(status, StatusFile.stopped, "interrupted")
+        raise
+    except SystemExit as exc:
+        # A falsy code is the SIGTERM above, or an ordinary `--help`-shaped
+        # exit. Anything else is a refusal to start — and `SystemExit` carries
+        # two different things there: a string, which is the sentence the
+        # operator has to act on and which an observer needs verbatim, or an
+        # integer, which is a status and explains nothing on its own.
+        if not exc.code:
+            _record(status, StatusFile.stopped, "terminated")
+        elif isinstance(exc.code, int):
+            _record(status, StatusFile.error, f"exited with status {exc.code}")
+        else:
+            _record(status, StatusFile.error, str(exc.code))
+        raise
+    except BaseException as exc:  # noqa: BLE001 — report, then die as before
+        _record(status, StatusFile.error, f"{type(exc).__name__}: {exc}")
+        raise
 
-    tasks_dir = ws / "tasks"
-    results_dir = ws / "results"
-    tasks_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
 
-    # The Ladder, if this Worker holds a relay token: the placeholder and its
-    # edits are Room Ops, and without a token there is nobody to ask for one.
-    ops = room_ops_from_env()
-    settings = LadderSettings.from_env()
+def _record(status: Optional[StatusFile], method, detail: str) -> None:
+    """Write an ending, if there is a status file yet to write it to.
 
-    print(f"agent-connect worker: adapter={adapter_name} repo={repo} ws={ws}")
-    asyncio.run(serve(adapter, repo, results_dir, tasks_dir, poll, ops, settings))
+    There may not be: everything before `status_from_env()` — a config file
+    that cannot be read, most of all — fails with nowhere to say so, and
+    inventing a path to report it at would be reporting it in the wrong place.
+    """
+    if status is not None:
+        method(status, detail)
 
 
 if __name__ == "__main__":
