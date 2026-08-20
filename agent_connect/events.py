@@ -75,6 +75,10 @@ class TurnContext:
     derived from it — never from anything the sender can write), and which
     message it came from (`source_message_id`, for threading later).
 
+    `access_tier` is always one of the two values the broker attests, `owner` or
+    `guest`; the Worker settles that before a Turn is built, so an Adapter reads
+    a Tier and never has to interpret one.
+
     `prompt` is what the person typed, with relay headers already stripped and
     no preamble attached. Framing is the Adapter's business: the shimmed
     Adapters prepend the sandbox preamble because their confinement is what it
@@ -91,7 +95,7 @@ class TurnContext:
     task_id: str = ""
     room: str = ""
     room_name: str = ""
-    access_tier: str = "other"
+    access_tier: str = "guest"
     sender_name: str = ""
     user_id: str = ""
     source_message_id: str = ""
