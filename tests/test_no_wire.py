@@ -15,11 +15,23 @@ Removing those is a commit. Keeping them removed is this file. It reads the
 package as a syntax tree and refuses:
 
 * **any HTTP client** — `urllib`, `http.client`, `socket`, `ssl`, `requests`;
+* **the library's own raw-request surface**, `ag2_relay_client.transport`, which
+  is a shorter route to the same place: an authenticated request against the
+  gateway, with the bearer already on it;
 * **any credential handling** — a bearer header, a `|`-split of a token, the
   `%7C` its URL-encoded separator is written as;
 * **any gateway** — a URL literal in code, which is I3;
 * **any second copy of the result-marker grammar**, whose every copy has
   drifted, most recently into a `[file:]` that reached rooms as literal text.
+
+**What is refused is what is written plainly.** Every check below reads names
+and string literals out of the syntax tree, so `importlib.import_module` with an
+assembled name, a host built by concatenation, a `chr(124)` in place of `|` and
+a `curl` handed to `subprocess` all walk past it. That is not a gap to close by
+pattern-matching harder: a fence against a package deliberately hiding what it
+speaks to is not something a syntax tree can be. This one is against the
+regression — the next honest `import urllib` added by somebody who did not know
+there was one speaker — and against that it is exhaustive.
 
 **The Adapters are a different wire, and the fence knows it.** An Adapter drives
 a *Local Agent*, and one of them (Ollama) offers an HTTP API on this machine.
@@ -52,6 +64,17 @@ WIRE_MODULES = {
     "httpx", "aiohttp",
 }
 
+#: The library's own raw-request surface — refused everywhere, Adapters
+#: included. It is not a socket module, and it is the same thing by a shorter
+#: route: `RelayHTTP` is a request against the gateway with the bearer already
+#: on it, which is why the spec lists "raw authenticated request escape hatch,
+#: bearer access" under *Deliberately absent*. The Local Agent exemption below
+#: is for a server on **this machine**; there is nothing local about this one.
+#: What this package may import out of the library is its named surface —
+#: `RelayClient`, `markers`, `credentials`, `state` — and this is the one name
+#: under it that hands back the wire itself.
+RELAY_INTERNALS = {"ag2_relay_client.transport"}
+
 #: The Adapters that may open a socket, and what for. A local model server is
 #: not the relay; a new name here is a decision somebody made on purpose.
 LOCAL_AGENT_SOCKETS = {"ollama.py": "the Ollama server on this machine"}
@@ -68,9 +91,18 @@ FORBIDDEN_TEXT = {
     "sutando-gateway-client": "the CloudFlare User-Agent workaround, copied",
 }
 
-#: And one more that only holds outside `adapters/`: nothing else in this
-#: package has any business naming a host at all.
-NO_URLS_OUTSIDE_ADAPTERS = "://"
+#: And one more that holds everywhere except in the named files below: nothing
+#: else in this package has any business naming a host at all.
+NO_URLS = "://"
+
+#: The Adapters that may write a URL down, and what for. By file, not by
+#: directory — `adapters/` is not a neighbourhood where hosts are fine, it is
+#: two files with a reason, and a directory-wide excuse would let the next
+#: Adapter name a gateway that is not the Ollama server on this machine.
+ADAPTER_URLS = {
+    "ollama.py": "the local Ollama server's default address",
+    "acp.py": "where to install Node.js, in a sentence shown to the operator",
+}
 
 #: What a hand-rolled token parse looks like at the call site.
 SPLITTERS = {"split", "rsplit", "partition", "rpartition"}
@@ -114,12 +146,21 @@ def code_strings(tree):
 
 
 def imported(tree):
+    """Every module name an import brings in, as a dotted name.
+
+    A `from X import y` yields both `X` and `X.y`, because `y` may itself be a
+    module and the two spellings of one import must not be worth different
+    verdicts: `from ag2_relay_client import transport` and
+    `from ag2_relay_client.transport import RelayHTTP` reach the same object.
+    """
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 yield alias.name
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             yield node.module
+            for alias in node.names:
+                yield f"{node.module}.{alias.name}"
 
 
 # --- no HTTP client, anywhere ----------------------------------------------
@@ -129,17 +170,22 @@ excused = set()
 for path, tree in sources():
     for name in imported(tree):
         head = name.split(".")[0]
-        if not (name in WIRE_MODULES or head in WIRE_MODULES):
+        internal = name in RELAY_INTERNALS
+        if not (internal or name in WIRE_MODULES or head in WIRE_MODULES):
             continue
-        if path.parent.name == "adapters" and path.name in LOCAL_AGENT_SOCKETS:
+        if (not internal and path.parent.name == "adapters"
+                and path.name in LOCAL_AGENT_SOCKETS):
             excused.add(path.name)
             continue
         offenders.append(f"{path.parent.name}/{path.name} imports {name}")
 check(not offenders,
-      "zero direct HTTP calls: nothing in agent_connect opens a socket, except "
-      f"the named Adapters that drive a Local Agent ({offenders or 'none'})")
-check(excused <= set(LOCAL_AGENT_SOCKETS),
-      f"and the exemption list is exactly the Adapters that use it ({sorted(excused)})")
+      "zero direct HTTP calls: nothing in agent_connect opens a socket or takes "
+      "the library's raw-request surface, except the named Adapters that drive "
+      f"a Local Agent ({offenders or 'none'})")
+check(excused == set(LOCAL_AGENT_SOCKETS),
+      "and the exemption list is exactly the Adapters that use it — an excuse "
+      "nobody uses any more is one the next Adapter inherits without deciding "
+      f"anything (excused: {sorted(excused)}, listed: {sorted(LOCAL_AGENT_SOCKETS)})")
 
 
 # --- no credential handling, and no gateway --------------------------------
@@ -154,16 +200,23 @@ check(not offenders, f"no bearer, no relay host, no relay path, no token "
                      f"grammar in code ({offenders or 'none'})")
 
 offenders = []
+url_excused = set()
 for path, tree in sources():
-    if path.parent.name == "adapters":
-        continue
     for node, text in code_strings(tree):
-        if NO_URLS_OUTSIDE_ADAPTERS in text:
-            offenders.append(f"{path.name}:{node.lineno} {text[:40]!r}")
+        if NO_URLS not in text:
+            continue
+        if path.parent.name == "adapters" and path.name in ADAPTER_URLS:
+            url_excused.add(path.name)
+            continue
+        offenders.append(f"{path.name}:{node.lineno} {text[:40]!r}")
 check(not offenders,
-      "and outside the Adapters there is no host written down at all: the "
-      "gateway travels inside the credential, and the library is the only "
-      f"thing that reads it (I3) ({offenders or 'none'})")
+      "and outside the two named Adapter files there is no host written down at "
+      "all: the gateway travels inside the credential, and the library is the "
+      f"only thing that reads it (I3) ({offenders or 'none'})")
+check(url_excused == set(ADAPTER_URLS),
+      "and that exemption is by file and still earned, so a stale one cannot "
+      f"become the next Adapter's licence (excused: {sorted(url_excused)}, "
+      f"listed: {sorted(ADAPTER_URLS)})")
 
 offenders = []
 for path, tree in sources():
