@@ -7,7 +7,9 @@ name = "ag2-agent-connect"
 dynamic = ["version"]
 description = "Connect your local agent (Codex, Hermes, …) to AG2 Space as a first-class room agent."
 readme = "README.md"
-requires-python = ">=3.9"
+# Bounded by agent-client-protocol (0.12.0 supports >=3.10,<3.15); a wider range
+# makes fresh resolutions (uv) fail outright.
+requires-python = ">=3.10,<3.15"
 license = { text = "MIT" }
 keywords = ["ag2space", "codex", "matrix", "agent", "bridge"]
 # `dependencies = []` ended at docs/adr/0001: the maintained ACP SDK for Python

@@ -68,7 +68,9 @@ class RoomOps:
         The identifier is the whole point: without it there is nothing to edit,
         and the Ladder collapses into a stream of separate messages.
         """
-        reply = await self._call({"op": "message", "room": room, "body": body})
+        # The relay reads only `room_id` (WORKER-PROTOCOL.md); a `room` key is
+        # ignored and the op fails with a 400.
+        reply = await self._call({"op": "message", "room_id": room, "body": body})
         event_id = _event_id(reply)
         if not event_id:
             raise RoomOpError("the relay posted the message but returned no event id")
@@ -77,7 +79,7 @@ class RoomOps:
     async def edit(self, room: str, event_id: str, body: str) -> None:
         """Replace the body of a message this Agent Identity posted."""
         await self._call(
-            {"op": "edit", "room": room, "event_id": event_id, "body": body}
+            {"op": "edit", "room_id": room, "event_id": event_id, "body": body}
         )
 
     async def _call(self, payload: dict) -> dict:

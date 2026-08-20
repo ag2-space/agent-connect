@@ -192,7 +192,7 @@ check(relay.ops and relay.ops[0]["op"] == "message",
       "the first Room Op is a message — the placeholder")
 check(relay.ops[0]["body"] == PLACEHOLDER,
       f"and it carries the fleet-wide copy, {PLACEHOLDER!r}")
-check(relay.ops[0]["room"] == "!room:ag2.space", "posted into the room that asked")
+check(relay.ops[0]["room_id"] == "!room:ag2.space", "posted into the room that asked")
 check(len(relay.ops_of("message")) == 1,
       "exactly one message is ever posted — everything after it is an edit")
 check(not relay.ops_of("react"),
@@ -346,7 +346,7 @@ messages = relay.ops_of("message")
 check(len(messages) == 2, "the announcement is posted, so the room is two messages")
 check(messages[0]["body"] == PLACEHOLDER and messages[1]["body"] == ANNOUNCE,
       "the placeholder first, then the announcement as its own message")
-check(messages[1]["room"] == "!room:ag2.space", "into the room it is about")
+check(messages[1]["room_id"] == "!room:ag2.space", "into the room it is about")
 check(all(ANNOUNCE not in o["body"] for o in relay.ops_of("edit")),
       "and NOT by editing the placeholder — that message belongs to the answer")
 check(relay.ops[-1]["op"] == "edit" and "here it is" in relay.ops[-1]["body"],

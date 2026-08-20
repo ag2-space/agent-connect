@@ -98,7 +98,7 @@ class FakeRelay:
 
     def of(self, kind, room=None):
         return [o for o in self.ops
-                if o.get("op") == kind and (room is None or o.get("room") == room)]
+                if o.get("op") == kind and (room is None or o.get("room_id") == room)]
 
     def bodies(self):
         return " ".join(o.get("body", "") for o in self.ops)
@@ -225,7 +225,7 @@ announcements = [o for o in mid["ops"]
                  if o.get("op") == "message" and "queued" in o.get("body", "")]
 check(len(announcements) == 1,
       f"the queued Task is announced, once (got {len(announcements)})")
-check(announcements and announcements[0]["room"] == ROOM_A,
+check(announcements and announcements[0]["room_id"] == ROOM_A,
       "in the room that is waiting, and only there")
 check(all("queued" not in o.get("body", "") for o in relay.of("edit")),
       "as its own message — never by editing someone else's placeholder")
