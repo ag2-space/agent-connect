@@ -13,8 +13,10 @@ Run: python3 tests/test_events.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
 import ast
+import io
 import json
 import queue
+import socket
 import tempfile
 import threading
 import time
@@ -26,6 +28,8 @@ from ag2_relay_client.backoff import Backoff
 from ag2_relay_client.credentials import TokenSource
 from ag2_relay_client.events import (
     EVENTS_STREAM_PATH,
+    MAX_LINE_BYTES,
+    SKIP_LOOKAHEAD,
     STREAM_READ_TIMEOUT_S,
     EventChannel,
     events,
@@ -397,6 +401,15 @@ with FakeBroker() as broker:
     channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), Sink(),
                      backoff=fast_backoff())
     check(until(lambda: not channel.running, 3.0), "403 is classified the same way")
+    # Not merely "it stopped": a 403 that stopped the channel for some other
+    # reason — a parse error, a bug in the loop — would satisfy that alone. The
+    # classification is the thing under test, so the snapshot has to name it.
+    check(channel.health()["status"] == "auth_failed",
+          "and it stopped for the auth reason, not for another one")
+    check(channel.health()["error"] == "HTTP 403",
+          "naming the status it was refused with")
+    check(len(broker.took("GET", EVENTS_STREAM_PATH)) == 1,
+          "after exactly one attempt — a missing grant is not something to hammer")
     channel.stop()
 
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
@@ -700,13 +713,374 @@ with FakeBroker() as broker:
         delivery.stop()
 
 # =============================================================================
+# Progress is the cursor MOVING — not a reconnection, and not a commit
+# =============================================================================
+print("\n-- a commit that moves no cursor is not progress")
+
+with FakeBroker() as broker:
+    # A producer that omits `id:` entirely. Every frame commits, so the old rule
+    # ("a committed frame is progress") reset the ladder on every connection —
+    # and because the marker never moved, no `Last-Event-ID` was ever sent, the
+    # server replayed from the start, and the same events were committed again.
+    # With production's ladder that settles at exactly one second: one reconnect
+    # and one duplicate commit per second, forever.
+    resumes = []
+    lock = threading.Lock()
+
+    def no_id(request, write):
+        with lock:
+            resumes.append(request.header("Last-Event-Id"))
+        write('data: {"kind":"noid"}\n\n')  # committed, and unresumable
+
+    broker.sse(EVENTS_STREAM_PATH, no_id)
+    ladder = Backoff(start=0.01, cap=0.32)
+    sink = Sink()
+    channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                     backoff=ladder)
+    try:
+        check(until(lambda: sink.count() >= 3, 5.0),
+              "every connection commits its event, and the sink keeps them")
+        check(until(lambda: ladder.seconds >= 0.04, 5.0),
+              f"and the ladder climbs anyway ({ladder.seconds}s) — a commit that "
+              "moves no cursor is not progress")
+        check(channel.health()["last_cursor"] is None,
+              "because the resume marker never moved at all")
+        check(all(r == "" for r in resumes),
+              "which is exactly why no reconnect can ask for anything newer")
+    finally:
+        channel.stop()
+
+with FakeBroker() as broker:
+    # The same shape with an id that never advances: a producer stuck re-serving
+    # cursor 7. It commits, so it looks like progress; it resumes from 7, so it
+    # is the same event forever.
+    def same_id(request, write):
+        write(event_frame(7, kind="stuck"))
+
+    broker.sse(EVENTS_STREAM_PATH, same_id)
+    ladder = Backoff(start=0.01, cap=0.32)
+    sink = Sink()
+    channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                     backoff=ladder)
+    try:
+        check(until(lambda: sink.count() >= 3, 5.0), "the same cursor is re-served")
+        check(until(lambda: ladder.seconds >= 0.04, 5.0),
+              "and a cursor that does not move does not reset the ladder either")
+    finally:
+        channel.stop()
+
+# =============================================================================
+# A skip may only step a little way past ground the channel has reached
+# =============================================================================
+print("\n-- a poison frame's id does not get to blind the channel")
+
+with FakeBroker() as broker:
+    # One unparseable frame carrying `id: 5000` used to set the resume marker to
+    # 5000 — monotonic, never pulled back — so every reconnect asked for
+    # everything after 5000, the broker served nothing, and the five real events
+    # below it were never delivered for the life of the process. `health()` said
+    # nothing: cursor `None`, status cycling as though all were well.
+    calls = []
+    lock = threading.Lock()
+
+    def wait_after(request, write):
+        resumed = int(request.header("Last-Event-Id") or 0)
+        with lock:
+            turn = len(calls)
+            calls.append(resumed)
+        if turn == 0:
+            write(frame(5000, "{ not json at all"))  # the poison, wildly ahead
+            return
+        for cursor in range(1, 6):
+            if cursor > resumed:  # the broker's own rule: strictly after
+                write(event_frame(cursor, kind=f"real-{cursor}"))
+        broker.closing.wait(5)
+
+    broker.sse(EVENTS_STREAM_PATH, wait_after)
+    sink = Sink()
+    channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                     backoff=fast_backoff())
+    try:
+        check(until(lambda: sink.count() >= 5, 5.0),
+              "all five real events below the bad id are delivered")
+        check(until(lambda: len(calls) >= 2, 5.0) and calls[1] == 0,
+              "because the reconnect did not ask for everything after 5000")
+        check(channel.health()["skipped"] == 1, "the skip is counted in health()")
+        check("5000" in (channel.health()["last_skip"] or ""),
+              f"and named there ({channel.health()['last_skip']})")
+        check(until(lambda: channel.health()["last_cursor"] == 5, 5.0),
+              "and the cursor the channel really reached is the one it reports")
+    finally:
+        channel.stop()
+
+with FakeBroker() as broker:
+    # The bound is a bound, not a ban: a bad frame within reach of where the
+    # channel already is still gets stepped over, which is the whole point of
+    # skipping — one skip per process, not one per reconnect.
+    calls = []
+    lock = threading.Lock()
+
+    def near(request, write):
+        with lock:
+            turn = len(calls)
+            calls.append(request)
+        if turn == 0:
+            write(event_frame(10, kind="good"))
+            write(frame(10 + SKIP_LOOKAHEAD, "{ truncated"))  # just inside
+            return
+        broker.closing.wait(5)
+
+    broker.sse(EVENTS_STREAM_PATH, near)
+    sink = Sink()
+    channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                     backoff=fast_backoff())
+    try:
+        check(until(lambda: len(calls) >= 2, 5.0), "the stream ends after the bad frame")
+        check(calls[1].header("Last-Event-ID") == str(10 + SKIP_LOOKAHEAD),
+              "a skip within the lookahead still advances past the frame")
+    finally:
+        channel.stop()
+
+with FakeBroker() as broker:
+    # The mirror image, and the case the ticket's "one skip per process" never
+    # covered: a poison frame with no id at all. There is nothing to advance
+    # past, so it arrives again on every reconnect — bounded by the ladder
+    # rather than by the cursor, which is worth saying out loud in health()
+    # rather than leaving as a silence.
+    def no_id_poison(request, write):
+        write("data: { truncated\n\n")
+
+    broker.sse(EVENTS_STREAM_PATH, no_id_poison)
+    ladder = Backoff(start=0.01, cap=0.32)
+    sink = Sink()
+    channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                     backoff=ladder)
+    try:
+        check(until(lambda: channel.health()["skipped"] >= 2, 5.0),
+              "an id-less poison frame is re-served on every reconnect")
+        check("no id" in (channel.health()["last_skip"] or ""),
+              f"and health() says why it cannot be resumed past "
+              f"({channel.health()['last_skip']})")
+        check(channel.health()["unresumable"] >= 2,
+              "counted as unresumable — the number a supervisor can alert on")
+        check(until(lambda: ladder.seconds >= 0.04, 5.0),
+              "while the ladder climbs against it instead of spinning")
+        check(sink.count() == 0, "and nothing unusable ever reaches the sink")
+    finally:
+        channel.stop()
+
+# =============================================================================
+# Bounded reads — the one confirmed route from this channel to delivery's memory
+# =============================================================================
+print("\n-- an unbounded body is poison, not a memory leak")
+
+with FakeBroker() as broker:
+    calls = []
+    lock = threading.Lock()
+
+    def flood(request, write):
+        with lock:
+            turn = len(calls)
+            calls.append(request)
+        if turn == 0:
+            write("id: 1\ndata: ")
+            for _ in range(48):            # 384 KiB with no newline in it
+                write("x" * 8192)
+            write("\n\n")                  # ...and only now a terminator
+            write(event_frame(2, kind="after-the-flood"))
+            write("id: 3\n")
+            for _ in range(24):            # data lines that sum past the frame bound
+                write("data: " + "y" * 60000 + "\n")
+            write("\n")
+            write(event_frame(4, kind="after-the-frame"))
+            return
+        broker.closing.wait(5)
+
+    broker.sse(EVENTS_STREAM_PATH, flood)
+    sink = Sink()
+    channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                     backoff=fast_backoff())
+    try:
+        check(until(lambda: sink.kinds() == ["after-the-flood", "after-the-frame"], 10.0),
+              f"the channel reads past both over-sized frames and keeps "
+              f"delivering ({sink.kinds()})")
+        check(channel.health()["skipped"] == 2,
+              "each of them is a skipped frame, not a buffer")
+        check("longer than" in (channel.health()["last_skip"] or ""),
+              f"named by the bound it broke ({channel.health()['last_skip']})")
+        check(channel.running, "and the channel is still up")
+    finally:
+        channel.stop()
+
+with FakeBroker() as broker:
+    # The pure form: a body with no newline anywhere, and then the far end goes.
+    def newline_free(request, write):
+        for _ in range(32):
+            write("x" * 8192)
+        raise StreamAborted()
+
+    broker.sse(EVENTS_STREAM_PATH, newline_free)
+    sink = Sink()
+    channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                     backoff=fast_backoff())
+    try:
+        check(until(lambda: channel.health()["retries"] >= 2, 8.0),
+              "a body with no newline ends as a reconnect, not as a buffer")
+        check(sink.count() == 0, "nothing was committed")
+        check(channel.running, "and the channel survives it")
+    finally:
+        channel.stop()
+
+# =============================================================================
+# stop() before the first byte, and the start() that follows it
+# =============================================================================
+print("\n-- stop() during a connect that will never answer")
+
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(8)
+accepted = []
+
+
+def accept_forever():
+    """Accept, and then say nothing at all — the black-holed connect."""
+    while True:
+        try:
+            accepted.append(listener.accept()[0])
+        except OSError:
+            return
+
+
+acceptor = threading.Thread(target=accept_forever, name="never-answers", daemon=True)
+acceptor.start()
+
+port = listener.getsockname()[1]
+dead_http = RelayHTTP(TokenSource(token=f"http://127.0.0.1:{port}|SECRET"))
+# Short, so the leftover thread this test is *about* does not outlive the suite.
+channel = EventChannel(dead_http, Sink(), read_timeout=1.5, backoff=fast_backoff())
+try:
+    channel.start()
+    check(until(lambda: len(accepted) >= 1, 5.0),
+          "the channel is parked in a connect that has produced no byte")
+
+    started = time.monotonic()
+    channel.stop(timeout=0.3)
+    check(time.monotonic() - started < 2.0, "stop() returns rather than hanging on it")
+    check(not channel.running,
+          "and does not report the channel as still running afterwards")
+    check(channel.health()["status"] == "stopped", "the snapshot says stopped")
+    check("could not be interrupted" in (channel.health()["error"] or ""),
+          f"while saying honestly what it could not reach "
+          f"({channel.health()['error']})")
+
+    # And the compounding half: start() used to return early on the live thread
+    # *before* clearing the stop flag, so this call handed back a channel that
+    # said running, spawned nothing, and died when the old thread saw the flag.
+    connects = len(accepted)
+    channel.start()
+    check(channel.running, "start() after a stop that could not take really starts")
+    check(until(lambda: len(accepted) > connects, 5.0),
+          "a new attempt of its own, which connects rather than inheriting a stop")
+    check(channel.health()["status"] != "stopped",
+          "and the channel is no longer describing itself as stopped")
+finally:
+    channel.stop(timeout=0.3)
+    check(until(lambda: not channel_threads(), 6.0),
+          "and every thread it left behind exits when its connect gives up")
+    listener.close()
+    for conn in accepted:
+        conn.close()
+
+# =============================================================================
+# A clean stop leaves nothing in the snapshot but "stopped"
+# =============================================================================
+print("\n-- health() after an ordinary stop")
+
+dirty = []
+for _ in range(6):
+    with FakeBroker() as broker:
+        def ticking(request, write):
+            cursor = 0
+            while not broker.closing.wait(0.002):
+                cursor += 1
+                write(event_frame(cursor, kind="tick"))
+
+        broker.sse(EVENTS_STREAM_PATH, ticking)
+        sink = Sink()
+        channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                         backoff=fast_backoff())
+        check_ok = until(lambda: sink.count() >= 2, 5.0)
+        channel.stop()
+        snapshot = channel.health()
+        if not check_ok or snapshot["status"] != "stopped" or snapshot["error"] is not None:
+            dirty.append(snapshot)
+
+# `close_stream` drops `fp` on the caller's thread while the reader is inside
+# http.client about to use it, and the AttributeError that follows used to be
+# written straight into the snapshot — 12 times out of 12, a normal shutdown
+# reading `error: "stream: 'NoneType' object has no attribute 'close'"`.
+check(not dirty,
+      f"six clean stops leave no library internals in health() ({dirty[:1]})")
+
+# =============================================================================
+# A sink that cannot answer at all
+# =============================================================================
+print("\n-- a sink that cannot report its durable cursor")
+
+
+class MuteSink(Sink):
+    """A store that is up enough to commit and down enough to be asked."""
+
+    def durable_cursor(self):
+        raise RuntimeError("the store cannot be reached")
+
+
+with FakeBroker() as broker:
+    calls = []
+    lock = threading.Lock()
+
+    def script(request, write):
+        with lock:
+            turn = len(calls)
+            calls.append(request)
+        if turn == 0:
+            write(event_frame(11, kind="through"))
+            return
+        broker.closing.wait(5)
+
+    broker.sse(EVENTS_STREAM_PATH, script)
+    sink = MuteSink()
+    channel = events(RelayHTTP(TokenSource(token=f"{broker.url}|SECRET")), sink,
+                     backoff=fast_backoff())
+    try:
+        check(until(lambda: len(calls) >= 2, 5.0),
+              "a sink that raises on durable_cursor() does not stop the channel")
+        check(calls[0].header("Last-Event-ID") == "",
+              "the first connect has nothing of its own to fall back on")
+        check(calls[1].header("Last-Event-ID") == "11",
+              "and the reconnect falls back to the channel's own marker")
+        check(sink.count() == 1, "while events still reach it")
+        check(channel.running, "and the channel is still up")
+    finally:
+        channel.stop()
+
+# =============================================================================
 # The frame parser, on its own — the SSE grammar the rest depends on
 # =============================================================================
 print("\n-- the SSE grammar")
 
 
-def parsed(text):
-    return list(parse_frames(iter(text.encode().splitlines(keepends=True))))
+def parsed(text, **bounds):
+    """Parse `text` the way production parses a stream: through `readline`.
+
+    This used to hand the parser `bytes.splitlines(keepends=True)`, which is a
+    *different tokenizer* from the one the module actually reads with — it
+    breaks on a lone `\\r` where `HTTPResponse` does not. So the only coverage
+    the parser had was coverage of a read path nothing uses, and a CR-only frame
+    passed here while yielding nothing at all on the wire. A file object with a
+    `readline(limit)` is what the channel really holds.
+    """
+    return list(parse_frames(io.BytesIO(text.encode()), **bounds))
 
 
 check(parsed("data: {}\n\n") == [("event", None, "{}")],
@@ -726,6 +1100,49 @@ check(parsed("retry: 3000\ndata: x\n\n") == [("event", None, "x")],
       "fields this client does not use are ignored, not fatal")
 check(parsed("data: x\r\n\r\n") == [("event", None, "x")], "CRLF line endings work")
 check(parsed("data: x\n") == [], "an undispatched frame is not delivered")
+check(parsed("id: 3\rdata: z\r\r\n") == [("event", "3", "z")],
+      "and a CR-only frame is a frame — the grammar allows it, and the old read "
+      "path silently yielded nothing for it")
+check(parsed("data: a\rdata: b\r\n\r\n") == [("event", None, "a\nb")],
+      "CR-terminated lines inside one read accumulate like any others")
+
+# The bound, at the level where it is decided: a line that never ends must not
+# be read into memory, because this channel shares an address space with task
+# delivery and 64 MiB of newline-free body once grew RSS by ~139 MB.
+class Counted:
+    """A response that remembers the largest read the parser ever asked for."""
+
+    def __init__(self, payload):
+        self._buf = io.BytesIO(payload)
+        self.biggest = 0
+
+    def readline(self, limit=-1):
+        self.biggest = max(self.biggest, limit)
+        return self._buf.readline(limit)
+
+
+endless = Counted(b"id: 9\ndata: " + b"x" * (512 * 1024) + b"\n\n" + b"data: {}\n\n")
+frames = list(parse_frames(endless))
+check(0 < endless.biggest <= MAX_LINE_BYTES + 1,
+      f"the parser never asks for an unbounded line ({endless.biggest} bytes at most)")
+check(frames[0][0] == "poison" and frames[0][1] == "9",
+      "a line past the bound is poison, carrying the id it arrived under")
+check("longer than" in frames[0][2], "and says which bound it broke")
+check(frames[1] == ("event", "9", "{}"),
+      "and the parser resynchronises: the next frame is read normally")
+
+huge = Counted(b"id: 4\n" + b"".join(b"data: " + b"y" * 4000 + b"\n" for _ in range(64))
+               + b"\n" + b"data: {}\n\n")
+frames = list(parse_frames(huge, max_frame=100_000))
+check(frames[0][0] == "poison" and "frame longer than" in frames[0][2],
+      "data lines that accumulate past the frame bound are poison too")
+check(frames[1] == ("event", "4", "{}"), "and that frame is dropped, not the stream")
+
+nothing = Counted(b"z" * (256 * 1024))  # a body with no newline anywhere, then EOF
+check(list(parse_frames(nothing)) == [],
+      "a body with no newline at all yields nothing rather than buffering it")
+check(0 < nothing.biggest <= MAX_LINE_BYTES + 1,
+      "and is read a bounded piece at a time to the end")
 
 # =============================================================================
 print("\n-- threads")
