@@ -23,10 +23,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 from .adapters import get as get_adapter
 from .attachments import parse as parse_attachments
+from .config import CONFIG_ENV, DEFAULT_PATH, ConfigError
+from .config import export as export_config
+from .config import load as load_config
 from .events import TurnContext
 from .outgoing import Outbox
 from .pending import queue_for
@@ -41,6 +46,44 @@ def _ws() -> Path:
     # in it — `agent_connect.sessions` owns it because the Adapter reaches for
     # it without going through the Worker.
     return workspace_dir()
+
+
+# macOS TCC-protected locations: an agent operating out of one of these hits
+# permission walls on file access unless the launching process has Full Disk
+# Access. The old cwd default silently put the agent in whatever dir the user
+# launched from — often ~/Documents / ~/Desktop — which produced opaque TCC
+# failures (owner-caught friction). We default to a dedicated ~/agents dir and
+# warn loudly if the resolved repo still lands under a protected path.
+_TCC_PROTECTED = ("Desktop", "Documents", "Downloads")
+
+
+def _resolve_repo() -> Path:
+    """Resolve the working dir the agent operates in.
+
+    `AGENT_CONNECT_REPO` (if set) wins; otherwise default to ``~/agents`` — a
+    dedicated, non-TCC-protected dir — instead of the launch cwd. Creates the
+    dir when defaulting, prints where it landed, and warns if the path is under
+    a macOS TCC-protected location (agent file ops there need Full Disk Access).
+    """
+    explicit = os.environ.get("AGENT_CONNECT_REPO")
+    repo = Path(explicit).expanduser() if explicit else (Path.home() / "agents")
+    if not explicit:
+        repo.mkdir(parents=True, exist_ok=True)
+        print(f"agent-connect: no AGENT_CONNECT_REPO set — defaulting repo to {repo}")
+
+    home = Path.home()
+    try:
+        rel = repo.resolve().relative_to(home.resolve())
+        top = rel.parts[0] if rel.parts else ""
+    except ValueError:
+        top = ""
+    if top in _TCC_PROTECTED:
+        print(
+            f"agent-connect: WARNING — repo {repo} is under a macOS TCC-protected "
+            f"location (~/{top}); the agent's file operations may fail without "
+            f"Full Disk Access. Set AGENT_CONNECT_REPO to a dir like ~/agents."
+        )
+    return repo
 
 
 # Header keys the AG2 Space relay writes (ag2-sparrow's task-file layout).
@@ -282,16 +325,79 @@ def preflight(adapter) -> None:
         print(f"agent-connect: {describe()}")
 
 
-def main() -> None:
+USAGE = f"""usage: agent-connect [--config PATH] [--export-config]
+
+Runs your local agent against the Tasks the relay client pulls for one Agent
+Identity. Everything it reads is a setting, documented in README.md § Settings,
+and every setting can be given in the environment or in a config file.
+
+  --config PATH    the config file to read. Default: {CONFIG_ENV} if it is set,
+                   otherwise {DEFAULT_PATH} if it exists. Environment variables
+                   win over the file.
+  --export-config  print that same config file as shell `export` lines and exit,
+                   for a launcher that has to start something else with the same
+                   settings. This is why there is no second parser anywhere.
+"""
+
+
+def parse_args(argv: List[str]) -> Tuple[Optional[str], bool]:
+    """`(config path, export-only)` from a command line.
+
+    Two flags, and no more: a flag per setting would be a third place for a
+    setting to live, and there are already two too many. `--help` earns its
+    place by being the answer to `--export-config` existing at all — a program
+    with flags that treats `--help` as an unknown argument is worse than one
+    with no flags.
+    """
+    args = list(argv)
+    path, export = None, False
+    while args:
+        arg = args.pop(0)
+        if arg in ("-h", "--help"):
+            print(USAGE)
+            raise SystemExit(0)
+        if arg == "--export-config":
+            export = True
+        elif arg == "--config":
+            if not args:
+                raise SystemExit("agent-connect: --config needs a path")
+            path = args.pop(0)
+        elif arg.startswith("--config="):
+            path = arg.partition("=")[2]
+        else:
+            raise SystemExit(f"agent-connect: unknown argument {arg!r}\n\n{USAGE}")
+    return path, export
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    # ---- the startup order is a contract -------------------------------------
+    # Settings first: a config file may name the workspace, so nothing that
+    # reads a setting may run before it — and every setting an Adapter reads
+    # for itself sees the same environment whether the operator exported it or
+    # wrote it down. What the environment already says is never overwritten;
+    # see `agent_connect.config`. The workspace is resolved next, because
+    # everything the Worker owns on disk hangs off it.
+    config_path, export_only = parse_args(
+        sys.argv[1:] if argv is None else list(argv))
+    try:
+        if export_only:
+            export_config(config_path)
+            return
+        load_config(config_path)
+    except ConfigError as exc:
+        raise SystemExit(f"agent-connect: {exc}")
+    ws = _ws()
     adapter_name = os.environ.get("AGENT_CONNECT_ADAPTER")
     if not adapter_name:
-        raise SystemExit("set AGENT_CONNECT_ADAPTER (e.g. codex)")
+        raise SystemExit(
+            "set AGENT_CONNECT_ADAPTER (e.g. codex) — in the environment, or in "
+            "a config file (--config PATH; see README.md § Settings)"
+        )
     adapter = get_adapter(adapter_name)
     preflight(adapter)
-    repo = os.environ.get("AGENT_CONNECT_REPO") or os.getcwd()
+    repo = str(_resolve_repo())
     poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
 
-    ws = _ws()
     tasks_dir = ws / "tasks"
     results_dir = ws / "results"
     tasks_dir.mkdir(parents=True, exist_ok=True)

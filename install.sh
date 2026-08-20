@@ -14,7 +14,7 @@
 #   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini
 #             [default: claude]  Any other ACP agent: set AGENT_CONNECT_ACP_COMMAND
 #             yourself — it overrides the preset.
-#   --repo    AGENT_CONNECT_REPO     repo the agent works in            [default: cwd]
+#   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
 #   --sutando-workspace PATH         connect an ALREADY-RUNNING Sutando instead of
 #             (AGENT_CONNECT_SUTANDO_WORKSPACE)  installing a worker: relay-only mode,
 #             task/result/state dirs point at that Sutando's workspace — its own
@@ -187,6 +187,55 @@ if [ "$ADAPTER" = "acp" ]; then
   esac
 fi
 
+# ── 1c) write the config file ───────────────────────────────────────────────
+# Every setting in one 0600 file that agent-connect reads itself. The point is
+# what is NOT elsewhere: the service definition below carries only a path to
+# this file, so the bearer token stops living in plaintext in a launchd plist
+# (world-readable by default) or a systemd unit. Same keys as README's Settings
+# table; environment variables still win over the file.
+#
+# Relay-only mode writes none: there is no worker there to read one, and the
+# only process that needs the token is the relay client, which gets it from a
+# launcher this script writes at mode 0700.
+CONFIG=""
+if [ -z "$SUTANDO_WS" ]; then
+  CONFIG="$APP_DIR/config.env"
+  # This installer is the documented `curl … | sh` path and people re-run it.
+  # A re-run must not silently eat a setting somebody added by hand, so the old
+  # file is kept beside the new one and every key this script does not manage is
+  # carried across.
+  KEPT=""
+  if [ -f "$CONFIG" ]; then
+    BACKUP="$CONFIG.bak"
+    cp "$CONFIG" "$BACKUP" && chmod 600 "$BACKUP"
+    say "existing config kept as $BACKUP"
+    KEPT="$(grep -v -E '^[[:space:]]*(AGENT_CONNECT_TOKEN|AGENT_CONNECT_ADAPTER|AGENT_CONNECT_REPO|AGENT_CONNECT_ACP_AGENT)[[:space:]]*=' "$CONFIG" \
+            | grep -v -E '^[[:space:]]*(#|$)' || true)"
+  fi
+  say "writing config $CONFIG (mode 0600 — it holds your token)"
+  (
+    umask 077
+    {
+      echo "# agent-connect settings, written by install.sh."
+      echo "# Keep this file to yourself: it holds your agent identity's token."
+      echo "# Every key in README.md's Settings table may be written here."
+      # Values are quoted on the way out so that a token with edge whitespace
+      # or quotes of its own survives the round trip: the reader strips one
+      # matching pair and nothing else.
+      echo "AGENT_CONNECT_TOKEN=\"$TOKEN\""
+      echo "AGENT_CONNECT_ADAPTER=\"$ADAPTER\""
+      echo "AGENT_CONNECT_REPO=\"$REPO\""
+      [ -z "$ACP_KV" ] || echo "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
+      if [ -n "$KEPT" ]; then
+        echo ""
+        echo "# kept from your previous config.env:"
+        printf '%s\n' "$KEPT"
+      fi
+    } > "$CONFIG"
+  )
+  chmod 600 "$CONFIG"
+fi
+
 # ── 2) write the launcher ────────────────────────────────────────────────────
 # One code path for every start mode (launchd / systemd / nohup / by hand):
 # starts the relay client wired to the worker's workspace via the dir-interface
@@ -203,8 +252,14 @@ if [ -n "$SUTANDO_WS" ]; then
 #!/bin/sh
 # launch.sh — written by install.sh (--sutando-workspace mode): relay only,
 # wired to the running Sutando instance's workspace.
+#
+# This file is mode 0700 because the token is in it. There is no config file in
+# this mode and deliberately so: agent-connect is not installed here (the
+# running Sutando is the worker), so nothing could read one — and a second
+# implementation of the config reader, in shell, is exactly the thing that went
+# wrong once already. One private file holds the secret either way.
 set -eu
-: "\${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN (from the Agent Portal)}"
+AGENT_CONNECT_TOKEN="\${AGENT_CONNECT_TOKEN:-$TOKEN}"
 PIDFILE="$APP_DIR/.relay.pids"
 if [ -f "\$PIDFILE" ]; then
   while read -r _old; do
@@ -224,10 +279,21 @@ else
   cat > "$LAUNCHER" <<LAUNCH
 #!/bin/sh
 # launch.sh — written by install.sh; starts relay client + worker as one unit.
-# Caller env: AGENT_CONNECT_TOKEN (required), AGENT_CONNECT_ADAPTER,
-# AGENT_CONNECT_REPO, AGENT_CONNECT_WORKSPACE, REMOTE_TASK_URL (optional).
+# Every setting is read from the config file ($CONFIG by default; point
+# AGENT_CONNECT_CONFIG elsewhere to move it). Anything already exported wins
+# over the file, so the old "export it first" way still works unchanged.
 set -eu
-: "\${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN (from the Agent Portal)}"
+export AGENT_CONNECT_CONFIG="\${AGENT_CONNECT_CONFIG:-$CONFIG}"
+
+# The relay client needs the same settings the worker does, and asking the
+# worker for them is the whole design: `--export-config` prints the config file
+# as shell, with the environment's own values already deferred to, so there is
+# no second parser here to disagree with the first. Warnings go to stderr; only
+# `export` lines reach stdout.
+_cfg="\$("$WORKER_BIN" --export-config)" || exit 1
+eval "\$_cfg"
+unset _cfg
+: "\${AGENT_CONNECT_TOKEN:?no token — it should be in \$AGENT_CONNECT_CONFIG}"
 WS="\${AGENT_CONNECT_WORKSPACE:-\$HOME/.agent-connect/workspace}"
 export AGENT_CONNECT_WORKSPACE="\$WS"
 mkdir -p "\$WS/tasks" "\$WS/results" "\$WS/state"
@@ -260,12 +326,19 @@ echo "\$\$" >> "\$PIDFILE"
 exec "$WORKER_BIN"
 LAUNCH
 fi
-chmod +x "$LAUNCHER"
-
 if [ -n "$SUTANDO_WS" ]; then
-  RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN sh $LAUNCHER"
+  chmod 700 "$LAUNCHER"   # the token is in it
 else
-  RUN_CMD="AGENT_CONNECT_TOKEN=$TOKEN AGENT_CONNECT_ADAPTER=$ADAPTER AGENT_CONNECT_REPO=$REPO ${ACP_KV:+$ACP_KV }sh $LAUNCHER"
+  chmod +x "$LAUNCHER"    # holds no secret: the config file does
+fi
+
+# Everything it needs is in the config file (or, in relay-only mode, in the 0700
+# launcher), so the command an operator copies out of a terminal — and into a
+# shell history, and a support ticket — is a path rather than a bearer token.
+if [ -n "$CONFIG" ]; then
+  RUN_CMD="AGENT_CONNECT_CONFIG=$CONFIG sh $LAUNCHER"
+else
+  RUN_CMD="sh $LAUNCHER"
 fi
 
 if [ "$START" -eq 0 ]; then
@@ -280,14 +353,6 @@ fi
 # Adapter-specific env, carried into whichever start mode is used. Empty for
 # every adapter but acp, which is why these expand to nothing rather than to a
 # variable set to the empty string.
-ACP_PLIST=""
-ACP_UNIT=""
-if [ -n "$ACP_KV" ]; then
-  ACP_PLIST="    <key>AGENT_CONNECT_ACP_AGENT</key><string>$ACP_AGENT</string>
-"
-  ACP_UNIT="Environment=AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
-fi
-
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
   say "starting via launchd (per-user LaunchAgent)"
@@ -301,11 +366,11 @@ if [ "$OS" = "Darwin" ]; then
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>$LAUNCHER</string>
   </array>
+  <!-- No token here, and no settings: this plist is world-readable by default,
+       and everything the worker needs is in a private file the launcher reads. -->
   <key>EnvironmentVariables</key><dict>
-    <key>AGENT_CONNECT_TOKEN</key><string>$TOKEN</string>
-    <key>AGENT_CONNECT_ADAPTER</key><string>$ADAPTER</string>
-    <key>AGENT_CONNECT_REPO</key><string>$REPO</string>
-$ACP_PLIST    <key>PATH</key><string>$PATH</string>
+${CONFIG:+"    <key>AGENT_CONNECT_CONFIG</key><string>$CONFIG</string>
+"}    <key>PATH</key><string>$PATH</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -324,10 +389,8 @@ elif command -v systemctl >/dev/null 2>&1; then
 Description=AG2 Space agent-connect worker
 After=network-online.target
 [Service]
-Environment=AGENT_CONNECT_TOKEN=$TOKEN
-Environment=AGENT_CONNECT_ADAPTER=$ADAPTER
-Environment=AGENT_CONNECT_REPO=$REPO
-$ACP_UNIT
+# No token in the unit file: it is in a private file the launcher reads.
+${CONFIG:+Environment=AGENT_CONNECT_CONFIG=$CONFIG}
 ExecStart=/bin/sh $LAUNCHER
 Restart=always
 [Install]
@@ -338,9 +401,7 @@ UNIT
   say "enabled. Logs: journalctl --user -u agent-connect -f"
 else
   say "no service manager found — starting in the background (nohup)"
-  # shellcheck disable=SC2086
-  env AGENT_CONNECT_TOKEN="$TOKEN" AGENT_CONNECT_ADAPTER="$ADAPTER" \
-      AGENT_CONNECT_REPO="$REPO" $ACP_KV \
+  env ${CONFIG:+AGENT_CONNECT_CONFIG="$CONFIG"} \
       nohup sh "$LAUNCHER" >"$APP_DIR/agent-connect.log" 2>&1 &
   say "started (pid $!). Logs: $APP_DIR/agent-connect.log"
 fi

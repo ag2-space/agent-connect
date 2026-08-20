@@ -2,16 +2,36 @@
 # Launch your local agent as an AG2 Space agent: the AG2 relay client (pulls your
 # agent's tasks + posts results) + the agent-connect worker (runs the agent).
 #
+# Settings — exported, or written in the config file the worker reads
+# (~/.agent-connect/config.env, or wherever AGENT_CONNECT_CONFIG points). An
+# exported value wins over the file, per setting.
+#
 #   AGENT_CONNECT_TOKEN    your agent's relay token (from the Agent Portal) [required]
 #   AGENT_CONNECT_ADAPTER  adapter, e.g. codex [required]
-#   AGENT_CONNECT_REPO     repo the agent works in [default: cwd]
+#   AGENT_CONNECT_REPO     repo the agent works in [default: ~/agents]
 #   AGENT_CONNECT_WORKSPACE  task/result workspace [default: ~/.agent-connect/workspace]
+#
+# This script's own knobs. NOT settings, and deliberately not readable from the
+# config file: that file may set AGENT_CONNECT_*, REMOTE_TASK_* and OLLAMA_HOST
+# and nothing else, because a config file able to name a binary would be
+# choosing which program runs. Export these if you need them.
+#
 #   RELAY_BIN              ag2-sparrow console script [default: `command -v ag2-sparrow`;
 #                          `pip install ag2-sparrow` if you don't have it]
 #   RELAY_CLIENT           legacy: path to a file-based relay client — only used
 #                          when explicitly set (pre-PyPI installs)
 set -euo pipefail
-: "${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN (from the Agent Portal)}"
+
+# Settings may be written down instead of exported: the config file the worker
+# reads itself (README.md § The config file). This asks the worker for it rather
+# than parsing it here — one parser, so the relay client below and the worker
+# cannot end up disagreeing about what the file says. The environment still
+# wins, per setting, and that decision is made in there too.
+export AGENT_CONNECT_CONFIG="${AGENT_CONNECT_CONFIG:-$HOME/.agent-connect/config.env}"
+_cfg="$(python3 -m agent_connect --export-config)" || exit 1
+eval "$_cfg"
+unset _cfg
+: "${AGENT_CONNECT_TOKEN:?set AGENT_CONNECT_TOKEN — export it, or write it in $AGENT_CONNECT_CONFIG}"
 : "${AGENT_CONNECT_ADAPTER:?set AGENT_CONNECT_ADAPTER (e.g. codex)}"
 export AGENT_CONNECT_WORKSPACE="${AGENT_CONNECT_WORKSPACE:-$HOME/.agent-connect/workspace}"
 mkdir -p "$AGENT_CONNECT_WORKSPACE/tasks" "$AGENT_CONNECT_WORKSPACE/results" \

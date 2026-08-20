@@ -261,6 +261,127 @@ its working directory can then send the copy. The permitted area is a boundary o
 paths, not a proof about contents — closing that needs a sandbox that refuses the
 first copy.
 
+## The config file: settings written down, not exported
+
+Everything below is an environment variable, which is a fine interface for a
+shell and a poor one for a service. So the same keys can be written in a file
+instead, and the worker reads it itself:
+
+```bash
+install -m 600 /dev/null ~/.agent-connect/config.env
+cat > ~/.agent-connect/config.env <<'EOF'
+AGENT_CONNECT_TOKEN=<token from the portal>
+AGENT_CONNECT_ADAPTER=acp
+AGENT_CONNECT_ACP_AGENT=claude
+AGENT_CONNECT_REPO=/Users/me/agents
+EOF
+agent-connect
+```
+
+**The keys are the ones in the Settings table below** — the same names, no
+translation, nothing to learn twice. `KEY=value`, one per line, `#` comments,
+everything after the first `=` taken verbatim (one matching pair of surrounding
+quotes is removed, and that is the whole of the syntax). It is **not** a shell
+script and is never evaluated as one, so the launcher and the worker read the
+same file and agree about what it says.
+
+**Where it looks**, in order: `--config <path>` on the command line, then
+`AGENT_CONNECT_CONFIG`, then `~/.agent-connect/config.env` if it exists. The
+flag exists so a start needs no environment at all; the variable exists so a
+service unit can point at a file without putting anything else on a command
+line. A file you *named* and that is not there stops the worker — it holds the
+token, and starting without it gives you a worker that runs, pulls nothing and
+looks healthy.
+
+**Environment variables win over the file.** A setting already exported is left
+exactly as it is, per setting, and the worker says which ones the file offered
+and did not get:
+
+```
+agent-connect: config /Users/me/.agent-connect/config.env — 4 setting(s) applied,
+  1 already set in the environment (AGENT_CONNECT_ADAPTER) and left alone
+```
+
+That direction is the only one that makes `AGENT_CONNECT_ADAPTER=codex
+agent-connect` mean what it says. A config file is a default that persists, not
+an authority that overrules the shell you are standing in.
+
+**It may set settings and nothing else.** Only `AGENT_CONNECT_*`,
+`REMOTE_TASK_*` and `OLLAMA_HOST` are applied; any other key is named on stderr
+and ignored, because a file that could set `PATH` would be deciding which
+`codex` binary runs. A misspelt setting is named for the same reason: it looks
+exactly like a setting that did not work. A key written **twice** takes the last
+line, as it would in any file of this shape, and the repetition is named too —
+that one is worth being sure about when the setting is a token.
+
+**There is exactly one parser, and the launchers ask it.** The relay client
+needs the same settings the worker does, so `launch.sh` and `run-agent.sh` run
+
+```bash
+_cfg="$(agent-connect --export-config)" || exit 1
+eval "$_cfg"
+```
+
+which prints the config file as `export` lines — with the environment's own
+values already deferred to — and nothing else on stdout. The shell loop that
+used to do this instead disagreed with the worker about duplicated keys, CRLF
+line endings and whitespace-only variables; the first of those handed the relay
+client and the worker *different tokens* out of one file. Two readers of one
+file is two answers to "what does this file say".
+
+**It holds your agent's token, so keep it to yourself.** The installer writes it
+`0600`. A file others can read is still loaded — refusing would break a working
+install over a warning's worth of problem — and complained about at every start,
+with the `chmod` that fixes it.
+
+**This is what the installer now does.** `install.sh` writes your token, adapter
+and working directory into that file and points the launchd plist (or systemd
+unit) at it with `AGENT_CONNECT_CONFIG`, so **the service definition carries no
+bearer token** — it used to sit in plaintext in
+`~/Library/LaunchAgents/space.ag2.agent-connect.plist`, which is world-readable
+by default. Re-running the installer keeps the previous file as
+`config.env.bak` and carries across every key it does not manage itself, so a
+setting you added by hand survives a re-run of the one-liner.
+
+(`--sutando-workspace` relay-only mode writes no config file: agent-connect is
+not installed there, so nothing could read one. Its launcher holds the token
+and is written mode 0700 instead — one private file either way, and still
+nothing in the plist.)
+
+## Running more than one agent on one machine
+
+**The launch unit is one worker plus one relay client, pointed at one config
+file.** That is the contract a supervisor builds on, and it is deliberately not
+a process count or a transport: today the installer's `launch.sh` starts both
+halves, and what a supervisor should depend on is the pair, named by the config
+file it was given.
+
+```bash
+agent-connect --config ~/.agent-connect/instances/scratch/config.env
+```
+
+**An instance is a config file and a workspace, and they come together.** Give
+each instance its own config file, and in it its own `AGENT_CONNECT_WORKSPACE`
+— everything per-instance hangs off that one setting:
+
+```bash
+# ~/.agent-connect/instances/scratch/config.env   (mode 0600)
+AGENT_CONNECT_TOKEN=<this instance's own agent token>
+AGENT_CONNECT_ADAPTER=acp
+AGENT_CONNECT_ACP_AGENT=claude
+AGENT_CONNECT_REPO=/Users/me/agents/scratch
+AGENT_CONNECT_WORKSPACE=/Users/me/.agent-connect/instances/scratch/workspace
+```
+
+**Two instances must never share a workspace.** `tasks/`, `results/`, the
+session map and the status file all live in it, and two workers watching one
+`tasks/` directory will each pick up every task and run it twice. Two instances
+sharing an *agent token* is the same bug one layer up: one queue, two pullers.
+A new instance means a new Agent Identity.
+
+Each instance also owns a **status file** under its own workspace, which is how
+a supervisor watching several of them tells one worker's state from another's.
+
 ## Settings
 
 **This table is the authoritative list of every setting agent-connect reads.**
@@ -270,9 +391,10 @@ table.
 
 | Setting | What it does | Default |
 | --- | --- | --- |
+| `AGENT_CONNECT_CONFIG` | the config file to read (see the section above). The `--config` flag wins over it | `~/.agent-connect/config.env`, if it exists |
 | `AGENT_CONNECT_TOKEN` | your agent identity's relay token, from the Agent Portal | *(required)* |
 | `AGENT_CONNECT_ADAPTER` | which adapter runs the task: `codex`, `ollama`, `omnigent`, `cline`, `kilo`, `acp` | *(required)* |
-| `AGENT_CONNECT_REPO` | the working directory the agent operates in | cwd (installer: `~/agents`) |
+| `AGENT_CONNECT_REPO` | the working directory the agent operates in. Created for you when it is the default; a path under `~/Documents`, `~/Desktop` or `~/Downloads` is warned about, because macOS privacy protection turns agent file operations there into an unexplained "operation not permitted" | `~/agents` |
 | `AGENT_CONNECT_WORKSPACE` | workspace dir holding `tasks/` + `results/` | `~/.agent-connect/workspace` |
 | `AGENT_CONNECT_POLL` | seconds between scans for new tasks | `1.0` |
 | `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` | how much of one attached file is read into a prompt. An attachment over this is reported in the room, never shrunk to fit. `0` means no limit | `10485760` (10 MB) |
