@@ -158,6 +158,24 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
           "and the room is told, in the answer: " + repr(prepared.body[-90:]))
     check(len(prepared.refused) == 1, "one refusal, reported once")
 
+    # --- an answer that *explains* the marker is not an answer that issued one
+    # The instruction the consumer puts in the agent's preamble spells the value
+    # `<path>`, so the sentence an agent writes when a person asks how to send a
+    # file contains this marker in ordinary prose, where no code mask reaches.
+    # It used to lose the marker out of the middle of that sentence and gain a
+    # refusal under it, for a file nobody had asked for.
+    taught = ("To put a file in the room, write [file: <path>] on a line of "
+              "its own and agent-connect attaches it to this reply.")
+    sent_before = len(broker.took("POST", MEDIA))
+    prepared = out.prepare("task-22", ROOM, taught)
+    check(prepared.body == taught,
+          "the explanation is delivered exactly as written: " + repr(prepared.body))
+    check(prepared.refused == () and prepared.uploaded == (),
+          "with nothing refused and nothing sent — no `[attachment not sent:` "
+          "under a sentence that only described the feature")
+    check(len(broker.took("POST", MEDIA)) == sent_before,
+          "and nothing reached the media route at all")
+
     # --- a refusal cannot forge a marker out of the path it repeats
     prepared = out.prepare("task-21", ROOM, "[file: /nope/a]b] evil]")
     check("[file:" not in prepared.body and "]b]" not in prepared.body,

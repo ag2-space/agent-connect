@@ -37,6 +37,13 @@ The precedence rules are part of the grammar, not of any consumer:
   line still in it, because emptying somebody's example is the same silent
   rewrite the standalone-only rule above exists to prevent.
 
+- **A marker whose value is a placeholder is being described, not issued.**
+  `[file: <path>]` is how the consumer's own instruction to the agent is
+  written, so it is also what an agent repeating that instruction produces — in
+  ordinary prose, where no mask reaches. Detection and stripping are narrowed
+  together, so the explanation is delivered exactly as written and no file is
+  refused in it.
+
 The masking has one invariant, and it is the one worth checking a change
 against: **a marker is either issued and stripped, or masked and left visible —
 never neither.** "Neither" is how a marker reaches the user as literal text,
@@ -100,6 +107,28 @@ _DMONLY_STRIP_RE = re.compile(
 #: The three spellings of "put this file in the room". Anywhere in the body, in
 #: document order.
 _ATTACH_RE = re.compile(r"\[(?:file|send|attach):\s*([^\]]+)\]")
+
+#: A value carrying `<…>` is a **placeholder**, and a placeholder is prose.
+#:
+#: This is the one place where a live marker and a *described* one are told
+#: apart by what they say rather than by where they sit, and the reason is that
+#: the consumer teaches this grammar to the agent in the agent's own preamble —
+#: `agent_connect.outgoing.INSTRUCTION`: "write [file: <path>] on a line of its
+#: own". So the sentence an agent produces when a person asks how to send a file
+#: is a sentence containing this marker, unfenced, in ordinary prose. Acting on
+#: it took a bite out of the middle of the explanation and appended
+#: `[attachment not sent: (path) …]` under it — a refusal for a file nobody
+#: asked for, in an answer that was only ever describing the feature. Detection
+#: and stripping are narrowed together, so what is not issued stays visible:
+#: the "neither" case is a marker that vanishes *and* does nothing, not one that
+#: is left exactly as the agent wrote it.
+#:
+#: Nothing sendable is lost. No filesystem this client uploads from has a file
+#: called `<path>`, so the only outcomes on offer were a mangled sentence and a
+#: false refusal; and a genuine path with an angle bracket in it now arrives in
+#: the room whole and visible, which is the direction a person can see and act
+#: on rather than the one that hides.
+_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")
 
 #: An **unterminated** marker: an opening tag with no closing `]` before the end
 #: of the body. `_ATTACH_RE` cannot match one, so without this the tail — an
@@ -236,15 +265,22 @@ def parse(text: Optional[str]) -> ParseResult:
             actions.append(Action("redirect", named))
         body = body[found.end():]
 
-    # 4. ATTACH — anywhere, document order, code regions masked.
+    # 4. ATTACH — anywhere, document order, code regions masked, placeholders
+    # left alone. `_issued` is asked by both the collection and the strip, which
+    # is what keeps them one scope: a marker this step declines to act on is a
+    # marker it also declines to remove.
     in_code = _mask(body)
 
+    def _issued(found) -> bool:
+        return (not in_code(found.start())
+                and not _PLACEHOLDER_RE.search(found.group(1)))
+
     for found in _ATTACH_RE.finditer(body):
-        if not in_code(found.start()):
+        if _issued(found):
             actions.append(Action("attach", found.group(1).strip()))
 
     body = _ATTACH_RE.sub(
-        lambda m: m.group(0) if in_code(m.start()) else "", body
+        lambda m: "" if _issued(m) else m.group(0), body
     )
 
     # 5. UNTERMINATED — an opening tag the body ran out before closing. It named

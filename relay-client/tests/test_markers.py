@@ -185,6 +185,34 @@ check("[file:" not in parsed.body, "so its marker is stripped, not left as text"
 check(markers.parse("    [file: /etc/passwd]\nafter").attachments == (),
       "while an indented block that opens the body still issues nothing")
 
+# --- a value in angle brackets is a PLACEHOLDER, and a placeholder is prose.
+# The consumer teaches the agent this marker in the agent's own preamble, with
+# the value written `<path>` — so an agent asked how to send a file repeats that
+# sentence, unfenced, in an ordinary answer. Acting on it stripped a piece out of
+# the middle of the explanation and appended `[attachment not sent: (path) …]`
+# under it, accusing the agent of a failure that never happened. Nothing is lost
+# by declining: no filesystem has the file `<path>`, so the only two outcomes
+# were a mangled sentence and a false refusal.
+taught = ("To put a file in the room, write [file: <path>] on a line of its "
+          "own and agent-connect attaches it to this reply.")
+parsed = markers.parse(taught)
+check(parsed.attachments == (),
+      "a marker whose value is a placeholder issues nothing")
+check(parsed.body == taught,
+      "and the sentence explaining it is delivered exactly as written: "
+      + repr(parsed.body))
+
+for shown in ("[file: <path>]", "see [send: <absolute path>] for that",
+              "[attach: ~/<name>.png]"):
+    parsed = markers.parse(shown)
+    check(parsed.attachments == () and parsed.body == shown,
+          f"...whichever spelling it is written in ({shown!r})")
+
+check(markers.parse("[file: /a/real<1>.png]").attachments == (),
+      "a real path with angle brackets in it goes the same way — it is left "
+      "whole and visible rather than sent, which is the direction that shows "
+      "up in the room instead of hiding there")
+
 # --- nothing at all
 check(markers.parse("").body == "" and markers.parse(None).actions == (),
       "an empty body parses to nothing, and does not raise")
