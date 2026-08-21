@@ -1,0 +1,81 @@
+name: Publish ag2-agent-connect
+
+# Publishes ag2-agent-connect to PyPI when a `v*` tag is pushed.
+# Auth is PyPI Trusted Publishing (OIDC) — no API token stored in the repo.
+#
+# The filename is part of the credential: PyPI's pending publisher for
+# ag2-agent-connect names `publish-agent-connect.yml` and environment `pypi`,
+# and a rename here silently invalidates the trust relationship. This file was
+# `release.yml` until the publisher was configured against the split name — the
+# repository publishes two distributions and one workflow cannot claim both.
+#
+# The relay client is the sibling workflow, on its own tag prefix:
+# `relay-client-v*` never matches `v*`, so a tag publishes exactly one package.
+#
+# Release flow: bump agent_connect/__version__ (the single source — pyproject
+# reads it dynamically), commit, then `git tag vX.Y.Z && git push --tags`.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Guard — git tag must match the package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(python -c 'import agent_connect; print(agent_connect.__version__)')"
+          echo "tag=$tag  package __version__=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match agent_connect.__version__ ($pkg). Bump __init__.py before tagging."
+            exit 1
+          fi
+
+      - name: Guard — the relay client dependency must be resolvable from PyPI
+        # This package depends on ag2-relay-client, which lives in this same
+        # repository behind a uv path source. `[tool.uv.sources]` is a *dev*
+        # convenience that never reaches published metadata, so a wheel built
+        # before the sibling is on PyPI installs for nobody: pip resolves the
+        # name against the index and finds nothing. That failure is invisible
+        # here — the build and the upload both succeed — and lands on the first
+        # user instead, permanently, because a version number cannot be reused.
+        run: |
+          set -euo pipefail
+          floor="$(python - <<'PY'
+          import re, pathlib
+          text = pathlib.Path("pyproject.toml").read_text()
+          m = re.search(r'"ag2-relay-client([^"]*)"', text)
+          print((m.group(1) if m else "").strip() or "NONE")
+          PY
+          )"
+          echo "declared dependency: ag2-relay-client ${floor}"
+          if [ "$floor" = "NONE" ]; then
+            echo "::error::pyproject declares ag2-relay-client with no version floor. Publish the relay client first (tag relay-client-vX.Y.Z), then pin the floor here."
+            exit 1
+          fi
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip download --no-deps --dest /tmp/relay-probe "ag2-relay-client${floor}" >/dev/null
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1

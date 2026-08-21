@@ -1,0 +1,85 @@
+name: Publish ag2-relay-client
+
+# Publishes ag2-relay-client — the wire library built in `relay-client/` — to
+# PyPI when a `relay-client-v*` tag is pushed.
+#
+# Two distributions live in this repository and each has its own pending
+# publisher on PyPI, keyed by *this filename* plus environment `pypi`. Renaming
+# this file invalidates the trust relationship silently, so it stays
+# `publish-relay-client.yml`.
+#
+# The tag prefix is what keeps the two releases apart: `relay-client-v0.1.0`
+# does not match the sibling workflow's `v*` glob, so one tag publishes exactly
+# one package and versions move independently — which they must, because
+# sutando consumes this library's version and not agent-connect's (workspace
+# ADR 0001).
+#
+# Release flow: bump relay-client/ag2_relay_client/__version__, commit, then
+# `git tag relay-client-vX.Y.Z && git push --tags`.
+
+on:
+  push:
+    tags:
+      - 'relay-client-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi
+    defaults:
+      run:
+        working-directory: relay-client
+    permissions:
+      id-token: write  # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The library's floor is sutando's 3.9, not agent-connect's 3.10 — a
+          # build on a newer interpreter is fine, but the guard below imports
+          # the package to read its version, so nothing here may rely on
+          # syntax the floor cannot parse.
+          python-version: '3.x'
+
+      - name: Guard — git tag must match the package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#relay-client-v}"
+          pkg="$(python -c 'import ag2_relay_client; print(ag2_relay_client.__version__)')"
+          echo "tag=$tag  package __version__=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag relay-client-v$tag does not match ag2_relay_client.__version__ ($pkg). Bump relay-client/ag2_relay_client/__init__.py before tagging."
+            exit 1
+          fi
+
+      - name: Guard — the wire library stays dependency-free
+        # stdlib-only is a contract, not an accident (ADR 0001): sutando will
+        # not take a dependency tree to get a transport. A dependency added by
+        # hand would ship the moment someone tagged, and unshipping a PyPI
+        # version is not a thing.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, re, sys
+          text = pathlib.Path("pyproject.toml").read_text()
+          block = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.S | re.M)
+          if block is None:
+              sys.exit("::error::relay-client/pyproject.toml declares no dependencies key")
+          if block.group(1).strip():
+              sys.exit(f"::error::ag2-relay-client must stay stdlib-only, found: {block.group(1).strip()}")
+          print("dependencies = [] — stdlib-only, as contracted")
+          PY
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: relay-client/dist
