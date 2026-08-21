@@ -49,12 +49,16 @@ REPO="${AGENT_CONNECT_REPO:-$HOME/agents}"
 START=1
 # agent-connect source: overridable so this same script serves both the
 # private-repo phase (git+ssh for repo-holders) and the public phase (PyPI).
-# Worker install source. Default stays the git spec until the PyPI publish
-# (name pending owner confirmation) actually completes — flipping the default
-# to an unpublished package would break every fresh install in the gap. The
-# one-line flip to "ag2-agent-connect>=0.2.0" (or the confirmed name) lands as
-# the publish commit.
-AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-git+https://github.com/ag2-space/agent-connect.git}"
+# Worker install source, flipped to PyPI by the v0.2.0 publish this comment
+# used to wait for. The git spec it replaced installed the repository, and the
+# repository declares a dependency on ag2-relay-client — a name that existed
+# nowhere but the working tree until relay-client-v0.1.0, so every fresh
+# install resolved to "No matching distribution found" no matter how healthy
+# the clone was. Both distributions are on the index now. The floor is repeated
+# here rather than left to pyproject because this line is what a fresh host
+# resolves: without it an installer run can settle on a pre-transport worker
+# that still expects task files.
+AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.2.0}"
 ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-claude}"
 # The ACP bridge that makes Claude Code an ACP Agent, PINNED to an exact
 # version. It renamed itself once already (the older name is dead — do not
