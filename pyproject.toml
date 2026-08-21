@@ -24,23 +24,26 @@ keywords = ["ag2space", "codex", "matrix", "agent", "bridge"]
 # disease its drift tests already treat (ADR 0001). It is stdlib-only, so this
 # adds no dependency tree.
 #
-# It is not on PyPI yet, and a floor of `>=0.1.0` against an unpublished name
-# made `pip install -e .` fail at resolution — which is also why the ACP suites,
-# whose printed remedy is `pip install -e .`, could not be run at all. Until the
-# first release it resolves from the directory beside this one. That keeps it a
-# *version* rather than a copy: the path points at the same distribution the
-# PyPI name will carry, so the swap back is one line and no import moves.
+# Published since relay-client-v0.1.0, so the floor below is a real resolution
+# and not a promise: until that tag the name existed nowhere and `pip install`
+# ended at `No matching distribution found`. Capped below 0.2 for the same
+# reason the ACP SDK is capped below 1.0 — a 0.x library may move its surface
+# in a minor, and the two distributions release from this one repository on
+# separate tags, so nothing but this cap stops an old worker from resolving a
+# library it was never built against.
 dependencies = [
     "agent-client-protocol>=0.12,<1.0",
-    "ag2-relay-client",
+    "ag2-relay-client>=0.1.0,<0.2",
 ]
 
 [tool.uv.sources]
 ag2-relay-client = { path = "relay-client", editable = true }
 
 [tool.pip]
-# pip has no lockfile-independent equivalent of `[tool.uv.sources]`; installing
-# with pip needs the sibling first:
+# pip has no lockfile-independent equivalent of `[tool.uv.sources]`, so plain
+# `pip install -e .` now resolves the *published* library and quietly ignores
+# the working tree beside it. When the change under test is in `relay-client/`,
+# install the sibling first or you are testing PyPI's copy of it:
 #     pip install -e relay-client && pip install -e .
 
 [project.scripts]
