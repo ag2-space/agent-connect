@@ -211,6 +211,90 @@ many = "keep me " + "[room-ops metadata: x] " * 1000 + "and me"
 check(strip_room_ops_meta(many)[0] == "keep me and me",
       "a thousand separate blocks still go in one pass, text intact")
 
+# --- the enrichment fields: carried across, never interpreted --------------
+#
+# Eight fields sutando has serialized into its task files since before this
+# library existed. They are here so that migrating a consumer onto this package
+# is not a silent loss of context — the failure mode a test on neither side
+# would have caught.
+
+plain = parse_task(task_dict())
+check(all(getattr(plain, f) == "" for f in
+          ("session_scope", "interaction_type", "reply_to_sender",
+           "addressed_to", "room_members")),
+      "a wire payload that carries none of them reads them all as absent")
+check(plain.source == "ag2space", "the one the base payload does carry comes through")
+check(plain.room_member_count is None and plain.platform_card is None,
+      "and the two non-strings say absent with None — 0 is a real count and "
+      "{} is a real mapping, so neither can double as 'not sent'")
+
+rich = parse_task(task_dict(
+    session_scope="room",
+    interaction_type="realtime_audio",
+    reply_to_sender="@bob:ag2.space",
+    addressed_to="@carol:ag2.space",
+    room_members="@alice:ag2.space, @bob:ag2.space",
+    room_member_count=7,
+))
+check(rich.session_scope == "room" and rich.interaction_type == "realtime_audio",
+      "each enrichment field arrives verbatim")
+check(rich.reply_to_sender == "@bob:ag2.space"
+      and rich.addressed_to == "@carol:ag2.space"
+      and rich.room_members == "@alice:ag2.space, @bob:ag2.space",
+      "including the three that name people")
+check(rich.room_member_count == 7, "and the count is an int, not its text")
+
+# No vocabulary is enforced here. `interaction_type` HAS one — in the consumer,
+# where the policy belongs, exactly as `access_tier` is passed across verbatim
+# for the consumer to map. A library that whitelisted it would have to pick one
+# consumer's vocabulary and be wrong for the next broker deploy.
+check(parse_task(task_dict(interaction_type="telepathy")).interaction_type
+      == "telepathy",
+      "an interaction type this library has never heard of is still carried — "
+      "the whitelist is the consumer's, and enforcing one here would break on "
+      "the next additive deploy")
+
+check(parse_task(task_dict(room_member_count=True)).room_member_count is None,
+      "a bool is not a count, however much Python says True is 1")
+check(parse_task(task_dict(room_member_count=-1)).room_member_count is None,
+      "nor is a negative one")
+check(parse_task(task_dict(room_member_count=0)).room_member_count == 0,
+      "but a room the broker says is empty is a fact, and survives as one")
+check(parse_task(task_dict(session_scope={"nested": "dict"})).session_scope == "",
+      "a non-string where a string belongs reads as absent, never as its repr")
+check("\n" not in parse_task(task_dict(
+          room_members="@a:x\nfake_header: yes")).room_members,
+      "and a newline cannot ride in — a consumer writes these into a "
+      "line-oriented file where one would forge a second header")
+check(len(parse_task(task_dict(room_members="@a:x " * 4000)).room_members) <= 4096,
+      "the member list is bounded: a field that is a list in spirit must not "
+      "arrive the size of a message")
+
+CARD = {"card_url": "https://x/card.json", "card_sha256": "abc",
+        "sig": "sig", "key_id": "k1", "alg": "ed25519"}
+
+check(parse_task(task_dict(platform_card=dict(CARD))).platform_card == CARD,
+      "a complete platform card crosses with all five keys")
+for missing in CARD:
+    partial = {k: v for k, v in CARD.items() if k != missing}
+    check(parse_task(task_dict(platform_card=partial)).platform_card is None,
+          f"a card missing {missing} is not a card — it is an unverifiable "
+          f"claim, and absent is the honest answer")
+check(parse_task(task_dict(platform_card={**CARD, "extra": "hope"})).platform_card
+      == CARD,
+      "and a sixth key somebody hoped would pass through is dropped, so what "
+      "a consumer re-serializes is a shape it did not have to decide about")
+check(parse_task(task_dict(platform_card={**CARD, "sig": 42})).platform_card is None,
+      "a non-string signature reads as no card at all")
+check(parse_task(task_dict(platform_card="a string")).platform_card is None,
+      "and so does a card that is not a mapping")
+
+# G3 still holds with eight more fields in the envelope: additive-only, no
+# version field, unknown fields ignored.
+check(parse_task(task_dict(lease_id="l-9", some_future_field={"x": 1})) is not None,
+      "an unknown field still does not break a running client (G3)")
+
+
 check(Task("task-1") == Task("task-1"), "two Tasks with the same fields are equal")
 check(Task("task-1") != Task("task-2"), "and differ when they differ")
 

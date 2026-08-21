@@ -27,8 +27,11 @@ this is where a wire dict becomes a `Task`:
 broker's attestation and this library passes them across the seam unchanged —
 the trust *mapping* is the consumer's, and the two consumers of this package
 answer it differently on purpose (agent-connect honors the attestation per its
-ADR 0003; sutando's shim ignores the wire tier by local policy). A library that
-mapped the tier itself would have to pick one of them and break the other. The
+ADR 0003; sutando's shim honors it too but caps it against the host owner's
+per-sender map, which can re-tier a sender downward and never upward). A library
+that mapped the tier itself would have to pick one of them and break the other,
+and the same reasoning applies to every enrichment field `Task` carries: they
+cross this seam as data. The
 value's *shape* is bounded — a str, control characters removed, length-capped —
 which changes no legitimate value and keeps an attacker-shaped one small.
 """
@@ -68,6 +71,17 @@ DEFAULT_PRIORITY = "normal"
 MAX_TEXT = 64 * 1024
 MAX_SHORT = 256
 MAX_TIER = 64
+#: Room membership arrives as one preformatted line the broker has already
+#: capped. It is longer than a name and shorter than a body, and it gets its own
+#: bound rather than borrowing `MAX_TEXT`: a field that is a *list* in spirit
+#: should not be able to arrive the size of a message.
+MAX_LIST = 4 * 1024
+
+#: The five keys a platform card is made of. All five or it is not a card — a
+#: partial one is a pointer with a missing signature, and the consumer that
+#: re-serializes it (sutando writes it as a one-line JSON header) would be
+#: publishing an unverifiable claim in a field that exists to be verifiable.
+PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -167,6 +181,10 @@ class Task:
         "priority", "timestamp", "room_name", "sender_name", "reply_to_event",
         "reply_to_me", "source_message_id", "attempt", "metadata_stripped",
         "attachments",
+        # Context the broker enriches a task with. Carried, never interpreted:
+        # see the block comment in `__init__` below.
+        "session_scope", "source", "interaction_type", "reply_to_sender",
+        "addressed_to", "room_members", "room_member_count", "platform_card",
     )
 
     def __init__(
@@ -189,6 +207,14 @@ class Task:
         attempt: int = 0,
         metadata_stripped: bool = False,
         attachments: Tuple = (),
+        session_scope: str = "",
+        source: str = "",
+        interaction_type: str = "",
+        reply_to_sender: str = "",
+        addressed_to: str = "",
+        room_members: str = "",
+        room_member_count: Optional[int] = None,
+        platform_card: Optional[Mapping[str, str]] = None,
     ):
         self.id = id
         #: The message text, metadata blocks removed (G2).
@@ -227,6 +253,47 @@ class Task:
         #: `parse_task` reads the wire, and the wire has no attachment field at
         #: all. See `media.py`.
         self.attachments = tuple(attachments)
+
+        # --- context the broker enriches a task with ----------------------
+        #
+        # Eight fields this library carries and has no opinion about. They are
+        # here because a consumer already serializes all eight into local state
+        # (sutando's task files, since long before this package existed), and a
+        # library that dropped them would make migrating onto it a quiet loss of
+        # context that no test on either side would catch.
+        #
+        # Carried, never interpreted: no vocabulary is enforced, no default is
+        # substituted, no field gates anything. `interaction_type` in particular
+        # has a whitelist — in the *consumer*, where the policy belongs, for the
+        # same reason `access_tier` is passed across verbatim.
+        #
+        # `""` means "the broker did not send it", which is exactly the test a
+        # consumer applies before writing a header, so absence survives the trip
+        # rather than turning into an empty header. The two non-strings say the
+        # same thing with `None`, because `0` is a real member count and `{}` is
+        # a real (if useless) mapping.
+
+        #: `"room"` scopes the task to a room session; anything else is the
+        #: main-session path. The value, not the decision.
+        self.session_scope = session_scope
+        #: Which surface the task came from. A consumer with its own default
+        #: applies it; this library has none to apply.
+        self.source = source
+        #: `message`, `realtime_audio`, … — the broker's word for what this is.
+        self.interaction_type = interaction_type
+        #: Who wrote the message this one replies to.
+        self.reply_to_sender = reply_to_sender
+        #: The peer the broker resolved this reply's target to. Addressing
+        #: context; it grants and withholds nothing by itself.
+        self.addressed_to = addressed_to
+        #: A one-line, broker-capped mxid list.
+        self.room_members = room_members
+        #: The true joined total, which the capped list above does not imply.
+        #: `None` is "not sent" and `0` is a room the broker says is empty.
+        self.room_member_count = room_member_count
+        #: The signed platform-metadata pointer: all five of
+        #: `PLATFORM_CARD_KEYS`, or `None`. Never partial — see the constant.
+        self.platform_card = platform_card
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<Task {self.id} room={self.room_id} tier={self.access_tier!r}>"
@@ -283,6 +350,14 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
                                 or raw.get("source_event_id")),
         attempt=_attempt(raw.get("attempt")),
         metadata_stripped=stripped,
+        session_scope=_text(raw.get("session_scope")),
+        source=_text(raw.get("source")),
+        interaction_type=_text(raw.get("interaction_type")),
+        reply_to_sender=_text(raw.get("reply_to_sender")),
+        addressed_to=_text(raw.get("addressed_to")),
+        room_members=_text(raw.get("room_members"), MAX_LIST),
+        room_member_count=_count(raw.get("room_member_count")),
+        platform_card=_platform_card(raw.get("platform_card")),
     )
 
 
@@ -291,3 +366,37 @@ def _attempt(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
     return value if 0 <= value < 10 ** 6 else 0
+
+
+def _count(value: Any) -> Optional[int]:
+    """A non-negative member count, or `None` for "the broker did not say".
+
+    `None` rather than `0`, because a consumer writes this field only when the
+    broker sent it and `0` is a thing the broker can send. A bool is not a
+    count: `True` is `1` to Python and nothing to a room.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value < 10 ** 9 else None
+
+
+def _platform_card(value: Any) -> Optional[Mapping[str, str]]:
+    """The signed metadata pointer, all five keys or `None`.
+
+    Every value is taken as a bounded string and any extra key is dropped, so
+    what comes out is the shape a consumer can re-serialize without deciding
+    anything: a partial card, a card with a non-string `sig`, or a card with a
+    sixth field somebody hoped would be passed through, all read as absent or
+    are trimmed back to the five. The card is *not* verified here — this library
+    has no key material and inventing a verdict would be worse than carrying the
+    claim across for something that does.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    card = {}
+    for key in PLATFORM_CARD_KEYS:
+        held = value.get(key)
+        if not isinstance(held, str) or not held.strip():
+            return None
+        card[key] = _text(held)
+    return card
