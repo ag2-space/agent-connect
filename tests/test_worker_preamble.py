@@ -1,10 +1,14 @@
 """Tests for the sandbox preamble + its wiring through process_one.
 
-Run: python3 test_worker_preamble.py
+Run: python3 tests/test_worker_preamble.py
 """
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
+import asyncio
 import tempfile
 from pathlib import Path
 
+from _taskqueue import task
+from agent_connect.adapters import ShimAdapter
 from agent_connect.worker import process_one, sandbox_preamble
 
 fails = 0
@@ -34,18 +38,20 @@ class StubAdapter:
 
 
 tmp = Path(tempfile.mkdtemp())
-tasks, results = tmp / "tasks", tmp / "results"
-tasks.mkdir(); results.mkdir()
-tf = tasks / "task-p1.txt"
-tf.write_text("id: task-p1\ntask: do the thing\nsource: ag2space\naccess_tier: owner\n")
+results = tmp / "results"
+results.mkdir()
 stub = StubAdapter()
-process_one(tf, stub, "/repo", results)
+# The seam is asynchronous now, and a synchronous adapter reaches it through
+# the shim — but what the adapter is handed, and what comes back as the answer,
+# are unchanged, which is what these assertions are about.
+answer = asyncio.run(process_one(task("task-p1", "do the thing"),
+                                 ShimAdapter("stub", stub), "/repo"))
 sent_task, sent_sandbox, _ = stub.calls[0]
 check(sent_sandbox == "workspace-write", "owner task → workspace-write sandbox arg")
 check(sent_task.startswith("[agent-connect: this run's sandbox is 'workspace-write'"),
       "prompt starts with the authoritative preamble")
 check(sent_task.endswith("do the thing"), "original task body preserved after preamble")
-check((results / "task-p1.txt").read_text() == "stub-output\n", "result written")
+check(answer == "stub-output", "and the answer is what the adapter produced")
 
 print("\n" + ("PASS — preamble green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

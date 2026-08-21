@@ -6,6 +6,7 @@ Regression test for the 0.1.0/0.2.0 skew where ``pyproject.toml`` was bumped but
 These asserts fail loudly if anyone re-hardcodes a static ``version =`` in
 ``[project]`` (which would let the two drift again).
 """
+import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 import pathlib
 import re
 
@@ -13,7 +14,7 @@ import pytest
 
 import agent_connect
 
-PYPROJECT = pathlib.Path(__file__).parent / "pyproject.toml"
+PYPROJECT = _bootstrap.ROOT / "pyproject.toml"
 # PEP 440 (common subset): 0.2.0, 1.2.3rc1, 0.2.0.post1 ...
 _PEP440 = re.compile(r"^\d+(\.\d+)*([abc]|rc)?\d*(\.post\d+)?(\.dev\d+)?$")
 

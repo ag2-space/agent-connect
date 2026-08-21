@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ag2-relay-client"
+dynamic = ["version"]
+description = "The AG2 Space relay wire, as a library: poll, lease, ack, results, heartbeat, media, Room Ops."
+readme = "README.md"
+# sutando's floor, not agent-connect's. The library is published so sutando can
+# consume a *version* of this wire rather than a copy of it, and sutando runs on
+# 3.9 — a 3.10 floor here would make that impossible.
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["ag2space", "relay", "broker", "agent", "matrix"]
+# Empty, and it stays empty. sutando will not take a dependency tree to get a
+# transport, so this package is stdlib-only (urllib) by contract, not by
+# accident. agent-connect itself has a dependency (the ACP SDK); this
+# distribution is separate precisely so that choice does not travel with the
+# wire.
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["ag2_relay_client*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ag2_relay_client.__version__" }
