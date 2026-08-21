@@ -85,6 +85,12 @@ PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+#: A count exactly as the wire spells it: ASCII digits, bounded, nothing
+#: around them. Not `str.isdigit()`, which is True for `"\u00b2"` and raises
+#: inside `int()`; and no stripping, because the writer pads nothing and a
+#: padded value is a shape this client does not know.
+_COUNT_RE = re.compile(r"[0-9]{1,9}")
+
 
 def _text(value: Any, limit: int = MAX_SHORT, keep_newlines: bool = False) -> str:
     """A wire value as a bounded string, or `""`.
@@ -374,7 +380,16 @@ def _count(value: Any) -> Optional[int]:
     `None` rather than `0`, because a consumer writes this field only when the
     broker sent it and `0` is a thing the broker can send. A bool is not a
     count: `True` is `1` to Python and nothing to a room.
+
+    A plain decimal string is a count. The intake that enriches a task writes
+    this one as `str(len(members))` — every live task carries the total as
+    text — so int-only reading dropped the field for all of them, silently,
+    which is the loss carrying it here exists to prevent. Only that shape:
+    a sign, a fraction, an exponent or surrounding whitespace is refused, the
+    same as any other value the broker did not send.
     """
+    if isinstance(value, str) and _COUNT_RE.fullmatch(value):
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if 0 <= value < 10 ** 9 else None

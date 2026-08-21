@@ -260,6 +260,14 @@ check(parse_task(task_dict(room_member_count=-1)).room_member_count is None,
       "nor is a negative one")
 check(parse_task(task_dict(room_member_count=0)).room_member_count == 0,
       "but a room the broker says is empty is a fact, and survives as one")
+check(parse_task(task_dict(room_member_count="14")).room_member_count == 14,
+      "and the count as the wire actually spells it — the intake writes "
+      "str(len(members)), so int-only reading dropped it for every live task")
+check(all(parse_task(task_dict(room_member_count=v)).room_member_count is None
+          for v in ("", " 14", "14 ", "+14", "-1", "7.0", "1e3", "\u00b2",
+                    "12abc", "0x1f", "9" * 40)),
+      "but only a plain bounded decimal: a sign, padding, a fraction, an "
+      "exponent or a digit that is not ASCII is still absent, fail-closed")
 check(parse_task(task_dict(session_scope={"nested": "dict"})).session_scope == "",
       "a non-string where a string belongs reads as absent, never as its repr")
 check("\n" not in parse_task(task_dict(

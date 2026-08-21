@@ -75,6 +75,8 @@ not send it, so absence survives the trip; `room_member_count` and
 `platform_card` say the same with `None`, because `0` and `{}` are real values.
 A platform card arrives whole or not at all: all five of `card_url`,
 `card_sha256`, `sig`, `key_id`, `alg`, never partially, and never verified here.
+`room_member_count` is accepted as the plain decimal string the broker writes
+it as, and as nothing looser.
 
 The queue is a **handoff, not durability**. What survives a restart is the
 journal under the state dir, and the promise attached to it is worth stating
