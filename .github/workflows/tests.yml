@@ -1,0 +1,133 @@
+name: Tests
+
+# Every suite in this repository, on every pull request. Until this existed a
+# 31k-line transport/ACP migration could go to review with no checks at all, and
+# one of the two things that found is the reason the matrices below are shaped
+# the way they are (review of #12).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push supersedes the run it interrupted; nothing here is worth finishing
+# for a commit that has already been replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  relay-client:
+    # No install step, and that is the test. `ag2-relay-client` is stdlib-only
+    # by contract rather than by accident (its pyproject says so, and
+    # test_packaging.py asserts it), so running the suite against a bare
+    # interpreter is what would notice the first import that breaks the promise.
+    #
+    # 3.9 is its declared floor and it is not this package's floor — it is
+    # sutando's, which is the consumer the separate distribution exists for. A
+    # claim no job exercises is a claim that decays.
+    name: relay-client (py${{ matrix.python }}, no deps)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the suite
+        working-directory: relay-client
+        run: |
+          fail=0
+          for t in tests/test_*.py; do
+            echo "::group::$t"
+            python "$t" || { fail=1; echo "::error file=relay-client/$t::suite failed"; }
+            echo "::endgroup::"
+          done
+          exit $fail
+
+  worker:
+    # Both documented install paths, deliberately. They are not two spellings of
+    # one thing: uv installs a python-build-standalone interpreter, which links
+    # extension modules like `_queue` *statically*, so `BuiltinImporter` answers
+    # for them ahead of anything on `sys.path`; setup-python's build ships them
+    # as shared objects under `lib-dynload`, where `sys.path` order decides. A
+    # test helper whose name collides with a stdlib module therefore passes on
+    # one and cannot even import on the other — which is exactly how 14 suites
+    # came to be unrunnable while a local run reported everything green.
+    name: worker (py${{ matrix.python }}, ${{ matrix.install }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13']   # the floor and the ceiling of requires-python
+        install: [uv, pip]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        if: matrix.install == 'pip'
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: astral-sh/setup-uv@v5
+        if: matrix.install == 'uv'
+
+      # Both distributions, both times. The Worker depends on the transport, and
+      # a run that installed only one of them would test an arrangement nobody
+      # ships.
+      - name: Install (uv)
+        if: matrix.install == 'uv'
+        run: |
+          # only-managed pins the statically-linked build on purpose — see above.
+          uv python install ${{ matrix.python }}
+          uv sync --python ${{ matrix.python }} --python-preference only-managed
+          uv pip install pytest
+
+      - name: Install (pip)
+        if: matrix.install == 'pip'
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e relay-client
+          .venv/bin/python -m pip install -e .
+          .venv/bin/python -m pip install pytest
+
+      - name: Show what the interpreter actually resolves
+        run: |
+          .venv/bin/python -c "import sys, _queue; \
+            print('python  ', sys.version.split()[0]); \
+            print('_queue  ', 'builtin' if '_queue' in sys.builtin_module_names \
+                  else getattr(_queue, '__file__', '?'))"
+
+      - name: Run the Worker suite
+        run: |
+          fail=0
+          for t in tests/test_*.py; do
+            echo "::group::$t"
+            .venv/bin/python "$t" || { fail=1; echo "::error file=$t::suite failed"; }
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      - name: Run the relay-client suite against the same install
+        working-directory: relay-client
+        run: |
+          fail=0
+          for t in tests/test_*.py; do
+            ../.venv/bin/python "$t" || { fail=1; echo "::error file=relay-client/$t::suite failed"; }
+          done
+          exit $fail
+
+  installer:
+    # Hermetic: it stubs pipx, npm and the installed bins onto PATH, so this
+    # neither reaches the network nor installs anything.
+    name: install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh install.test.sh
