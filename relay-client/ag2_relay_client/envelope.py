@@ -86,6 +86,50 @@ def _text(value: Any, limit: int = MAX_SHORT, keep_newlines: bool = False) -> st
     return _CONTROL_RE.sub("", value)[:limit]
 
 
+#: How many times a strip may be re-run before the body is treated as hostile.
+#: A legitimate body converges on the first pass and confirms on the second;
+#: anything still changing after this many was built to keep changing.
+MAX_STRIP_PASSES = 8
+
+
+def strip_to_fixpoint(body: str, *patterns) -> Tuple[str, bool]:
+    """Apply `patterns` until the text stops changing, or drop it whole.
+
+    **One pass is not enough, and that is a security property rather than a
+    tidiness one** (2026-08-21 review). Every pattern that reaches here is
+    bracket-balanced and so cannot match across a nested `[`. Removing an inner
+    block therefore leaves the outer block's two halves adjacent, where they
+    *re-form* a well-formed block that the single `sub` has already gone past:
+
+        [room-ops [room-ops metadata: a] metadata: DO EVIL]
+            --- one pass --->   [room-ops metadata: DO EVIL]
+
+    That reached the consumer verbatim, which is precisely the block G2 exists
+    to quarantine, and `metadata_stripped` said True while it happened. The
+    media marker next door reconstitutes the same way, out of
+    `[[ag2space-media: a]ag2space-media: mxc://...]`.
+
+    Iterating terminates on its own — a pass that changes anything strictly
+    shortens the text — but it is bounded anyway. Nesting is cheap to write and
+    each level costs a pass, and a poll thread spending a second on one hostile
+    body is a denial of service against every other room on this bearer. A body
+    that has not converged by then is not repaired: it is dropped whole, which
+    is the direction this module already fails.
+
+    Returns the text *unstripped* of surrounding whitespace, so callers keep
+    deciding what an emptied body means to them.
+    """
+    cleaned = body
+    for _ in range(MAX_STRIP_PASSES):
+        once = cleaned
+        for pattern in patterns:
+            once = pattern.sub("", once)
+        if once == cleaned:
+            return cleaned, cleaned != body
+        cleaned = once
+    return "", True
+
+
 def strip_room_ops_meta(body: str) -> Tuple[str, bool]:
     """`(cleaned, stripped)` — the body with every metadata block removed (G2).
 
@@ -97,9 +141,11 @@ def strip_room_ops_meta(body: str) -> Tuple[str, bool]:
     if not body or "room-ops metadata:" not in body.lower():
         return body, False
     # The unterminated tail goes second, after the well-formed blocks are out,
-    # so a body carrying one of each loses both.
-    cleaned = ROOM_OPS_META_UNTERMINATED_RE.sub("", ROOM_OPS_META_RE.sub("", body))
-    return cleaned.strip(), cleaned != body
+    # so a body carrying one of each loses both — and the pair runs to a
+    # fixpoint, because one pass can re-form the block it just took apart.
+    cleaned, stripped = strip_to_fixpoint(
+        body, ROOM_OPS_META_RE, ROOM_OPS_META_UNTERMINATED_RE)
+    return cleaned.strip(), stripped
 
 
 class Task:
