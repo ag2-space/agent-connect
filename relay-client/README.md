@@ -56,6 +56,26 @@ the text its agent wrote and never touches a marker, a path this library has not
 judged, or the wire. `base_dir=` is what a relative path in a marker is read
 against; it widens nothing.
 
+### What a Task carries
+
+`id`, `body` and `room_id` are what a simple consumer needs. Around them the
+envelope carries what the broker attests about the sender — `user_id`,
+`access_tier`, `requested_access_tier`, `collaborator`,
+`sensitive_data_filter` — and what it enriches the message with: `source`,
+`session_scope`, `interaction_type`, `priority`, `timestamp`, `room_name`,
+`sender_name`, `room_members`, `room_member_count`, `reply_to_event`,
+`reply_to_me`, `reply_to_sender`, `addressed_to`, `source_message_id`,
+`platform_card`, `attempt`. Plus `attachments`, which the media stage fills.
+
+All of it crosses **as data**. This library maps none of it to a decision: the
+tier is an attestation and not a permission, the interaction type has no
+whitelist here, and an unknown field on the wire is ignored rather than fatal —
+the envelope is additive-only and carries no version. `""` means the broker did
+not send it, so absence survives the trip; `room_member_count` and
+`platform_card` say the same with `None`, because `0` and `{}` are real values.
+A platform card arrives whole or not at all: all five of `card_url`,
+`card_sha256`, `sig`, `key_id`, `alg`, never partially, and never verified here.
+
 The queue is a **handoff, not durability**. What survives a restart is the
 journal under the state dir, and the promise attached to it is worth stating
 plainly:
