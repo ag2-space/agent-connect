@@ -29,7 +29,7 @@ try:
     from agent_connect.adapters.acp import REFUSAL, AcpAdapter, command_from_env
     from agent_connect.acp.core import AcpError
     from agent_connect.sessions import SessionStore
-    from _queue import task as queued_task
+    from _taskqueue import task as queued_task
     from agent_connect.worker import handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(

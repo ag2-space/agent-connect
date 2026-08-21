@@ -41,8 +41,8 @@ try:
     from agent_connect.reporter import PLACEHOLDER, REPLIED, STOP_LINES, LadderSettings
     from agent_connect.events import REFUSED
     from agent_connect.sessions import SessionStore
-    from _queue import room_ops_at
-    from _queue import task as queued_task
+    from _taskqueue import room_ops_at
+    from _taskqueue import task as queued_task
     from agent_connect.worker import GUEST, OWNER, handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(

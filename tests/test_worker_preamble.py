@@ -7,7 +7,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 
-from _queue import task
+from _taskqueue import task
 from agent_connect.adapters import ShimAdapter
 from agent_connect.worker import process_one, sandbox_preamble
 

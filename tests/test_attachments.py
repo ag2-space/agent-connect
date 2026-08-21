@@ -40,7 +40,7 @@ import agent_connect
 from agent_connect import attachments
 from agent_connect.adapters.shim import ShimAdapter
 from agent_connect.attachments import Attachment
-from _queue import task
+from _taskqueue import task
 from agent_connect.worker import handle_one, turn_context
 
 fails = 0

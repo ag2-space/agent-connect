@@ -19,7 +19,7 @@ Run: python3 tests/test_worker_task.py
 """
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 
-from _queue import task
+from _taskqueue import task
 from ag2_relay_client.media import Attachment as Resolved
 from agent_connect.events import Attachment
 from agent_connect.worker import attested_tier, task_attachments, turn_context

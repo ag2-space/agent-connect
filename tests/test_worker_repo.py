@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from unittest import mock
 
-from _queue import child_env
+from _taskqueue import child_env
 from agent_connect.worker import _resolve_repo
 
 fails = 0

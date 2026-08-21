@@ -15,7 +15,7 @@ being tested up here is the Worker, and the Worker's whole knowledge of the wire
 is these five methods.
 
     import _bootstrap  # noqa: F401
-    from _queue import FakeClient, task
+    from _taskqueue import FakeClient, task
 
     client = FakeClient()
     body = asyncio.run(handle_one(task("t1", "do it"), adapter, "/repo",

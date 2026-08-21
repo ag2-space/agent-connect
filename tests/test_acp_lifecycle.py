@@ -37,8 +37,8 @@ try:
     from agent_connect.adapters.acp import DEFAULT_TIMEOUT, TIMEOUT_ENV, AcpAdapter
     from agent_connect.reporter import NO_SEND, PLACEHOLDER, REPLIED, LadderSettings
     from agent_connect.sessions import SessionSettings, SessionStore
-    from _queue import room_ops_at
-    from _queue import task as queued_task
+    from _taskqueue import room_ops_at
+    from _taskqueue import task as queued_task
     from agent_connect.worker import handle_one, process_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(

@@ -49,7 +49,7 @@ from agent_connect.reporter import (
     LadderSettings,
     TurnReporter,
 )
-from _queue import FakeClient, room_ops_at, task
+from _taskqueue import FakeClient, room_ops_at, task
 from agent_connect.worker import handle_one, process_one
 
 ROOM_A = "!alpha:ag2.space"

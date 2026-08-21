@@ -27,7 +27,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from _queue import child_env
+from _taskqueue import child_env
 from agent_connect.config import CONFIG_ENV, Config, accepts, locate, parse
 
 ROOT = _bootstrap.ROOT

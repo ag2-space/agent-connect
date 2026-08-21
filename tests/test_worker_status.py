@@ -30,7 +30,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from _queue import CHILD_TOKEN, child_env
+from _taskqueue import CHILD_TOKEN, child_env
 from agent_connect.status import (
     DEFAULT_HEARTBEAT,
     ERROR,

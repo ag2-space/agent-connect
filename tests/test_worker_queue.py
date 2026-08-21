@@ -1,6 +1,6 @@
 """The Worker on the real Relay Client, at the seam between them.
 
-Everything else in this suite drives the Worker through `_queue.FakeClient`,
+Everything else in this suite drives the Worker through `_taskqueue.FakeClient`,
 which is the right trade almost everywhere — the Worker's knowledge of the wire
 is five methods, and a test of Session queueing should not need a broker. But a
 hand-written stand-in only proves the Worker agrees with *itself*. This file

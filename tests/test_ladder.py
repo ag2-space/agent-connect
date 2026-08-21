@@ -40,7 +40,7 @@ from agent_connect.events import (
     TurnContext,
 )
 from agent_connect.reporter import PLACEHOLDER, REPLIED, LadderSettings, TurnReporter
-from _queue import FakeClient, room_ops_at, task
+from _taskqueue import FakeClient, room_ops_at, task
 from agent_connect import relay as relay_module
 from agent_connect.roomops import room_ops_for
 from agent_connect.worker import handle_one, process_one

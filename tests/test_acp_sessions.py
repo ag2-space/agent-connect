@@ -41,8 +41,8 @@ try:
         store_path,
         workspace_dir,
     )
-    from _queue import room_ops_at
-    from _queue import task as queued_task
+    from _taskqueue import room_ops_at
+    from _taskqueue import task as queued_task
     from agent_connect.worker import handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
     raise SystemExit(

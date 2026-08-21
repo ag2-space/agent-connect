@@ -21,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 
-from _queue import FakeClient, task
+from _taskqueue import FakeClient, task
 from ag2_relay_client import media
 from agent_connect import events as ev
 from agent_connect.adapters import ADAPTERS, ShimAdapter, get as get_adapter
