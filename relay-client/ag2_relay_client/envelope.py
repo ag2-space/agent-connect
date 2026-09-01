@@ -191,6 +191,7 @@ class Task:
         # see the block comment in `__init__` below.
         "session_scope", "source", "interaction_type", "reply_to_sender",
         "addressed_to", "room_members", "room_member_count", "platform_card",
+        "thread_root", "source_room_id",
     )
 
     def __init__(
@@ -221,6 +222,8 @@ class Task:
         room_members: str = "",
         room_member_count: Optional[int] = None,
         platform_card: Optional[Mapping[str, str]] = None,
+        thread_root: str = "",
+        source_room_id: str = "",
     ):
         self.id = id
         #: The message text, metadata blocks removed (G2).
@@ -262,8 +265,8 @@ class Task:
 
         # --- context the broker enriches a task with ----------------------
         #
-        # Eight fields this library carries and has no opinion about. They are
-        # here because a consumer already serializes all eight into local state
+        # Ten fields this library carries and has no opinion about. They are
+        # here because a consumer already serializes all ten into local state
         # (sutando's task files, since long before this package existed), and a
         # library that dropped them would make migrating onto it a quiet loss of
         # context that no test on either side would catch.
@@ -300,6 +303,16 @@ class Task:
         #: The signed platform-metadata pointer: all five of
         #: `PLATFORM_CARD_KEYS`, or `None`. Never partial — see the constant.
         self.platform_card = platform_card
+        #: The thread the message was posted in, as the root event's id, and
+        #: the room that root lives in. Membership, distinct from the reply
+        #: fact: without it a consumer cannot tell an in-thread ask from a
+        #: top-level one, and every answer it writes leaves the thread. The
+        #: room travels beside the root because an event id cannot prove its
+        #: own room. Ingress only — the broker inherits the route by task id,
+        #: so a consumer that echoed these back could name a thread it was not
+        #: asked in.
+        self.thread_root = thread_root
+        self.source_room_id = source_room_id
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<Task {self.id} room={self.room_id} tier={self.access_tier!r}>"
@@ -364,6 +377,8 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
         room_members=_text(raw.get("room_members"), MAX_LIST),
         room_member_count=_count(raw.get("room_member_count")),
         platform_card=_platform_card(raw.get("platform_card")),
+        thread_root=_text(raw.get("thread_root")),
+        source_room_id=_text(raw.get("source_room_id")),
     )
 
 

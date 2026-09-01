@@ -65,7 +65,8 @@ envelope carries what the broker attests about the sender — `user_id`,
 `session_scope`, `interaction_type`, `priority`, `timestamp`, `room_name`,
 `sender_name`, `room_members`, `room_member_count`, `reply_to_event`,
 `reply_to_me`, `reply_to_sender`, `addressed_to`, `source_message_id`,
-`platform_card`, `attempt`. Plus `attachments`, which the media stage fills.
+`thread_root`, `source_room_id`, `platform_card`, `attempt`. Plus
+`attachments`, which the media stage fills.
 
 All of it crosses **as data**. This library maps none of it to a decision: the
 tier is an attestation and not a permission, the interaction type has no
@@ -76,7 +77,9 @@ not send it, so absence survives the trip; `room_member_count` and
 A platform card arrives whole or not at all: all five of `card_url`,
 `card_sha256`, `sig`, `key_id`, `alg`, never partially, and never verified here.
 `room_member_count` is accepted as the plain decimal string the broker writes
-it as, and as nothing looser.
+it as, and as nothing looser. `thread_root` and `source_room_id` are ingress
+only: the broker inherits a result's route from the task id, and a consumer
+that echoed them back could name a thread it was not asked in.
 
 The queue is a **handoff, not durability**. What survives a restart is the
 journal under the state dir, and the promise attached to it is worth stating

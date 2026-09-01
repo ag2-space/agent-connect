@@ -221,7 +221,7 @@ check(strip_room_ops_meta(many)[0] == "keep me and me",
 plain = parse_task(task_dict())
 check(all(getattr(plain, f) == "" for f in
           ("session_scope", "interaction_type", "reply_to_sender",
-           "addressed_to", "room_members")),
+           "addressed_to", "room_members", "thread_root", "source_room_id")),
       "a wire payload that carries none of them reads them all as absent")
 check(plain.source == "ag2space", "the one the base payload does carry comes through")
 check(plain.room_member_count is None and plain.platform_card is None,
@@ -243,6 +243,26 @@ check(rich.reply_to_sender == "@bob:ag2.space"
       and rich.room_members == "@alice:ag2.space, @bob:ag2.space",
       "including the three that name people")
 check(rich.room_member_count == 7, "and the count is an int, not its text")
+
+# Thread membership is its own fact, beside the reply fact. The intake writes
+# the root's id and the root's room together, because an event id cannot
+# prove its own room; a consumer that read one without the other could put a
+# redirected answer inside a thread in a different room.
+threaded = parse_task(task_dict(
+    reply_to_event="$inner:ag2.space",
+    thread_root="$root:ag2.space",
+    source_room_id="!room:ag2.space",
+))
+check(threaded.thread_root == "$root:ag2.space"
+      and threaded.source_room_id == "!room:ag2.space",
+      "an in-thread ask carries the thread root and the room it lives in")
+check(threaded.reply_to_event == "$inner:ag2.space"
+      and threaded.thread_root != threaded.reply_to_event,
+      "distinct from the reply target: a reply inside a thread names both")
+check(parse_task(task_dict(thread_root={"event_id": "$root:ag2.space"})).thread_root == "",
+      "a shape that is not a string is absent, not str()'d into a header")
+check(parse_task(task_dict(thread_root="$root\x00:ag2.space")).thread_root == "$root:ag2.space",
+      "and a control character does not travel inside an event id")
 
 # No vocabulary is enforced here. `interaction_type` HAS one — in the consumer,
 # where the policy belongs, exactly as `access_tier` is passed across verbatim
