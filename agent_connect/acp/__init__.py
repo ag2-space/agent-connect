@@ -6,6 +6,7 @@ directly and must not have to import an Adapter to do it.
 """
 from .core import (  # noqa: F401
     AcpAgentGone,
+    AcpAuthRequired,
     AcpClient,
     AcpError,
     AgentDescription,
@@ -21,6 +22,7 @@ __all__ = [
     "Decision",
     "WorkingDirectoryPolicy",
     "AcpAgentGone",
+    "AcpAuthRequired",
     "AcpClient",
     "AcpError",
     "AgentDescription",

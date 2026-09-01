@@ -71,6 +71,25 @@ class AcpAgentGone(AcpError):
     """The ACP Agent process died, or its stdio closed, with work outstanding."""
 
 
+#: JSON-RPC code the protocol reserves for "you are not authenticated"
+#: (`acp.RequestError.auth_required`). Matched on the code rather than the
+#: message: the wording is the Agent's to change, the code is the protocol's.
+AUTH_REQUIRED_CODE = -32000
+
+
+class AcpAuthRequired(AcpError):
+    """The ACP Agent refused the work because the Client is not authenticated.
+
+    Separate from `AcpError` because it is the one protocol failure with a
+    *specific* thing for the operator to do, and because it can arrive after
+    `initialize` said nothing was needed — an Agent may advertise no
+    `authMethods` and still refuse the first `session/prompt`. Observed against
+    `@agentclientprotocol/claude-agent-acp` with a fresh `CLAUDE_CONFIG_DIR`:
+    `authMethods: []`, so the startup check passes, and then the first Turn
+    fails here. Callers turn this into login advice instead of a raw error.
+    """
+
+
 @dataclass(frozen=True)
 class AgentDescription:
     """What the ACP Agent said about itself at `initialize`."""
@@ -429,6 +448,8 @@ class AcpClient:
                 try:
                     return call.result()
                 except acp.RequestError as exc:
+                    if getattr(exc, "code", None) == AUTH_REQUIRED_CODE:
+                        raise AcpAuthRequired(str(exc)) from exc
                     raise AcpError(str(exc)) from exc
                 except (ConnectionError, EOFError) as exc:
                     # The transport noticed the closed pipe before `wait()`

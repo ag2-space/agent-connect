@@ -34,6 +34,7 @@ answers every prompt with one message and stops with `end_turn`.
       "agentCapabilities": {...},     # merged over the default capabilities
       "authMethods": [...],           # advertised by initialize
       "newSessionError": {"code": -32000, "message": "..."},
+      "promptError":     {"code": -32000, "message": "..."},
       "loadSessionError": {...},      # refuse Session resumption
       "loadSessionReplay": [ <update>, ... ],   # replayed history on resume
       "sessionPrefix": "roomA",       # how session ids are named (default
@@ -336,6 +337,12 @@ class FakeAcpAgent:
 
     async def _prompt(self, params: dict) -> dict:
         session_id = params.get("sessionId")
+        # An agent that advertised no auth method at `initialize` and refuses
+        # only when real work arrives. -32000 is the protocol's auth-required
+        # code; the Claude bridge does exactly this with a fresh config dir.
+        error = self.script.get("promptError")
+        if error:
+            raise _JsonRpcError(error.get("code", -32000), error.get("message", ""))
         self._cancel_event(session_id).clear()
         self.report["prompts"].append(
             {"sessionId": session_id, "prompt": params.get("prompt")}

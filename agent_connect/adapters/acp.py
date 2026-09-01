@@ -123,6 +123,7 @@ from .. import attachments as att
 from .. import outgoing
 from ..acp.core import (
     AcpAgentGone,
+    AcpAuthRequired,
     AcpClient,
     AcpError,
     SessionResumeRefused,
@@ -517,6 +518,46 @@ def login_advice(agent, env: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def auth_failed_advice(agent, env: Optional[dict] = None) -> str:
+    """What to say when the ACP Agent refuses a Turn as unauthenticated.
+
+    Distinct from `login_advice`, and the difference is not cosmetic: that one
+    is told to an operator whose Agent *advertised* `authMethods`, and it opens
+    by saying so. Here the Agent advertised nothing — `preflight` passed — and
+    only refused when the first real work arrived. Reusing the other sentence
+    would tell the operator their agent offered a login method when it did not,
+    which sends them looking for the wrong thing.
+
+    Why the startup check cannot catch this: `initialize` answered
+    `authMethods: []`, and so did `session/new`. The refusal appears at
+    `session/prompt`, and prompting during preflight would spend tokens on every
+    Worker start — the check is deliberately free. So this is reported at the
+    first Turn, with the same install-and-login vocabulary the startup check
+    uses, rather than as a bare protocol error.
+    """
+    env = os.environ if env is None else env
+    name = (env.get(AGENT_ENV) or "").strip().lower()
+    preset = PRESETS.get(name) if not (env.get(COMMAND_ENV) or "").strip() else None
+    lines = [
+        "the Local Agent refused this turn because it is not authenticated. It "
+        "advertised no login method when the Worker started, so the startup "
+        "check had nothing to catch — it only said so when the first real work "
+        "arrived."
+    ]
+    if preset is not None:
+        lines.append(f"Log in with:\n    {preset.login}")
+    else:
+        lines.append(
+            "Log in to the agent yourself, in your own shell, then start the "
+            "Worker again."
+        )
+    lines.append(
+        "agent-connect will not log in for you: it never opens an interactive "
+        "terminal on your machine on behalf of a room."
+    )
+    return "\n".join(lines)
+
+
 def _truthy(value: Optional[str]) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -830,6 +871,10 @@ class AcpAdapter:
             return login_advice(agent)
         return None
 
+    def agent_description_or_none(self):
+        """What `preflight` learned about the Agent, if it ran at all."""
+        return getattr(self, "agent_description", None)
+
     def describe(self) -> str:
         """One line about what preflight found, for the Worker's startup log."""
         agent = getattr(self, "agent_description", None)
@@ -996,6 +1041,14 @@ class AcpAdapter:
             # it.
             yield Done(reason=FAILED, text="".join(chunks),
                        note=_gone_note(exc, store, key))
+            return
+        except AcpAuthRequired:
+            # `preflight` cannot see this one: the Agent advertised no auth
+            # method and refused only at `session/prompt`. Reported with the
+            # login vocabulary rather than as a raw protocol error, so the
+            # operator gets the thing to do instead of a stack trace.
+            yield Done(reason=FAILED, text="".join(chunks),
+                       note=f"agent-connect: {auth_failed_advice(self.agent_description_or_none())}")
             return
         except AcpError as exc:
             # A missing bridge mid-Turn gets the same install advice the startup
