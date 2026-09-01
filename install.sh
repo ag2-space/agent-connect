@@ -18,8 +18,11 @@
 #   --token   AGENT_CONNECT_TOKEN    your agent's relay token from the Agent Portal [required]
 #   --adapter AGENT_CONNECT_ADAPTER  codex | omnigent | ollama | cline | acp  [default: codex]
 #   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini
-#             [default: claude]  Any other ACP agent: set AGENT_CONNECT_ACP_COMMAND
-#             yourself — it overrides the preset.
+#             [default: claude, or `custom` when --acp-command is given]
+#   --acp-command AGENT_CONNECT_ACP_COMMAND  the ACP agent's command line, run as
+#             typed. **Overrides any preset**, so it is how any ACP agent no
+#             preset describes is connected. Omit it on a re-run and whatever is
+#             already in config.env is kept.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
 #   --no-start                       install only; print the run command, don't launch
 #
@@ -59,7 +62,10 @@ START=1
 # resolves: without it an installer run can settle on a pre-transport worker
 # that still expects task files.
 AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.2.0}"
-ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-claude}"
+ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-}"
+# Empty means "not asked for". The default is settled after arg parsing,
+# because it depends on whether a command was supplied.
+ACP_COMMAND="${AGENT_CONNECT_ACP_COMMAND:-}"
 # The ACP bridge that makes Claude Code an ACP Agent, PINNED to an exact
 # version. It renamed itself once already (the older name is dead — do not
 # reintroduce it) and moved through many major versions inside six months; an
@@ -101,12 +107,14 @@ while [ $# -gt 0 ]; do
     --token)   TOKEN="$2"; shift 2 ;;
     --adapter) ADAPTER="$2"; shift 2 ;;
     --acp-agent) ACP_AGENT="$2"; shift 2 ;;
+    --acp-command) ACP_COMMAND="$2"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --sutando-workspace|--sutando-workspace=*) sutando_gone ;;
     --no-start) START=0; shift ;;
     --token=*)   TOKEN="${1#*=}"; shift ;;
     --adapter=*) ADAPTER="${1#*=}"; shift ;;
     --acp-agent=*) ACP_AGENT="${1#*=}"; shift ;;
+    --acp-command=*) ACP_COMMAND="${1#*=}"; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
     *) echo "install.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -115,6 +123,20 @@ done
 if [ -z "$TOKEN" ]; then
   echo "install.sh: --token is required (get it from the AG2 Space Agent Portal)." >&2
   exit 2
+fi
+
+# A supplied command belongs to an agent no preset describes, so the preset name
+# defaults to one that is deliberately NOT a preset. Defaulting to `claude` here
+# would npm-install a bridge the command overrides anyway, and would make the
+# worker's login advice name Claude Code to somebody running something else.
+if [ -z "$ACP_AGENT" ]; then
+  if [ -n "$ACP_COMMAND" ]; then ACP_AGENT="custom"; else ACP_AGENT="claude"; fi
+fi
+
+# A flag that silently does nothing is the bug class this file keeps fixing.
+if [ -n "$ACP_COMMAND" ] && [ "$ADAPTER" != "acp" ]; then
+  echo "install.sh: WARNING — --acp-command applies only to --adapter acp; ignoring it for adapter '$ADAPTER'." >&2
+  ACP_COMMAND=""
 fi
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
@@ -168,8 +190,10 @@ export PATH
 # ── 1b) the ACP bridge, pinned ──────────────────────────────────────────────
 # Only for --adapter acp. The pin is the point: see ACP_BRIDGE_SPEC above.
 ACP_KV=""
+ACP_CMD_KV=""
 if [ "$ADAPTER" = "acp" ]; then
   ACP_KV="AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
+  [ -z "$ACP_COMMAND" ] || ACP_CMD_KV="AGENT_CONNECT_ACP_COMMAND=$ACP_COMMAND"
   case "$ACP_AGENT" in
     claude)
       if command -v npm >/dev/null 2>&1; then
@@ -203,7 +227,15 @@ if [ -f "$CONFIG" ]; then
   BACKUP="$CONFIG.bak"
   cp "$CONFIG" "$BACKUP" && chmod 600 "$BACKUP"
   say "existing config kept as $BACKUP"
-  KEPT="$(grep -v -E '^[[:space:]]*(AGENT_CONNECT_TOKEN|AGENT_CONNECT_ADAPTER|AGENT_CONNECT_REPO|AGENT_CONNECT_ACP_AGENT)[[:space:]]*=' "$CONFIG" \
+  # Managed keys are rewritten; everything else is carried across verbatim.
+  # AGENT_CONNECT_ACP_COMMAND joins that set ONLY when this run was given one.
+  # Managing it unconditionally would reproduce the --acp-agent trap in a worse
+  # place: a re-run without the flag would wipe the command, the adapter would
+  # fall back to the `claude` preset, and the agent would answer rooms as Claude
+  # Code with nothing said. Absent flag, absent from this list, hence preserved.
+  MANAGED='AGENT_CONNECT_TOKEN|AGENT_CONNECT_ADAPTER|AGENT_CONNECT_REPO|AGENT_CONNECT_ACP_AGENT'
+  [ -z "$ACP_CMD_KV" ] || MANAGED="$MANAGED|AGENT_CONNECT_ACP_COMMAND"
+  KEPT="$(grep -v -E "^[[:space:]]*($MANAGED)[[:space:]]*=" "$CONFIG" \
           | grep -v -E '^[[:space:]]*(#|$)' || true)"
 fi
 say "writing config $CONFIG (mode 0600 — it holds your token)"
@@ -220,6 +252,7 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     echo "AGENT_CONNECT_ADAPTER=\"$ADAPTER\""
     echo "AGENT_CONNECT_REPO=\"$REPO\""
     [ -z "$ACP_KV" ] || echo "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
+    [ -z "$ACP_CMD_KV" ] || echo "AGENT_CONNECT_ACP_COMMAND=\"$ACP_COMMAND\""
     if [ -n "$KEPT" ]; then
       echo ""
       echo "# kept from your previous config.env:"

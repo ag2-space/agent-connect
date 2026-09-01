@@ -344,6 +344,65 @@ grep -q "claude-agent-acp" "$NPM_LOG" \
   && bad "the Claude bridge was installed for a non-Claude preset" \
   || ok "no bridge installed for a preset that does not use one"
 
+# 9b) --acp-command: the generic ACP path. The command is written, the preset
+#     name defaults to a NON-preset so no bridge is fetched, and — the part that
+#     matters — a later run that does NOT pass the flag keeps the command.
+: > "$NPM_LOG"
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
+  || bad "acp --acp-command dry-run failed"
+ACPCFG="$TMP/.agent-connect/config.env"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="my-agent --acp"$' "$ACPCFG" \
+  && ok "--acp-command is written to config.env" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--acp-command not written"; }
+grep -q '^AGENT_CONNECT_ACP_AGENT="custom"$' "$ACPCFG" \
+  && ok "and the preset name defaults to a non-preset, so no bridge is implied" \
+  || bad "--acp-command did not default AGENT_CONNECT_ACP_AGENT to custom"
+grep -q "claude-agent-acp" "$NPM_LOG" \
+  && { sed 's/^/    /' "$NPM_LOG"; bad "the Claude bridge was installed despite an explicit command"; } \
+  || ok "and no bridge is downloaded for a command-supplied agent"
+
+# THE regression this flag must not introduce. Moving the key into the managed
+# set would make a re-run without the flag wipe it; the adapter would then fall
+# back to the `claude` preset and answer rooms as Claude Code, silently.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T2 --adapter acp --no-start 2>&1) \
+  || bad "acp re-run without --acp-command failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="my-agent --acp"$' "$ACPCFG" \
+  && ok "a re-run WITHOUT --acp-command keeps the existing command" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a re-run without --acp-command wiped the command"; }
+grep -q '^AGENT_CONNECT_TOKEN="T2"$' "$ACPCFG" \
+  && ok "while the managed settings still update around it" \
+  || bad "re-run did not update the token"
+
+# A run that DOES supply one rewrites it, exactly once.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T3 --adapter acp --acp-command "other-agent --acp" --no-start 2>&1) \
+  || bad "acp re-run with a new --acp-command failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="other-agent --acp"$' "$ACPCFG" \
+  && ok "a re-run WITH --acp-command replaces it" || bad "--acp-command did not replace the old value"
+n_cmd="$(grep -c '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" || true)"
+[ "${n_cmd:-0}" -eq 1 ] \
+  && ok "and leaves exactly one of it (no duplicate for the reader to disagree over)" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "config.env has $n_cmd AGENT_CONNECT_ACP_COMMAND lines"; }
+
+# An explicit --acp-agent still wins over the implied `custom`.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "x --acp" --acp-agent gemini --no-start 2>&1) \
+  || bad "acp --acp-command with explicit --acp-agent failed"
+grep -q '^AGENT_CONNECT_ACP_AGENT="gemini"$' "$ACPCFG" \
+  && ok "an explicit --acp-agent still wins over the implied 'custom'" \
+  || bad "explicit --acp-agent was overridden by the implied default"
+
+# The flag is meaningless without --adapter acp, and says so rather than vanishing.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter codex --acp-command "x --acp" --no-start 2>&1) \
+  || bad "codex + --acp-command dry-run failed"
+printf '%s\n' "$out" | grep -q "applies only to --adapter acp" \
+  && ok "--acp-command with a non-acp adapter warns instead of silently doing nothing" \
+  || { printf '%s\n' "$out" | sed 's/^/    /'; bad "no warning for --acp-command on a non-acp adapter"; }
+
 # 10) the sparse-fetch path is gone for good (PyPI is the single source)
 if grep -q "raw.githubusercontent.com" "$SCRIPT"; then
   bad "install.sh still sparse-fetches from raw.githubusercontent.com"
