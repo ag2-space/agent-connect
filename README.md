@@ -141,8 +141,14 @@ different from every other adapter's, and weaker. Read this before enabling it.*
   the file is not stopped, because nothing is there to stop it. It is a
   convention, not a guarantee; it is not a substitute for a sandbox.
 - **Owner-tier under ACP is therefore MORE permissive than owner-tier under
-  codex.** Same tier, weaker confinement: no OS sandbox, and network access is
-  always on (`codex exec --sandbox workspace-write` gives neither).
+  codex.** Same tier, weaker confinement: codex runs owner-tier tasks under
+  `codex exec --sandbox workspace-write`, where the OS refuses writes outside
+  the workspace whatever the agent tries; ACP has no such boundary, only the
+  cooperative policy above. Network is *not* the difference — agent-connect
+  turns network access on for owner-tier codex tasks too
+  (`sandbox_workspace_write.network_access=true`, see
+  `agent_connect/adapters/codex.py`); it is off only for guest/read-only tasks,
+  which never reach ACP at all.
 - **Guest tasks are refused outright** and never reach ACP — the ACP agent is
   not even started. Shipping a read-only *tier* on top of a cooperative *policy*
   would be offering a limit that only looks like one. The refusal is **said in
