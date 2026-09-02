@@ -20,9 +20,7 @@
 #   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini
 #             [default: claude, or `custom` when --acp-command is given]
 #   --acp-command AGENT_CONNECT_ACP_COMMAND  the ACP agent's command line, run as
-#             typed. **Overrides any preset**, so it is how any ACP agent no
-#             preset describes is connected. Omit it on a re-run and whatever is
-#             already in config.env is kept.
+#             typed. Overrides any preset. Omitted on a re-run, the stored one is kept.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
 #   --no-start                       install only; print the run command, don't launch
 #
@@ -125,11 +123,8 @@ if [ -z "$TOKEN" ]; then
   exit 2
 fi
 
-# Whether the operator *named* an agent, captured before any default fills the
-# variable in. The difference matters: naming a preset is a decision about what
-# runs, and a stored command would otherwise silently outrank it (see the
-# ACP_CMD_CLEAR block below). The defaults themselves are settled later, once
-# the existing config file has been read.
+# Captured before any default fills the variable in; the defaults are settled
+# later, once the existing config has been read.
 ACP_AGENT_GIVEN=0
 [ -z "$ACP_AGENT" ] || ACP_AGENT_GIVEN=1
 
@@ -141,14 +136,10 @@ fi
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
 
-# One setting per line is the config file's whole grammar, so a value carrying a
-# newline or a carriage return cannot be written down at all — quoting does not
-# save it, it just moves where the file starts lying about what was asked for.
-# Refused here, by name, rather than written and misread later.
-# A literal newline, held in a variable: `$(printf '\n')` is the obvious
-# spelling and the wrong one, because command substitution strips trailing
-# newlines and hands back the empty string — making the pattern below match
-# every value there is.
+# One setting per line is the file's whole grammar: no quoting saves a value
+# with a newline in it, so refuse it up front.
+# `$(printf '\n')` is the wrong spelling: command substitution strips trailing
+# newlines, so the pattern would match every value.
 NL='
 '
 CR="$(printf '\r')"
@@ -184,13 +175,10 @@ $PIP --version >/dev/null 2>&1 || {
 
 APP_DIR="$HOME/.agent-connect"
 mkdir -p "$APP_DIR"
-# Named here rather than at 1c: the ACP decisions below depend on what this file
-# already says, and a setting cannot be reconciled with a file nobody has read.
+# Named here rather than at 1c: the ACP decisions below need to read it.
 CONFIG="$APP_DIR/config.env"
 
-# What the existing config already asks for. Read, never executed: one grep per
-# key, last occurrence wins the same way the worker's own parser resolves it,
-# and the surrounding quotes come off exactly once.
+# Read, never executed. Last occurrence wins, as the worker's own parser does.
 stored() {  # <KEY>
   [ -f "$CONFIG" ] || return 0
   sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -n 1 \
@@ -199,29 +187,15 @@ stored() {  # <KEY>
 ACP_COMMAND_STORED="$(stored AGENT_CONNECT_ACP_COMMAND)"
 ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
 
-# The three ways an operator can arrive here, and what each one means for the
-# pair (agent name, command). A command always outranks a preset at runtime, so
-# every case has to say what happens to a command that is already stored —
-# leaving that implicit is how a re-run ends up running an agent nobody chose.
-#
-#   named an agent, no command  → the preset is the decision. A stored command
-#                                 would silently beat it, so it is CLEARED.
-#   gave a command              → that command runs; the name is bookkeeping,
-#                                 and defaults to a deliberately non-preset one.
-#   asked for neither           → change nothing. Both are carried across, name
-#                                 included, so a plain re-run to upgrade the
-#                                 worker does not quietly re-point the agent.
-#
-# All of it is scoped to `--adapter acp`, and that scoping is load-bearing
-# rather than tidiness: these keys describe an ACP agent, and an install that
-# is not selecting one has no business rewriting them. Without the guard,
-# `--adapter codex --acp-agent claude` reaches the "named an agent" case and
-# clears a working ACP command on the way past — a setting destroyed by a run
-# that was never about it.
+# A stored command outranks any preset at runtime, so each way of arriving has
+# to say what happens to one that is already there:
+#   named an agent, no command  → preset decides, so the command is CLEARED
+#   gave a command              → it runs; the name is bookkeeping
+#   neither                     → change nothing, name included
+# Scoped to --adapter acp: otherwise `--adapter codex --acp-agent claude` hits
+# the first case and deletes a working command on its way past.
 ACP_CMD_CLEAR=0
 if [ "$ADAPTER" != "acp" ]; then
-  # Say it, rather than ignore it silently, for the same reason --acp-command
-  # gets a sentence: a flag that does nothing has to admit as much.
   if [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
     echo "install.sh: WARNING — --acp-agent applies only to --adapter acp; ignoring it for adapter '$ADAPTER'. Your stored ACP settings are left alone." >&2
   fi
@@ -269,8 +243,6 @@ ACP_CMD_KV=""
 if [ "$ADAPTER" = "acp" ]; then
   ACP_KV="AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
   [ -z "$ACP_COMMAND" ] || ACP_CMD_KV="AGENT_CONNECT_ACP_COMMAND=$ACP_COMMAND"
-  # Dropping a setting is not something to do quietly, even when it is the only
-  # way to honour what was asked for. The old file is kept beside the new one.
   if [ "$ACP_CMD_CLEAR" -eq 1 ] && [ -n "$ACP_COMMAND_STORED" ]; then
     say "--acp-agent '$ACP_AGENT' replaces the AGENT_CONNECT_ACP_COMMAND already in your config"
     say "  (was: $ACP_COMMAND_STORED) — a command overrides every preset, so keeping it would have"
@@ -308,12 +280,9 @@ if [ -f "$CONFIG" ]; then
   BACKUP="$CONFIG.bak"
   cp "$CONFIG" "$BACKUP" && chmod 600 "$BACKUP"
   say "existing config kept as $BACKUP"
-  # Managed keys are rewritten; everything else is carried across verbatim.
-  # AGENT_CONNECT_ACP_COMMAND joins that set ONLY when this run was given one.
-  # Managing it unconditionally would reproduce the --acp-agent trap in a worse
-  # place: a re-run without the flag would wipe the command, the adapter would
-  # fall back to the `claude` preset, and the agent would answer rooms as Claude
-  # Code with nothing said. Absent flag, absent from this list, hence preserved.
+  # Managed keys are rewritten; everything else carried across verbatim.
+  # ACP_COMMAND joins the set only when this run set or cleared one — otherwise
+  # a re-run would wipe it and the adapter would fall back to the claude preset.
   MANAGED='AGENT_CONNECT_TOKEN|AGENT_CONNECT_ADAPTER|AGENT_CONNECT_REPO|AGENT_CONNECT_ACP_AGENT'
   if [ -n "$ACP_CMD_KV" ] || [ "$ACP_CMD_CLEAR" -eq 1 ]; then
     MANAGED="$MANAGED|AGENT_CONNECT_ACP_COMMAND"
@@ -332,14 +301,9 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     # or quotes of its own survives the round trip: the reader strips one
     # matching pair and nothing else.
     #
-    # `printf '%s\n'`, never `echo`. POSIX leaves echo's treatment of
-    # backslashes implementation-defined, and the shell this runs under is
-    # whatever /bin/sh happens to be: under dash a value containing \t or \n
-    # is rewritten into a real tab or a real newline — and a newline splits one
-    # setting into two lines, which the worker's line-oriented parser reads as
-    # a different setting or as nothing at all. A token is as exposed to that
-    # as a command line is, so every value goes through printf, not just the
-    # one that made it obvious.
+    # printf, never echo: echo's backslash handling is implementation-defined,
+    # and under dash a \t or \n in any value is rewritten (a newline splits one
+    # setting into two lines).
     printf '%s\n' "AGENT_CONNECT_TOKEN=\"$TOKEN\""
     printf '%s\n' "AGENT_CONNECT_ADAPTER=\"$ADAPTER\""
     printf '%s\n' "AGENT_CONNECT_REPO=\"$REPO\""

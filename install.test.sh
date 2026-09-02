@@ -344,9 +344,8 @@ grep -q "claude-agent-acp" "$NPM_LOG" \
   && bad "the Claude bridge was installed for a non-Claude preset" \
   || ok "no bridge installed for a preset that does not use one"
 
-# 9b) --acp-command: the generic ACP path. The command is written, the preset
-#     name defaults to a NON-preset so no bridge is fetched, and — the part that
-#     matters — a later run that does NOT pass the flag keeps the command.
+# 9b) --acp-command: written through, preset name defaults to a non-preset so
+#     no bridge is fetched, and a re-run without the flag keeps the command.
 : > "$NPM_LOG"
 rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
@@ -363,9 +362,8 @@ grep -q "claude-agent-acp" "$NPM_LOG" \
   && { sed 's/^/    /' "$NPM_LOG"; bad "the Claude bridge was installed despite an explicit command"; } \
   || ok "and no bridge is downloaded for a command-supplied agent"
 
-# THE regression this flag must not introduce. Moving the key into the managed
-# set would make a re-run without the flag wipe it; the adapter would then fall
-# back to the `claude` preset and answer rooms as Claude Code, silently.
+# The regression this flag must not introduce: a re-run without it wiping the
+# command, leaving the adapter on the claude preset.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T2 --adapter acp --no-start 2>&1) \
   || bad "acp re-run without --acp-command failed"
@@ -395,10 +393,8 @@ grep -q '^AGENT_CONNECT_ACP_AGENT="gemini"$' "$ACPCFG" \
   && ok "an explicit --acp-agent still wins over the implied 'custom'" \
   || bad "explicit --acp-agent was overridden by the implied default"
 
-# THE transition the adversarial review caught: a stored custom command
-# outranks any preset at runtime, so a later run that NAMES a preset has to
-# clear it. Otherwise the installer fetches the bridge and reports `claude`
-# while the old custom agent goes on receiving owner-tier prompts.
+# A stored command outranks any preset at runtime, so naming one has to clear
+# it — otherwise the install reports `claude` and runs the custom agent.
 rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
@@ -418,7 +414,7 @@ printf '%s\n' "$out" | grep -q "replaces the AGENT_CONNECT_ACP_COMMAND" \
   && ok "and the operator is told the command was dropped, not left to find out" \
   || { printf '%s\n' "$out" | sed 's/^/    /'; bad "clearing the command was silent"; }
 
-# ...while a plain re-run, naming nothing, still changes nothing.
+# ...while a plain re-run changes nothing.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
   || bad "re-seed failed"
@@ -434,10 +430,7 @@ grep -q "claude-agent-acp" "$NPM_LOG" \
   && { sed 's/^/    /' "$NPM_LOG"; bad "a plain re-run downloaded the Claude bridge for a custom-command install"; } \
   || ok "and downloads no bridge it will not use"
 
-# An install that is not about ACP must not rewrite ACP settings on its way
-# past. `--adapter codex --acp-agent claude` used to reach the "named an agent"
-# case and clear a working command — a setting destroyed by a run that had
-# nothing to do with it.
+# An install for another adapter must not rewrite ACP settings on its way past.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
   || bad "seed run for the non-acp-adapter case failed"
@@ -451,11 +444,9 @@ printf '%s\n' "$out" | grep -q -- "--acp-agent applies only to --adapter acp" \
   && ok "and says the flag was ignored rather than dropping it silently" \
   || { printf '%s\n' "$out" | sed 's/^/    /'; bad "--acp-agent on a non-acp adapter was silently ignored"; }
 
-# 9c) values reach the config file byte for byte. `echo` is implementation-
-#     defined for backslashes: under dash \t and \n become a real tab and a
-#     real newline, and a newline splits one setting into two lines that the
-#     worker reads as something else entirely. Run under every /bin/sh we can
-#     find, because which one this is on the operator's box is not our choice.
+# 9c) values reach config.env byte for byte. echo is implementation-defined for
+#     backslashes; under dash \t and \n become a real tab and newline, and a
+#     newline splits one setting into two. Run under each shell we can find.
 BS_CMD='my-agent --re \n --tab \t --trunc \c --path C:\\tools\\a'
 for SHBIN in sh dash bash; do
   command -v "$SHBIN" >/dev/null 2>&1 || continue
@@ -475,8 +466,7 @@ for SHBIN in sh dash bash; do
     || { sed 's/^/    /' "$ACPCFG"; bad "[$SHBIN] the command became $n lines"; }
 done
 
-# A value carrying a real newline cannot be written down at all, so it is
-# refused by name rather than written and misread later.
+# A value carrying a real newline is refused rather than written and misread.
 if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token "$(printf 'a\nb')" --no-start >/dev/null 2>&1; then
   bad "a token containing a newline should be refused"
 else
