@@ -434,6 +434,57 @@ grep -q "claude-agent-acp" "$NPM_LOG" \
   && { sed 's/^/    /' "$NPM_LOG"; bad "a plain re-run downloaded the Claude bridge for a custom-command install"; } \
   || ok "and downloads no bridge it will not use"
 
+# An install that is not about ACP must not rewrite ACP settings on its way
+# past. `--adapter codex --acp-agent claude` used to reach the "named an agent"
+# case and clear a working command — a setting destroyed by a run that had
+# nothing to do with it.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
+  || bad "seed run for the non-acp-adapter case failed"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter codex --acp-agent claude --no-start 2>&1) \
+  || bad "codex re-run with --acp-agent failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="my-agent --acp"$' "$ACPCFG" \
+  && ok "a non-acp adapter leaves a stored ACP command alone" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--adapter codex --acp-agent deleted the stored ACP command"; }
+printf '%s\n' "$out" | grep -q -- "--acp-agent applies only to --adapter acp" \
+  && ok "and says the flag was ignored rather than dropping it silently" \
+  || { printf '%s\n' "$out" | sed 's/^/    /'; bad "--acp-agent on a non-acp adapter was silently ignored"; }
+
+# 9c) values reach the config file byte for byte. `echo` is implementation-
+#     defined for backslashes: under dash \t and \n become a real tab and a
+#     real newline, and a newline splits one setting into two lines that the
+#     worker reads as something else entirely. Run under every /bin/sh we can
+#     find, because which one this is on the operator's box is not our choice.
+BS_CMD='my-agent --re \n --tab \t --trunc \c --path C:\\tools\\a'
+for SHBIN in sh dash bash; do
+  command -v "$SHBIN" >/dev/null 2>&1 || continue
+  rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+  out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+        "$SHBIN" "$SCRIPT" --token "tok\tone" --adapter acp --acp-command "$BS_CMD" --no-start 2>&1) \
+    || bad "[$SHBIN] backslash round-trip run failed"
+  grep -Fqx "AGENT_CONNECT_ACP_COMMAND=\"$BS_CMD\"" "$ACPCFG" \
+    && ok "[$SHBIN] a command containing backslashes reaches config.env unchanged" \
+    || { sed 's/^/    /' "$ACPCFG"; bad "[$SHBIN] backslashes in --acp-command were rewritten"; }
+  grep -Fqx 'AGENT_CONNECT_TOKEN="tok\tone"' "$ACPCFG" \
+    && ok "[$SHBIN] and so does a token — every value takes the same path, not just the ACP one" \
+    || { sed 's/^/    /' "$ACPCFG"; bad "[$SHBIN] backslashes in the token were rewritten"; }
+  n="$(grep -c '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" || true)"
+  [ "${n:-0}" -eq 1 ] \
+    && ok "[$SHBIN] and it is still one line, not split into two settings" \
+    || { sed 's/^/    /' "$ACPCFG"; bad "[$SHBIN] the command became $n lines"; }
+done
+
+# A value carrying a real newline cannot be written down at all, so it is
+# refused by name rather than written and misread later.
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token "$(printf 'a\nb')" --no-start >/dev/null 2>&1; then
+  bad "a token containing a newline should be refused"
+else
+  rc=$?
+  [ "$rc" -eq 2 ] && ok "a value containing a newline is refused, with exit 2" \
+                  || bad "newline token → exit $rc (want 2)"
+fi
+
 # The flag is meaningless without --adapter acp, and says so rather than vanishing.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter codex --acp-command "x --acp" --no-start 2>&1) \

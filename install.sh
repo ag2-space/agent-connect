@@ -141,6 +141,30 @@ fi
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
 
+# One setting per line is the config file's whole grammar, so a value carrying a
+# newline or a carriage return cannot be written down at all — quoting does not
+# save it, it just moves where the file starts lying about what was asked for.
+# Refused here, by name, rather than written and misread later.
+# A literal newline, held in a variable: `$(printf '\n')` is the obvious
+# spelling and the wrong one, because command substitution strips trailing
+# newlines and hands back the empty string — making the pattern below match
+# every value there is.
+NL='
+'
+CR="$(printf '\r')"
+reject_multiline() {  # <flag> <value>
+  case "$2" in
+    *"$NL"*|*"$CR"*)
+      echo "install.sh: $1 contains a newline, which a config file of KEY=value lines cannot carry. Remove it." >&2
+      exit 2 ;;
+  esac
+}
+reject_multiline --token "$TOKEN"
+reject_multiline --repo "$REPO"
+reject_multiline --adapter "$ADAPTER"
+[ -z "$ACP_COMMAND" ] || reject_multiline --acp-command "$ACP_COMMAND"
+[ -z "$ACP_AGENT" ] || reject_multiline --acp-agent "$ACP_AGENT"
+
 # Working directory: state it loudly (invisible defaults are how agents end up
 # in the wrong folder), create it if it's the default, and warn on macOS
 # TCC-protected paths where a service-run agent gets EPERM on writes.
@@ -187,8 +211,22 @@ ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
 #   asked for neither           → change nothing. Both are carried across, name
 #                                 included, so a plain re-run to upgrade the
 #                                 worker does not quietly re-point the agent.
+#
+# All of it is scoped to `--adapter acp`, and that scoping is load-bearing
+# rather than tidiness: these keys describe an ACP agent, and an install that
+# is not selecting one has no business rewriting them. Without the guard,
+# `--adapter codex --acp-agent claude` reaches the "named an agent" case and
+# clears a working ACP command on the way past — a setting destroyed by a run
+# that was never about it.
 ACP_CMD_CLEAR=0
-if [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
+if [ "$ADAPTER" != "acp" ]; then
+  # Say it, rather than ignore it silently, for the same reason --acp-command
+  # gets a sentence: a flag that does nothing has to admit as much.
+  if [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
+    echo "install.sh: WARNING — --acp-agent applies only to --adapter acp; ignoring it for adapter '$ADAPTER'. Your stored ACP settings are left alone." >&2
+  fi
+  ACP_AGENT=""
+elif [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
   [ -n "$ACP_COMMAND" ] || ACP_CMD_CLEAR=1
 elif [ -n "$ACP_COMMAND" ]; then
   ACP_AGENT="custom"
@@ -293,14 +331,23 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     # Values are quoted on the way out so that a token with edge whitespace
     # or quotes of its own survives the round trip: the reader strips one
     # matching pair and nothing else.
-    echo "AGENT_CONNECT_TOKEN=\"$TOKEN\""
-    echo "AGENT_CONNECT_ADAPTER=\"$ADAPTER\""
-    echo "AGENT_CONNECT_REPO=\"$REPO\""
-    [ -z "$ACP_KV" ] || echo "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
-    [ -z "$ACP_CMD_KV" ] || echo "AGENT_CONNECT_ACP_COMMAND=\"$ACP_COMMAND\""
+    #
+    # `printf '%s\n'`, never `echo`. POSIX leaves echo's treatment of
+    # backslashes implementation-defined, and the shell this runs under is
+    # whatever /bin/sh happens to be: under dash a value containing \t or \n
+    # is rewritten into a real tab or a real newline — and a newline splits one
+    # setting into two lines, which the worker's line-oriented parser reads as
+    # a different setting or as nothing at all. A token is as exposed to that
+    # as a command line is, so every value goes through printf, not just the
+    # one that made it obvious.
+    printf '%s\n' "AGENT_CONNECT_TOKEN=\"$TOKEN\""
+    printf '%s\n' "AGENT_CONNECT_ADAPTER=\"$ADAPTER\""
+    printf '%s\n' "AGENT_CONNECT_REPO=\"$REPO\""
+    [ -z "$ACP_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
+    [ -z "$ACP_CMD_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_COMMAND=\"$ACP_COMMAND\""
     if [ -n "$KEPT" ]; then
-      echo ""
-      echo "# kept from your previous config.env:"
+      printf '\n'
+      printf '%s\n' "# kept from your previous config.env:"
       printf '%s\n' "$KEPT"
     fi
   } > "$CONFIG"
