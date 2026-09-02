@@ -84,7 +84,9 @@ class _Answer(NamedTuple):
     status: int
     body: bytes
     headers: Dict[str, str]
-    delay: float
+    #: Seconds to sleep, or a callable to block on. A callable lets a test gate
+    #: the answer on an event it controls instead of racing a clock.
+    delay: object
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -109,7 +111,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         answer = broker.next_answer(self.command, split.path)
         if answer.delay:
-            time.sleep(answer.delay)
+            if callable(answer.delay):
+                answer.delay()
+            else:
+                time.sleep(answer.delay)
         self.send_response(answer.status)
         for key, value in answer.headers.items():
             self.send_header(key, value)
@@ -187,12 +192,15 @@ class FakeBroker:
 
     # --- programming
     def on(self, method: str, path: str, status: int = 200, body=b"",
-           json=None, headers: Optional[Dict[str, str]] = None, delay: float = 0.0):
+           json=None, headers: Optional[Dict[str, str]] = None, delay=0.0):
         """Queue one answer for `method` on `path` (relative to the base path).
 
         Queueing onto a route whose answers have all been served starts a fresh
         sequence: "answer this from now on" is what a test means when it
         programs a route it has already exercised, not "after the repeats".
+
+        `delay` is seconds to sleep, or a callable the handler blocks on — pass
+        `event.wait` to hold an answer open until the test releases it.
         """
         if json is not None:
             body = jsonlib.dumps(json).encode()
