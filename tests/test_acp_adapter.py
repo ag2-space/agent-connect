@@ -275,10 +275,8 @@ out = bench.handle("c1", "hello")
 check("AGENT_CONNECT_ACP_COMMAND" in out,
       "an unconfigured Worker says so in the room instead of failing silently")
 
-# An Agent that advertises no auth method at `initialize` — so preflight passes
-# — and then refuses the first prompt as unauthenticated. Observed for real
-# against the Claude bridge with a fresh CLAUDE_CONFIG_DIR. The room must get
-# the thing to do, not a bare protocol error.
+# Advertises no auth method (so preflight passes), then refuses the first
+# prompt. The room must get the thing to do, not a bare protocol error.
 bench = Bench({"promptError": {"code": -32000, "message": "Authentication required"}})
 out = bench.handle("auth1", "hello")
 check("not authenticated" in out,

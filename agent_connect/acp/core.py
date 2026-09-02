@@ -71,22 +71,17 @@ class AcpAgentGone(AcpError):
     """The ACP Agent process died, or its stdio closed, with work outstanding."""
 
 
-#: JSON-RPC code the protocol reserves for "you are not authenticated"
-#: (`acp.RequestError.auth_required`). Matched on the code rather than the
-#: message: the wording is the Agent's to change, the code is the protocol's.
+#: `acp.RequestError.auth_required`. Matched on the code, not the message:
+#: the wording is the Agent's to change.
 AUTH_REQUIRED_CODE = -32000
 
 
 class AcpAuthRequired(AcpError):
     """The ACP Agent refused the work because the Client is not authenticated.
 
-    Separate from `AcpError` because it is the one protocol failure with a
-    *specific* thing for the operator to do, and because it can arrive after
-    `initialize` said nothing was needed — an Agent may advertise no
-    `authMethods` and still refuse the first `session/prompt`. Observed against
-    `@agentclientprotocol/claude-agent-acp` with a fresh `CLAUDE_CONFIG_DIR`:
-    `authMethods: []`, so the startup check passes, and then the first Turn
-    fails here. Callers turn this into login advice instead of a raw error.
+    Can arrive after `initialize` said nothing was needed: the Claude bridge
+    with a fresh `CLAUDE_CONFIG_DIR` answers `authMethods: []` and then fails
+    the first `session/prompt`. Callers turn this into login advice.
     """
 
 

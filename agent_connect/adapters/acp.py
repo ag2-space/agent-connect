@@ -521,19 +521,10 @@ def login_advice(agent, env: Optional[dict] = None) -> str:
 def auth_failed_advice(agent, env: Optional[dict] = None) -> str:
     """What to say when the ACP Agent refuses a Turn as unauthenticated.
 
-    Distinct from `login_advice`, and the difference is not cosmetic: that one
-    is told to an operator whose Agent *advertised* `authMethods`, and it opens
-    by saying so. Here the Agent advertised nothing — `preflight` passed — and
-    only refused when the first real work arrived. Reusing the other sentence
-    would tell the operator their agent offered a login method when it did not,
-    which sends them looking for the wrong thing.
-
-    Why the startup check cannot catch this: `initialize` answered
-    `authMethods: []`, and so did `session/new`. The refusal appears at
-    `session/prompt`, and prompting during preflight would spend tokens on every
-    Worker start — the check is deliberately free. So this is reported at the
-    first Turn, with the same install-and-login vocabulary the startup check
-    uses, rather than as a bare protocol error.
+    Not `login_advice`: that one opens by saying the Agent advertised a login
+    method, and here it advertised none — `preflight` passed and the refusal
+    only came at `session/prompt`. `preflight` cannot catch it without sending
+    a prompt, which would spend tokens on every Worker start.
     """
     env = os.environ if env is None else env
     name = (env.get(AGENT_ENV) or "").strip().lower()
@@ -1043,10 +1034,6 @@ class AcpAdapter:
                        note=_gone_note(exc, store, key))
             return
         except AcpAuthRequired:
-            # `preflight` cannot see this one: the Agent advertised no auth
-            # method and refused only at `session/prompt`. Reported with the
-            # login vocabulary rather than as a raw protocol error, so the
-            # operator gets the thing to do instead of a stack trace.
             yield Done(reason=FAILED, text="".join(chunks),
                        note=f"agent-connect: {auth_failed_advice(self.agent_description_or_none())}")
             return

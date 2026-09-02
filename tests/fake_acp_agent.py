@@ -337,9 +337,8 @@ class FakeAcpAgent:
 
     async def _prompt(self, params: dict) -> dict:
         session_id = params.get("sessionId")
-        # An agent that advertised no auth method at `initialize` and refuses
-        # only when real work arrives. -32000 is the protocol's auth-required
-        # code; the Claude bridge does exactly this with a fresh config dir.
+        # Refuses only when real work arrives, as the Claude bridge does with
+        # a fresh config dir. -32000 is the auth-required code.
         error = self.script.get("promptError")
         if error:
             raise _JsonRpcError(error.get("code", -32000), error.get("message", ""))
