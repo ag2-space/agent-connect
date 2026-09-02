@@ -114,6 +114,14 @@ class Worker:
             time.sleep(0.05)
         return self.doc()
 
+    def wait_for_dir(self, path, timeout=20.0):
+        """`path`, once it exists. SERVING is the status file's state, not a
+        promise that the relay client has finished making its directory."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not path.is_dir():
+            time.sleep(0.05)
+        return path.is_dir()
+
     def stop(self, sig=signal.SIGTERM):
         if self.proc.poll() is None:
             self.proc.send_signal(sig)
@@ -380,7 +388,7 @@ doc = worker.wait_for(SERVING)
 check(doc.get("instance") == "scratch",
       "AGENT_CONNECT_INSTANCE is carried into the file, so a supervisor can "
       "match N status files to its own N rows without recognising a path")
-check((worker.dir / "ws" / "relay" / "scratch").is_dir(),
+check(worker.wait_for_dir(worker.dir / "ws" / "relay" / "scratch"),
       "and it is the same name the relay client's state is kept under")
 worker.stop()
 check(instance_name({}) == "" and instance_name({"AGENT_CONNECT_INSTANCE": " a "}) == "a",
@@ -393,7 +401,7 @@ worker = Worker()
 doc = worker.wait_for(SERVING)
 check(doc.get("instance") == "default",
       "a Worker nobody named says `default` rather than an empty string")
-check((worker.dir / "ws" / "relay" / doc.get("instance", "")).is_dir(),
+check(worker.wait_for_dir(worker.dir / "ws" / "relay" / doc.get("instance", "")),
       "which is, again, exactly the directory its relay state lives in")
 worker.stop()
 
