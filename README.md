@@ -190,7 +190,14 @@ using and make a login failure name an agent you are not running. Pass
 `--acp-agent` as well if you want a different name recorded.
 
 Re-running the installer **without** `--acp-command` keeps whatever command is
-already in `config.env`. Only a run that supplies one rewrites it.
+already in `config.env`, and keeps the agent name beside it — a plain re-run to
+upgrade the worker does not quietly re-point your agent.
+
+Naming a preset is how you switch back. `--acp-agent claude` on a later run
+**clears** a stored `AGENT_CONNECT_ACP_COMMAND`, because a command overrides
+every preset: keeping it would leave the old agent running while the installer
+reported the preset you asked for. The installer says so when it happens, and
+the previous file is at `config.env.bak`.
 
 **Startup checks, not surprises in a room.** Before the worker serves its first
 task it starts the ACP agent, runs `initialize`, and stops with a sentence you

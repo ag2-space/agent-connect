@@ -125,13 +125,13 @@ if [ -z "$TOKEN" ]; then
   exit 2
 fi
 
-# A supplied command belongs to an agent no preset describes, so the preset name
-# defaults to one that is deliberately NOT a preset. Defaulting to `claude` here
-# would npm-install a bridge the command overrides anyway, and would make the
-# worker's login advice name Claude Code to somebody running something else.
-if [ -z "$ACP_AGENT" ]; then
-  if [ -n "$ACP_COMMAND" ]; then ACP_AGENT="custom"; else ACP_AGENT="claude"; fi
-fi
+# Whether the operator *named* an agent, captured before any default fills the
+# variable in. The difference matters: naming a preset is a decision about what
+# runs, and a stored command would otherwise silently outrank it (see the
+# ACP_CMD_CLEAR block below). The defaults themselves are settled later, once
+# the existing config file has been read.
+ACP_AGENT_GIVEN=0
+[ -z "$ACP_AGENT" ] || ACP_AGENT_GIVEN=1
 
 # A flag that silently does nothing is the bug class this file keeps fixing.
 if [ -n "$ACP_COMMAND" ] && [ "$ADAPTER" != "acp" ]; then
@@ -160,6 +160,43 @@ $PIP --version >/dev/null 2>&1 || {
 
 APP_DIR="$HOME/.agent-connect"
 mkdir -p "$APP_DIR"
+# Named here rather than at 1c: the ACP decisions below depend on what this file
+# already says, and a setting cannot be reconciled with a file nobody has read.
+CONFIG="$APP_DIR/config.env"
+
+# What the existing config already asks for. Read, never executed: one grep per
+# key, last occurrence wins the same way the worker's own parser resolves it,
+# and the surrounding quotes come off exactly once.
+stored() {  # <KEY>
+  [ -f "$CONFIG" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -n 1 \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+ACP_COMMAND_STORED="$(stored AGENT_CONNECT_ACP_COMMAND)"
+ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
+
+# The three ways an operator can arrive here, and what each one means for the
+# pair (agent name, command). A command always outranks a preset at runtime, so
+# every case has to say what happens to a command that is already stored —
+# leaving that implicit is how a re-run ends up running an agent nobody chose.
+#
+#   named an agent, no command  → the preset is the decision. A stored command
+#                                 would silently beat it, so it is CLEARED.
+#   gave a command              → that command runs; the name is bookkeeping,
+#                                 and defaults to a deliberately non-preset one.
+#   asked for neither           → change nothing. Both are carried across, name
+#                                 included, so a plain re-run to upgrade the
+#                                 worker does not quietly re-point the agent.
+ACP_CMD_CLEAR=0
+if [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
+  [ -n "$ACP_COMMAND" ] || ACP_CMD_CLEAR=1
+elif [ -n "$ACP_COMMAND" ]; then
+  ACP_AGENT="custom"
+elif [ -n "$ACP_COMMAND_STORED" ]; then
+  ACP_AGENT="${ACP_AGENT_STORED:-custom}"
+else
+  ACP_AGENT="${ACP_AGENT_STORED:-claude}"
+fi
 
 # ── 1) install the worker ───────────────────────────────────────────────────
 # One package: the wire is a library inside it, not a second console script to
@@ -194,6 +231,13 @@ ACP_CMD_KV=""
 if [ "$ADAPTER" = "acp" ]; then
   ACP_KV="AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
   [ -z "$ACP_COMMAND" ] || ACP_CMD_KV="AGENT_CONNECT_ACP_COMMAND=$ACP_COMMAND"
+  # Dropping a setting is not something to do quietly, even when it is the only
+  # way to honour what was asked for. The old file is kept beside the new one.
+  if [ "$ACP_CMD_CLEAR" -eq 1 ] && [ -n "$ACP_COMMAND_STORED" ]; then
+    say "--acp-agent '$ACP_AGENT' replaces the AGENT_CONNECT_ACP_COMMAND already in your config"
+    say "  (was: $ACP_COMMAND_STORED) — a command overrides every preset, so keeping it would have"
+    say "  gone on running that agent while this install reported '$ACP_AGENT'. Previous file: $CONFIG.bak"
+  fi
   case "$ACP_AGENT" in
     claude)
       if command -v npm >/dev/null 2>&1; then
@@ -217,7 +261,6 @@ fi
 # this file, so the bearer token stops living in plaintext in a launchd plist
 # (world-readable by default) or a systemd unit. Same keys as README's Settings
 # table; environment variables still win over the file.
-CONFIG="$APP_DIR/config.env"
 # This installer is the documented `curl … | sh` path and people re-run it.
 # A re-run must not silently eat a setting somebody added by hand, so the old
 # file is kept beside the new one and every key this script does not manage is
@@ -234,7 +277,9 @@ if [ -f "$CONFIG" ]; then
   # fall back to the `claude` preset, and the agent would answer rooms as Claude
   # Code with nothing said. Absent flag, absent from this list, hence preserved.
   MANAGED='AGENT_CONNECT_TOKEN|AGENT_CONNECT_ADAPTER|AGENT_CONNECT_REPO|AGENT_CONNECT_ACP_AGENT'
-  [ -z "$ACP_CMD_KV" ] || MANAGED="$MANAGED|AGENT_CONNECT_ACP_COMMAND"
+  if [ -n "$ACP_CMD_KV" ] || [ "$ACP_CMD_CLEAR" -eq 1 ]; then
+    MANAGED="$MANAGED|AGENT_CONNECT_ACP_COMMAND"
+  fi
   KEPT="$(grep -v -E "^[[:space:]]*($MANAGED)[[:space:]]*=" "$CONFIG" \
           | grep -v -E '^[[:space:]]*(#|$)' || true)"
 fi

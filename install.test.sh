@@ -395,6 +395,45 @@ grep -q '^AGENT_CONNECT_ACP_AGENT="gemini"$' "$ACPCFG" \
   && ok "an explicit --acp-agent still wins over the implied 'custom'" \
   || bad "explicit --acp-agent was overridden by the implied default"
 
+# THE transition the adversarial review caught: a stored custom command
+# outranks any preset at runtime, so a later run that NAMES a preset has to
+# clear it. Otherwise the installer fetches the bridge and reports `claude`
+# while the old custom agent goes on receiving owner-tier prompts.
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
+  || bad "seed run for the preset-transition case failed"
+: > "$NPM_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-agent claude --no-start 2>&1) \
+  || bad "switching from a custom command back to a preset failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" \
+  && { sed 's/^/    /' "$ACPCFG"; bad "an explicit --acp-agent left the stored command in place — the preset is silently overridden"; } \
+  || ok "an explicit --acp-agent clears a stored command, so the preset actually decides"
+grep -q '^AGENT_CONNECT_ACP_AGENT="claude"$' "$ACPCFG" \
+  && ok "and the named preset is what the config records" || bad "the named preset was not recorded"
+grep -q "install -g $SPEC" "$NPM_LOG" \
+  && ok "and the bridge that preset needs is installed" || bad "no bridge installed for the newly named preset"
+printf '%s\n' "$out" | grep -q "replaces the AGENT_CONNECT_ACP_COMMAND" \
+  && ok "and the operator is told the command was dropped, not left to find out" \
+  || { printf '%s\n' "$out" | sed 's/^/    /'; bad "clearing the command was silent"; }
+
+# ...while a plain re-run, naming nothing, still changes nothing.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
+  || bad "re-seed failed"
+: > "$NPM_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T4 --adapter acp --no-start 2>&1) || bad "plain re-run failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="my-agent --acp"$' "$ACPCFG" \
+  && ok "a re-run naming neither flag keeps the command" || bad "a plain re-run dropped the command"
+grep -q '^AGENT_CONNECT_ACP_AGENT="custom"$' "$ACPCFG" \
+  && ok "and keeps the agent name with it, rather than reverting it to the claude preset" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a plain re-run re-pointed AGENT_CONNECT_ACP_AGENT"; }
+grep -q "claude-agent-acp" "$NPM_LOG" \
+  && { sed 's/^/    /' "$NPM_LOG"; bad "a plain re-run downloaded the Claude bridge for a custom-command install"; } \
+  || ok "and downloads no bridge it will not use"
+
 # The flag is meaningless without --adapter acp, and says so rather than vanishing.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T --adapter codex --acp-command "x --acp" --no-start 2>&1) \
