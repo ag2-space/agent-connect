@@ -123,6 +123,7 @@ from .. import attachments as att
 from .. import outgoing
 from ..acp.core import (
     AcpAgentGone,
+    AcpAuthRequired,
     AcpClient,
     AcpError,
     SessionResumeRefused,
@@ -517,6 +518,37 @@ def login_advice(agent, env: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def auth_failed_advice(agent, env: Optional[dict] = None) -> str:
+    """What to say when the ACP Agent refuses a Turn as unauthenticated.
+
+    Not `login_advice`: that one opens by saying the Agent advertised a login
+    method, and here it advertised none — `preflight` passed and the refusal
+    only came at `session/prompt`. `preflight` cannot catch it without sending
+    a prompt, which would spend tokens on every Worker start.
+    """
+    env = os.environ if env is None else env
+    name = (env.get(AGENT_ENV) or "").strip().lower()
+    preset = PRESETS.get(name) if not (env.get(COMMAND_ENV) or "").strip() else None
+    lines = [
+        "the Local Agent refused this turn because it is not authenticated. It "
+        "advertised no login method when the Worker started, so the startup "
+        "check had nothing to catch — it only said so when the first real work "
+        "arrived."
+    ]
+    if preset is not None:
+        lines.append(f"Log in with:\n    {preset.login}")
+    else:
+        lines.append(
+            "Log in to the agent yourself, in your own shell, then start the "
+            "Worker again."
+        )
+    lines.append(
+        "agent-connect will not log in for you: it never opens an interactive "
+        "terminal on your machine on behalf of a room."
+    )
+    return "\n".join(lines)
+
+
 def _truthy(value: Optional[str]) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -830,6 +862,10 @@ class AcpAdapter:
             return login_advice(agent)
         return None
 
+    def agent_description_or_none(self):
+        """What `preflight` learned about the Agent, if it ran at all."""
+        return getattr(self, "agent_description", None)
+
     def describe(self) -> str:
         """One line about what preflight found, for the Worker's startup log."""
         agent = getattr(self, "agent_description", None)
@@ -996,6 +1032,10 @@ class AcpAdapter:
             # it.
             yield Done(reason=FAILED, text="".join(chunks),
                        note=_gone_note(exc, store, key))
+            return
+        except AcpAuthRequired:
+            yield Done(reason=FAILED, text="".join(chunks),
+                       note=f"agent-connect: {auth_failed_advice(self.agent_description_or_none())}")
             return
         except AcpError as exc:
             # A missing bridge mid-Turn gets the same install advice the startup

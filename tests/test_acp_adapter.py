@@ -275,6 +275,25 @@ out = bench.handle("c1", "hello")
 check("AGENT_CONNECT_ACP_COMMAND" in out,
       "an unconfigured Worker says so in the room instead of failing silently")
 
+# Advertises no auth method (so preflight passes), then refuses the first
+# prompt. The room must get the thing to do, not a bare protocol error.
+bench = Bench({"promptError": {"code": -32000, "message": "Authentication required"}})
+out = bench.handle("auth1", "hello")
+check("not authenticated" in out,
+      "an auth refusal at the first Turn is reported as an authentication problem")
+check("advertised no login method" in out,
+      "and says why the startup check did not catch it")
+check("will not log in for you" in out,
+      "and repeats that the Worker never opens a terminal to do it")
+check("Authentication required" not in out or "not authenticated" in out,
+      "rather than surfacing the raw protocol error alone")
+
+# A non-auth protocol error is untouched by that path.
+bench = Bench({"promptError": {"code": -32603, "message": "Internal error"}})
+out = bench.handle("auth2", "hello")
+check("not authenticated" not in out,
+      "an unrelated protocol error is not dressed up as a login problem")
+
 check("acp" in NATIVE, "the ACP Adapter is registered under the name 'acp'")
 selected = get_adapter("acp")
 check(hasattr(selected, "turn") and not hasattr(selected, "impl"),
