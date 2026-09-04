@@ -112,12 +112,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import os
 import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 from .. import attachments as att
 from .. import outgoing
@@ -126,10 +128,12 @@ from ..acp.core import (
     AcpAuthRequired,
     AcpClient,
     AcpCommandMissing,
+    AcpDialFailed,
     AcpError,
     SessionResumeRefused,
     TurnResult,
     Update,
+    new_cookie_store,
 )
 from ..acp.policy import WorkingDirectoryPolicy
 from ..events import (
@@ -161,6 +165,14 @@ OWNER = "owner"
 COMMAND_ENV = "AGENT_CONNECT_ACP_COMMAND"
 MODE_ENV = "AGENT_CONNECT_ACP_MODE"
 AGENT_ENV = "AGENT_CONNECT_ACP_AGENT"
+#: An ACP Agent already running behind a URL, dialled instead of spawned.
+URL_ENV = "AGENT_CONNECT_ACP_URL"
+#: The bearer that URL's door checks at the WebSocket upgrade.
+TOKEN_ENV = "AGENT_CONNECT_ACP_TOKEN"
+#: Opt out of the loopback-only rule, deliberately and per install.
+ALLOW_REMOTE_ENV = "AGENT_CONNECT_ACP_ALLOW_REMOTE"
+#: The directory to open Sessions in on the *dialled* Agent's machine.
+REMOTE_CWD_ENV = "AGENT_CONNECT_ACP_REMOTE_CWD"
 SKIP_AUTH_ENV = "AGENT_CONNECT_ACP_SKIP_AUTH_CHECK"
 TIMEOUT_ENV = "AGENT_CONNECT_TURN_TIMEOUT"
 
@@ -176,6 +188,13 @@ DEFAULT_TIMEOUT = 600.0
 #: through an agent that is already misbehaving. When it runs out the Turn's own
 #: child process is reaped — see `_deadline`.
 CANCEL_GRACE = 15.0
+
+#: How long the startup check waits for an ACP Agent to answer `initialize`.
+#: A peer that accepts a connection and then says nothing would otherwise hold
+#: the Worker in preflight for ever — never serving, never exiting, and never
+#: giving a service manager anything to restart. Generous enough for a cold
+#: `npx` bridge; a door slower than this is a door to fix.
+PREFLIGHT_TIMEOUT = 45.0
 
 #: The bridge that makes Claude Code an ACP Agent, pinned.
 #:
@@ -335,6 +354,17 @@ UNSTOPPABLE = (
     "process was ended."
 )
 
+#: The same ending, for an Agent this Worker only dialled. Deliberately weaker,
+#: because the truth is weaker: closing a socket ends our side of the
+#: conversation and nothing else. A spawned Agent is a child process this Worker
+#: can reap; a dialled one keeps running whatever we do, and telling the room
+#: its process was ended would be a claim we cannot make.
+UNSTOPPABLE_REMOTE = (
+    " The agent did not answer the cancellation within {grace:.0f}s. This "
+    "Worker dialled it rather than starting it, so the connection was dropped "
+    "and it may still be working — check the agent itself."
+)
+
 #: A dead Local Agent, and what happens to the conversation it was holding.
 #: The Session identifier survives in the Session map, so the next message in
 #: the room resumes the conversation rather than starting over — which is the
@@ -407,6 +437,97 @@ TOOL_ACTIONS = {
 }
 
 
+#: Hosts the Permission Policy's reasoning survives. See `resolve_url`. Written
+#: as `urlsplit` reports them: lower-cased, and an IPv6 literal without the
+#: brackets it wears in the URL.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+#: The only schemes dialled. The remote-transport RFD requires HTTP/2 for its
+#: Streamable HTTP profile and says a server may be WebSocket-only, so WebSocket
+#: is the profile that excludes no conforming door.
+URL_SCHEMES = ("ws://", "wss://")
+
+
+def url_from_env(env: Optional[dict] = None) -> str:
+    """The ACP Agent's URL as the operator wrote it, validated."""
+    raw = (env if env is not None else os.environ).get(URL_ENV, "").strip()
+    return resolve_url(raw, env) if raw else ""
+
+
+def token_from_env(env: Optional[dict] = None) -> str:
+    """The bearer for that door, read at dial time so a rotation needs no restart."""
+    return (env if env is not None else os.environ).get(TOKEN_ENV, "").strip()
+
+
+def resolve_url(raw: str, env: Optional[dict] = None) -> str:
+    """`raw`, if it is a URL this Worker will dial. Otherwise `AcpError`.
+
+    **Loopback unless the operator says otherwise, and that is a safety rule
+    rather than a convenience.** The Permission Policy answers
+    `session/request_permission` by resolving the requested paths and comparing
+    them against the Session's working directory — on *this* machine's
+    filesystem. When the ACP Agent runs somewhere else, those resolutions are
+    about the wrong filesystem: different symlinks, different mounts, a `..`
+    that climbs somewhere else. The Policy would still answer, and its answers
+    would be guesses wearing the shape of a guarantee. `docs/adr/0001` already
+    concedes the confinement is cooperative; a remote endpoint moves further in
+    that direction, so it has to be asked for by name.
+
+    **The host is read the way the dialling library reads it, and by the same
+    parser.** A hand-rolled split is how this rule gets bypassed rather than
+    broken: `ws://attacker.example?@127.0.0.1` has an authority ending at the
+    `?`, so it names `attacker.example` — while a parser that looks for the last
+    `@` before the first `/` reads `127.0.0.1`, calls it loopback, and hands the
+    bearer to whoever answers. `urlsplit` and `websockets` agree; a private
+    guess does not have to.
+
+    **Off loopback, TLS is required.** The bearer travels on the handshake, so
+    plaintext `ws://` to another host puts the listener's credential and every
+    prompt, reply and tool call on the wire for anyone on the path. Nothing
+    about that is implied by accepting the Policy's uncertainty, so it is a
+    separate refusal rather than a footnote to the same opt-out.
+    """
+    env = os.environ if env is None else env
+    if not raw.startswith(URL_SCHEMES):
+        raise AcpError(
+            f"{URL_ENV}={raw!r} is not a WebSocket URL. It must start with "
+            f"{' or '.join(URL_SCHEMES)} — ACP's remote transport is WebSocket here."
+        )
+    parts = urlsplit(raw)
+    if parts.fragment:
+        raise AcpError(f"{URL_ENV}={raw!r} carries a fragment, which a WebSocket URL may not.")
+    if parts.username or parts.password:
+        raise AcpError(
+            f"{URL_ENV}={raw!r} carries credentials in the URL. The bearer for "
+            f"this door belongs in {TOKEN_ENV}, where it is sent as a header "
+            f"rather than written into a config file's URL."
+        )
+    try:
+        host = (parts.hostname or "").lower()
+    except ValueError as exc:  # a malformed authority, e.g. a bad port
+        raise AcpError(f"{URL_ENV}={raw!r} is not a URL this Worker can dial: {exc}") from exc
+    if not host:
+        raise AcpError(f"{URL_ENV}={raw!r} names no host.")
+    loopback = host in LOOPBACK_HOSTS
+    if not loopback and not _truthy(env.get(ALLOW_REMOTE_ENV)):
+        raise AcpError(
+            f"{URL_ENV}={raw!r} names {host}, and the "
+            f"Permission Policy that guards file operations resolves paths on "
+            f"*this* machine — against a different host it is guesswork. Keep "
+            f"the ACP Agent on loopback, or say you accept that:\n"
+            f"    export {ALLOW_REMOTE_ENV}=1"
+        )
+    if not loopback and parts.scheme != "wss":
+        raise AcpError(
+            f"{URL_ENV}={raw!r} would send this door's bearer token, and every "
+            f"prompt and reply with it, in clear text to {host}. Use wss://. "
+            f"({ALLOW_REMOTE_ENV} accepts the Permission Policy's uncertainty "
+            f"about another host's filesystem; it does not accept putting the "
+            f"credential on the wire.)"
+        )
+    return raw
+
+
 def command_from_env(env: Optional[dict] = None) -> List[str]:
     """The ACP Agent's command line, as the operator wrote it.
 
@@ -425,8 +546,58 @@ def _unconfigured() -> str:
         f"the ACP Adapter needs to know which agent to run. Either name one:\n"
         f"    export {AGENT_ENV}={'|'.join(sorted(PRESETS))}\n"
         f"or give the command yourself, which overrides any preset:\n"
-        f'    export {COMMAND_ENV}="npx -y {BRIDGE_SPEC}"'
+        f'    export {COMMAND_ENV}="npx -y {BRIDGE_SPEC}"\n'
+        f"or dial one that is already running:\n"
+        f'    export {URL_ENV}="ws://127.0.0.1:8802/acp"'
     )
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """Where this Worker's ACP Agent is: a URL to dial, or a command to run."""
+
+    url: str = ""
+    token: str = ""
+    command: Tuple[str, ...] = ()
+
+    @property
+    def dialled(self) -> bool:
+        return bool(self.url)
+
+    def describe(self) -> str:
+        return self.url if self.dialled else " ".join(self.command)
+
+
+def resolve_endpoint(env: Optional[dict] = None) -> Endpoint:
+    """The one ACP Agent this Worker drives, from the settings as written.
+
+    **A URL and a command are mutually exclusive, and that is a rejection rather
+    than a precedence.** Silently preferring one would mean an operator who set
+    both gets answers from an agent they did not pick — different credentials, a
+    different filesystem, a different conversation — with nothing in the room to
+    say which one spoke. A precedence is right for a *preset* versus a command,
+    where both name the same kind of thing; it is wrong for two different agents.
+
+    There is deliberately no fallback from a URL to spawning. A door that is
+    down is a door that is down: starting a second agent locally to cover for it
+    would answer the room as something other than what the operator configured,
+    and would do it exactly when nobody is watching.
+    """
+    env = os.environ if env is None else env
+    url = (env.get(URL_ENV) or "").strip()
+    command = (env.get(COMMAND_ENV) or "").strip()
+    if url and command:
+        raise AcpError(
+            f"{URL_ENV} and {COMMAND_ENV} are both set, and they name two "
+            f"different ACP Agents:\n"
+            f"    {URL_ENV}={url}\n"
+            f"    {COMMAND_ENV}={command}\n"
+            f"Unset one. A Worker that guessed would answer the room as an "
+            f"agent nobody chose."
+        )
+    if url:
+        return Endpoint(url=resolve_url(url, env), token=token_from_env(env))
+    return Endpoint(command=tuple(resolve_command(env)))
 
 
 def preset_for(name: str) -> Preset:
@@ -761,11 +932,21 @@ class AcpAdapter:
         store: Optional[SessionStore] = None,
         session_settings: Optional[SessionSettings] = None,
         timeout: Optional[float] = None,
+        url: Optional[str] = None,
+        token: Optional[str] = None,
+        remote_cwd: Optional[str] = None,
     ):
         # Injectable so a test does not have to set process environment; `None`
         # means "read the environment when the Turn runs", which is what the
         # Worker gets.
         self._command = list(command) if command else None
+        self._url = url or None
+        self._token = token or ""
+        self._remote_cwd = remote_cwd
+        # One store for this Adapter's whole life, because affinity cookies are
+        # about the *next* dial: a fresh one per dial loses the sticky session a
+        # load balancer handed out.
+        self._cookies = None
         self._mode = mode
         self._timeout = timeout
         # The Session map is per-Adapter, and the Adapter is per-Worker: the
@@ -776,10 +957,56 @@ class AcpAdapter:
         self.agent_description = None
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
-        return f"<AcpAdapter {self._command or 'from ' + COMMAND_ENV}>"
+        return f"<AcpAdapter {self._url or self._command or 'from ' + COMMAND_ENV}>"
 
     def command(self) -> List[str]:
         return list(self._command) if self._command else resolve_command()
+
+    def remote_cwd(self) -> str:
+        """The directory a dialled Agent should open its Sessions in.
+
+        `session/new` requires a working directory, so one is always sent — the
+        protocol has no way to say "you choose". On loopback, which is the
+        default, this Worker's own directory is a real path on the same
+        filesystem and is the right thing to send. Across hosts it is not, and
+        there is nothing this Worker can compute that would be: hence a setting,
+        for the case the operator has already opted into with
+        `AGENT_CONNECT_ACP_ALLOW_REMOTE`.
+
+        Empty means "send this Worker's own", which is what a loopback install
+        wants and never has to configure. Note that what an Agent *does* with
+        the value is its own business — the one we verified against accepts any
+        string, including a path that exists nowhere.
+        """
+        if self._remote_cwd is not None:
+            return self._remote_cwd
+        return os.environ.get(REMOTE_CWD_ENV, "").strip()
+
+    def endpoint(self) -> Endpoint:
+        """Where this Adapter's ACP Agent is — injected, or from the settings."""
+        if self._url:
+            return Endpoint(url=resolve_url(self._url), token=self._token)
+        if self._command:
+            return Endpoint(command=tuple(self._command))
+        return resolve_endpoint()
+
+    def _connect(self, endpoint: Endpoint, *, cwd: str, **kwargs):
+        """A live connection to `endpoint`, dialled or spawned.
+
+        The two are never alternatives at runtime: `resolve_endpoint` has
+        already settled which one this Worker has, and a dial that fails stays
+        failed rather than falling back to starting something locally.
+        """
+        if endpoint.dialled:
+            if self._cookies is None:
+                self._cookies = new_cookie_store()
+            return AcpClient.dial(
+                endpoint.url,
+                token=endpoint.token,
+                cookie_store=self._cookies,
+                **kwargs,
+            )
+        return AcpClient.spawn(list(endpoint.command), cwd=cwd, **kwargs)
 
     def mode(self) -> str:
         return self._mode if self._mode is not None else os.environ.get(MODE_ENV, "").strip()
@@ -844,17 +1071,35 @@ class AcpAdapter:
         editing the package.
         """
         try:
-            command = self.command()
+            endpoint = self.endpoint()
         except AcpError as exc:
             return str(exc)
-        if shutil.which(command[0]) is None:
-            return install_advice(command)
+        if not endpoint.dialled and shutil.which(endpoint.command[0]) is None:
+            return install_advice(list(endpoint.command))
+        async def contact():
+            async with self._connect(endpoint, cwd=os.getcwd()) as client:
+                return await client.initialize()
+
         try:
-            async with AcpClient.spawn(command, cwd=os.getcwd()) as client:
-                agent = await client.initialize()
+            # Bounded, because neither half of this is guaranteed to return: a
+            # spawned bridge can start and never speak, and a dialled door can
+            # accept the socket and never answer. Both look identical from here
+            # — a Worker that is still starting — which is the reason to put a
+            # clock on it rather than a note in the log.
+            agent = await asyncio.wait_for(contact(), timeout=PREFLIGHT_TIMEOUT)
+        except asyncio.TimeoutError:
+            return (
+                f"the ACP Agent at {endpoint.describe()} accepted a connection "
+                f"but did not answer `initialize` within {PREFLIGHT_TIMEOUT:.0f}s"
+            )
+        except AcpDialFailed as exc:
+            # A door that is merely not up yet is a real state, and it is not
+            # the same failure as a bridge that is not installed. Said plainly
+            # so the operator fixes the listener rather than the install.
+            return f"the ACP Agent at {endpoint.url} could not be reached: {exc}"
         except AcpError as exc:
             if isinstance(exc, AcpCommandMissing):
-                return install_advice(command)
+                return install_advice(list(endpoint.command))
             return f"the ACP Agent would not start: {exc}"
         except Exception as exc:  # noqa: BLE001 — a startup check reports, never raises
             return f"the ACP Agent would not start: {exc}"
@@ -882,13 +1127,26 @@ class AcpAdapter:
             return
 
         try:
-            command = self.command()
+            endpoint = self.endpoint()
         except AcpError as exc:
             yield Done(reason=FAILED, text="", note=f"agent-connect: {exc}")
             return
 
         cwd = ctx.cwd or os.getcwd()
-        policy = WorkingDirectoryPolicy(cwd)
+        # What the Agent is told to open its Session in. The same directory when
+        # it runs here — which is every loopback install — and the operator's
+        # own value when they have opted into dialling another host, where this
+        # Worker's paths mean nothing.
+        session_cwd = cwd
+        if endpoint.dialled:
+            session_cwd = self.remote_cwd() or cwd
+        # The Policy judges against the directory the Session is actually opened
+        # in, not this Worker's own. They differ exactly when a dialled Agent was
+        # given a directory of its own, and judging the wrong one is wrong in
+        # both directions at once: it would allow paths under this Worker's
+        # directory that are outside the Session's, and refuse paths under the
+        # Session's that are the only ones the agent can legitimately touch.
+        policy = WorkingDirectoryPolicy(session_cwd)
         queue: asyncio.Queue = asyncio.Queue()
         settings = self.session_settings()
         store = self.store() if settings.memory else None
@@ -942,15 +1200,15 @@ class AcpAdapter:
         # hears about it whether or not the agent turns out to be reachable.
         record = store.get(key) if store is not None else None
         if record is not None:
-            why = _why_unusable(record, cwd, settings)
+            why = _why_unusable(record, session_cwd, settings)
             if why:
                 store.forget(key)
                 record = None
                 queue.put_nowait(Notice(text=RESET.format(why=why)))
 
         async def run():
-            async with AcpClient.spawn(
-                command, cwd=cwd, on_update=on_update, permission_handler=on_permission
+            async with self._connect(
+                endpoint, cwd=cwd, on_update=on_update, permission_handler=on_permission
             ) as client:
                 agent = await client.initialize()
                 live.client = client
@@ -967,7 +1225,9 @@ class AcpAdapter:
                     session_id, turns = "", 0
                     if record is not None:
                         try:
-                            await client.load_session(record.session_id, cwd=cwd)
+                            await client.load_session(
+                                record.session_id, cwd=session_cwd
+                            )
                             session_id, turns = record.session_id, record.turns
                         except SessionResumeRefused as exc:
                             queue.put_nowait(
@@ -975,7 +1235,7 @@ class AcpAdapter:
                                     why=WHY_REFUSED.format(detail=exc)))
                             )
                     if not session_id:
-                        session_id = await client.new_session(cwd=cwd)
+                        session_id = await client.new_session(cwd=session_cwd)
                         turns = 0
                     mode = self.mode()
                     if mode:
@@ -986,7 +1246,7 @@ class AcpAdapter:
                         # is in the Local Agent's Session whatever this Worker
                         # does next. Counting it now is also what makes the Turn
                         # budget bound the tokens rather than the successes.
-                        store.remember(key, session_id, cwd, turns + 1)
+                        store.remember(key, session_id, session_cwd, turns + 1)
                 finally:
                     muted.on = False
                 # The deadline may have passed while the Session was being
@@ -1021,10 +1281,12 @@ class AcpAdapter:
             if not live.reaped:
                 raise
             # Our own last resort, not the caller's cancellation: the Turn was
-            # cancelled through the protocol, the agent ignored it, and its
-            # process was ended. Whatever it had said still stands.
+            # cancelled through the protocol and the agent ignored it. What that
+            # last resort *achieves* differs by transport, and the room is told
+            # the difference rather than the spawned story in both cases.
             yield Done(reason=TIMEOUT, text="".join(chunks),
-                       note=_interrupted(seconds, chunks, unstoppable=True))
+                       note=_interrupted(seconds, chunks, unstoppable=True,
+                                         dialled=endpoint.dialled))
             return
         except AcpAgentGone as exc:
             # The Local Agent died. The Worker does not: this is one Turn's
@@ -1041,7 +1303,7 @@ class AcpAdapter:
         except AcpError as exc:
             # A missing bridge mid-Turn gets the same install advice the startup
             # check gives, rather than a bare "command not found".
-            note = (install_advice(command)
+            note = (install_advice(list(endpoint.command))
                     if isinstance(exc, AcpCommandMissing) else str(exc))
             yield Done(reason=FAILED, text="".join(chunks),
                        note=f"agent-connect: {note}")
@@ -1141,20 +1403,31 @@ async def _deadline(seconds: float, live: _LiveTurn, work: asyncio.Future) -> No
     await asyncio.sleep(seconds)
     if work.done():
         return
-    await live.interrupt()
+    # Bounded, because `session/cancel` is a request like any other and an Agent
+    # that has stopped answering will not answer this one either. Unbounded, the
+    # grace period below never began and the deadline never actually ended
+    # anything — the failure mode the whole function exists to prevent.
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(live.interrupt(), timeout=CANCEL_GRACE)
+    live.cancelled = True
     await asyncio.sleep(CANCEL_GRACE)
     if not work.done():
         live.reaped = True
         work.cancel()
 
 
-def _interrupted(seconds: float, chunks, unstoppable: bool = False) -> str:
+def _interrupted(
+    seconds: float, chunks, unstoppable: bool = False, dialled: bool = False
+) -> str:
     """What the room is told about a Turn that hit its deadline."""
     note = INTERRUPTED.format(
         seconds=seconds,
         what=INTERRUPTED_PARTIAL if "".join(chunks).strip() else INTERRUPTED_EMPTY,
     )
-    return note + (UNSTOPPABLE.format(grace=CANCEL_GRACE) if unstoppable else "")
+    if not unstoppable:
+        return note
+    ending = UNSTOPPABLE_REMOTE if dialled else UNSTOPPABLE
+    return note + ending.format(grace=CANCEL_GRACE)
 
 
 def _gone_note(exc: Exception, store, key) -> str:
@@ -1184,7 +1457,7 @@ class _Suppression:
         self.on = False
 
 
-def _why_unusable(record, cwd: str, settings: SessionSettings) -> str:
+def _why_unusable(record, session_cwd: str, settings: SessionSettings) -> str:
     """Why this remembered Session cannot serve this Task — or `""`.
 
     Two reasons, and neither involves asking the Local Agent. A Session's
@@ -1194,8 +1467,16 @@ def _why_unusable(record, cwd: str, settings: SessionSettings) -> str:
     which is the point of the budget: the boundary is the Worker's to enforce
     and to announce, not something to discover when the context is already
     enormous.
+
+    **The comparison is between two values this Worker chose**, which is what
+    makes it meaningful over a socket as well as over a pipe: the map holds the
+    directory that was *sent* when the Session was opened, and this is the
+    directory that would be sent now. It was never the remote's own idea of
+    where it is, so there is nothing here that a different host makes
+    meaningless — and a Session opened under one directory must not go on
+    serving Turns that believe they are in another.
     """
-    if not record.matches(cwd):
+    if not record.matches(session_cwd):
         return WHY_MOVED
     reason = settings.retirement(record)
     return WHY_RETIRED.format(reason=reason) if reason else ""
