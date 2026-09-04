@@ -112,6 +112,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import os
 import shlex
 import shutil
@@ -343,6 +344,17 @@ INTERRUPTED_EMPTY = "It had produced nothing by then."
 UNSTOPPABLE = (
     " The agent did not answer the cancellation within {grace:.0f}s, so its "
     "process was ended."
+)
+
+#: The same ending, for an Agent this Worker only dialled. Deliberately weaker,
+#: because the truth is weaker: closing a socket ends our side of the
+#: conversation and nothing else. A spawned Agent is a child process this Worker
+#: can reap; a dialled one keeps running whatever we do, and telling the room
+#: its process was ended would be a claim we cannot make.
+UNSTOPPABLE_REMOTE = (
+    " The agent did not answer the cancellation within {grace:.0f}s. This "
+    "Worker dialled it rather than starting it, so the connection was dropped "
+    "and it may still be working — check the agent itself."
 )
 
 #: A dead Local Agent, and what happens to the conversation it was holding.
@@ -1070,7 +1082,6 @@ class AcpAdapter:
             return
 
         cwd = ctx.cwd or os.getcwd()
-        policy = WorkingDirectoryPolicy(cwd)
         # What the Agent is told to open its Session in. The same directory when
         # it runs here — which is every loopback install — and the operator's
         # own value when they have opted into dialling another host, where this
@@ -1078,6 +1089,13 @@ class AcpAdapter:
         session_cwd = cwd
         if endpoint.dialled:
             session_cwd = self.remote_cwd() or cwd
+        # The Policy judges against the directory the Session is actually opened
+        # in, not this Worker's own. They differ exactly when a dialled Agent was
+        # given a directory of its own, and judging the wrong one is wrong in
+        # both directions at once: it would allow paths under this Worker's
+        # directory that are outside the Session's, and refuse paths under the
+        # Session's that are the only ones the agent can legitimately touch.
+        policy = WorkingDirectoryPolicy(session_cwd)
         queue: asyncio.Queue = asyncio.Queue()
         settings = self.session_settings()
         store = self.store() if settings.memory else None
@@ -1131,9 +1149,7 @@ class AcpAdapter:
         # hears about it whether or not the agent turns out to be reachable.
         record = store.get(key) if store is not None else None
         if record is not None:
-            why = _why_unusable(
-                record, cwd, settings, owns_cwd=not endpoint.dialled
-            )
+            why = _why_unusable(record, session_cwd, settings)
             if why:
                 store.forget(key)
                 record = None
@@ -1214,10 +1230,12 @@ class AcpAdapter:
             if not live.reaped:
                 raise
             # Our own last resort, not the caller's cancellation: the Turn was
-            # cancelled through the protocol, the agent ignored it, and its
-            # process was ended. Whatever it had said still stands.
+            # cancelled through the protocol and the agent ignored it. What that
+            # last resort *achieves* differs by transport, and the room is told
+            # the difference rather than the spawned story in both cases.
             yield Done(reason=TIMEOUT, text="".join(chunks),
-                       note=_interrupted(seconds, chunks, unstoppable=True))
+                       note=_interrupted(seconds, chunks, unstoppable=True,
+                                         dialled=endpoint.dialled))
             return
         except AcpAgentGone as exc:
             # The Local Agent died. The Worker does not: this is one Turn's
@@ -1334,20 +1352,31 @@ async def _deadline(seconds: float, live: _LiveTurn, work: asyncio.Future) -> No
     await asyncio.sleep(seconds)
     if work.done():
         return
-    await live.interrupt()
+    # Bounded, because `session/cancel` is a request like any other and an Agent
+    # that has stopped answering will not answer this one either. Unbounded, the
+    # grace period below never began and the deadline never actually ended
+    # anything — the failure mode the whole function exists to prevent.
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(live.interrupt(), timeout=CANCEL_GRACE)
+    live.cancelled = True
     await asyncio.sleep(CANCEL_GRACE)
     if not work.done():
         live.reaped = True
         work.cancel()
 
 
-def _interrupted(seconds: float, chunks, unstoppable: bool = False) -> str:
+def _interrupted(
+    seconds: float, chunks, unstoppable: bool = False, dialled: bool = False
+) -> str:
     """What the room is told about a Turn that hit its deadline."""
     note = INTERRUPTED.format(
         seconds=seconds,
         what=INTERRUPTED_PARTIAL if "".join(chunks).strip() else INTERRUPTED_EMPTY,
     )
-    return note + (UNSTOPPABLE.format(grace=CANCEL_GRACE) if unstoppable else "")
+    if not unstoppable:
+        return note
+    ending = UNSTOPPABLE_REMOTE if dialled else UNSTOPPABLE
+    return note + ending.format(grace=CANCEL_GRACE)
 
 
 def _gone_note(exc: Exception, store, key) -> str:
@@ -1377,9 +1406,7 @@ class _Suppression:
         self.on = False
 
 
-def _why_unusable(
-    record, cwd: str, settings: SessionSettings, *, owns_cwd: bool = True
-) -> str:
+def _why_unusable(record, session_cwd: str, settings: SessionSettings) -> str:
     """Why this remembered Session cannot serve this Task — or `""`.
 
     Two reasons, and neither involves asking the Local Agent. A Session's
@@ -1390,16 +1417,15 @@ def _why_unusable(
     and to announce, not something to discover when the context is already
     enormous.
 
-    **`owns_cwd` is false when the Agent was dialled rather than spawned**, and
-    the working-directory reason goes with it. A dialled Agent's directory
-    belongs to *its* host: the value in the map is the one that Agent reported,
-    it means nothing on this filesystem, and comparing it against this Worker's
-    own would retire a live Session every Turn and lose the room its history for
-    a mismatch that was never a mismatch. Whether the Session is still good is
-    then the remote's to answer, and it answers by refusing `session/load` —
-    which is already handled, and already says so in the room.
+    **The comparison is between two values this Worker chose**, which is what
+    makes it meaningful over a socket as well as over a pipe: the map holds the
+    directory that was *sent* when the Session was opened, and this is the
+    directory that would be sent now. It was never the remote's own idea of
+    where it is, so there is nothing here that a different host makes
+    meaningless — and a Session opened under one directory must not go on
+    serving Turns that believe they are in another.
     """
-    if owns_cwd and not record.matches(cwd):
+    if not record.matches(session_cwd):
         return WHY_MOVED
     reason = settings.retirement(record)
     return WHY_RETIRED.format(reason=reason) if reason else ""

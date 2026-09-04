@@ -57,13 +57,19 @@ Across hosts it is not, and nothing this Worker can compute would be, so
 elsewhere. What an Agent does with the value is its own business; the listener we verified
 against accepts any string, including a path that exists nowhere.
 
-What changes in URL mode is the *judging*, not the sending. The Session map records the
-directory so a differently configured Worker gets a fresh Session rather than someone
-else's context — a comparison that is right when this Worker owns the filesystem and wrong
-when it does not, where it would retire a live Session every Turn and cost the room its
-history for a mismatch that was never a mismatch. So dialled, that comparison is dropped,
-and whether the Session survives becomes the remote's answer — given by refusing
-`session/load`, a path that already exists and already says so in the room.
+The Session map records the directory that was *sent*, and the comparison that retires a
+Session is between that and the directory that would be sent now. Both values are this
+Worker's own choice, so the comparison stays meaningful over a socket: a Worker whose own
+directory moved does not disturb a dialled Session whose remote directory did not, while
+changing that remote directory does retire it — a Session opened under one directory must
+not go on serving Turns that believe they are in another. A refused `session/load` remains
+the other way a Session ends, and is still announced in the room.
+
+**The Permission Policy is built from the same directory the Session was opened in.** They
+differ exactly when a dialled Agent was given one of its own, and judging the Worker's
+instead would be wrong in both directions at once: allowing paths under the Worker's
+directory that are outside the Session's, and refusing paths under the Session's, which are
+the only ones the Agent can legitimately touch.
 
 **The bearer is the Agent's, not the relay's.** It rides the WebSocket handshake as an
 `Authorization` header, where a door that authenticates can refuse it before any ACP frame
@@ -82,6 +88,15 @@ Turn had its own process and that concurrency was isolated by the operating syst
 it is not.
 
 ## Costs, stated plainly
+
+**A cancellation this Worker cannot enforce.** A Turn past its deadline is ended through
+`session/cancel`, and only if that is ignored is the last resort used. For a spawned Agent
+that resort is real: the child process is this Worker's and ending it ends the work. A
+dialled Agent's is not — dropping the socket ends our side of the conversation and nothing
+else, and the Agent may still be working. The room is told that, in those words, rather
+than the spawned story. There is no remedy here that does not require something from the
+far side (cancel-on-disconnect, a lease, a termination endpoint), and inventing one that
+only looked like a guarantee is the failure this ADR is trying not to repeat elsewhere.
 
 **A dependency, though a smaller one than it first appears.** The SDK's WebSocket client
 lives behind its own `http` extra (`httpx[http2]`, `websockets`). So this is an extra on a

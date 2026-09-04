@@ -70,6 +70,10 @@ ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-}"
 ACP_COMMAND="${AGENT_CONNECT_ACP_COMMAND:-}"
 ACP_URL="${AGENT_CONNECT_ACP_URL:-}"
 ACP_TOKEN="${AGENT_CONNECT_ACP_TOKEN:-}"
+# Tracked apart from its value: rotating a bearer is its own operation, and a
+# re-run that only supplies a new one must replace the stored bearer rather than
+# leave the worker authenticating with a credential the operator just revoked.
+ACP_TOKEN_GIVEN=0
 # The ACP bridge that makes Claude Code an ACP Agent, PINNED to an exact
 # version. It renamed itself once already (the older name is dead — do not
 # reintroduce it) and moved through many major versions inside six months; an
@@ -113,7 +117,7 @@ while [ $# -gt 0 ]; do
     --acp-agent) ACP_AGENT="$2"; shift 2 ;;
     --acp-command) ACP_COMMAND="$2"; shift 2 ;;
     --acp-url) ACP_URL="$2"; shift 2 ;;
-    --acp-token) ACP_TOKEN="$2"; shift 2 ;;
+    --acp-token) ACP_TOKEN="$2"; ACP_TOKEN_GIVEN=1; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --sutando-workspace|--sutando-workspace=*) sutando_gone ;;
     --no-start) START=0; shift ;;
@@ -122,7 +126,7 @@ while [ $# -gt 0 ]; do
     --acp-agent=*) ACP_AGENT="${1#*=}"; shift ;;
     --acp-command=*) ACP_COMMAND="${1#*=}"; shift ;;
     --acp-url=*) ACP_URL="${1#*=}"; shift ;;
-    --acp-token=*) ACP_TOKEN="${1#*=}"; shift ;;
+    --acp-token=*) ACP_TOKEN="${1#*=}"; ACP_TOKEN_GIVEN=1; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
     *) echo "install.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -302,10 +306,20 @@ export PATH
 ACP_KV=""
 ACP_CMD_KV=""
 ACP_URL_KV=""
+ACP_TOKEN_KV=""
 if [ "$ADAPTER" = "acp" ]; then
   ACP_KV="AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
   [ -z "$ACP_COMMAND" ] || ACP_CMD_KV="AGENT_CONNECT_ACP_COMMAND=$ACP_COMMAND"
   [ -z "$ACP_URL" ] || ACP_URL_KV="AGENT_CONNECT_ACP_URL=$ACP_URL"
+  # A token is written when this run supplied one and the result actually dials,
+  # or when a new URL is being written and a token came with it.
+  if [ -n "$ACP_TOKEN" ] && { [ -n "$ACP_URL_KV" ] || \
+     { [ "$ACP_TOKEN_GIVEN" -eq 1 ] && [ "$ACP_DIAL" -eq 1 ]; }; }; then
+    ACP_TOKEN_KV="AGENT_CONNECT_ACP_TOKEN=$ACP_TOKEN"
+  fi
+  if [ "$ACP_TOKEN_GIVEN" -eq 1 ] && [ "$ACP_DIAL" -eq 0 ]; then
+    echo "install.sh: WARNING — --acp-token needs a dialled agent; pass --acp-url too, or leave the stored one in place. Ignoring it." >&2
+  fi
   if [ "$ACP_URL_CLEAR" -eq 1 ]; then
     say "this run selects an ACP agent to spawn, so the dialled door already in your config is removed"
     say "  (was: $ACP_URL_STORED) — the worker refuses to start with both, so keeping it would have"
@@ -368,6 +382,10 @@ if [ -f "$CONFIG" ]; then
   # without the flag keeps the URL and token already in the file.
   if [ -n "$ACP_URL_KV" ] || [ "$ACP_URL_CLEAR" -eq 1 ]; then
     MANAGED="$MANAGED|AGENT_CONNECT_ACP_URL|AGENT_CONNECT_ACP_TOKEN"
+  elif [ -n "$ACP_TOKEN_KV" ]; then
+    # Rotating the bearer alone: the URL is kept exactly as it is, and only the
+    # credential beside it is replaced.
+    MANAGED="$MANAGED|AGENT_CONNECT_ACP_TOKEN"
   fi
   KEPT="$(grep -v -E "^[[:space:]]*($MANAGED)[[:space:]]*=" "$CONFIG" \
           | grep -v -E '^[[:space:]]*(#|$)' || true)"
@@ -392,7 +410,7 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     [ -z "$ACP_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
     [ -z "$ACP_CMD_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_COMMAND=\"$ACP_COMMAND\""
     [ -z "$ACP_URL_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_URL=\"$ACP_URL\""
-    [ -z "$ACP_URL_KV" ] || [ -z "$ACP_TOKEN" ] || printf '%s\n' "AGENT_CONNECT_ACP_TOKEN=\"$ACP_TOKEN\""
+    [ -z "$ACP_TOKEN_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_TOKEN=\"$ACP_TOKEN\""
     if [ -n "$KEPT" ]; then
       printf '\n'
       printf '%s\n' "# kept from your previous config.env:"

@@ -459,6 +459,32 @@ grep -q "claude-agent-acp" "$NPM_LOG" \
   && { sed 's/^/    /' "$NPM_LOG"; bad "a bridge was installed for an agent that is only dialled"; } \
   || ok "and no bridge is fetched, because nothing is spawned"
 
+# 9f) Rotating the bearer on its own. A re-run that supplies only a new token
+#     must replace the stored one — leaving the old bearer would restart the
+#     worker with a credential the operator has just revoked.
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:8802/acp" \
+     --acp-token "OLD" --no-start >/dev/null 2>&1 || bad "url install failed"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-token "ROTATED" --no-start >/dev/null 2>&1 \
+  || bad "token-only rotation failed"
+grep -q '^AGENT_CONNECT_ACP_TOKEN="ROTATED"$' "$ACPCFG" \
+  && ok "--acp-token on its own replaces the stored bearer" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a token-only re-run kept the old bearer"; }
+grep -q '^AGENT_CONNECT_ACP_URL="ws://127.0.0.1:8802/acp"$' "$ACPCFG" \
+  && ok "and leaves the door it belongs to exactly as it was" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a token-only re-run disturbed the URL"; }
+
+# And a plain re-run — no ACP flags at all — still keeps both.
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  sh "$SCRIPT" --token T4 --adapter acp --no-start >/dev/null 2>&1 \
+  || bad "plain acp re-run failed"
+grep -q '^AGENT_CONNECT_ACP_TOKEN="ROTATED"$' "$ACPCFG" \
+  && grep -q '^AGENT_CONNECT_ACP_URL=' "$ACPCFG" \
+  && ok "a re-run with no ACP flags keeps the dialled door and its bearer" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a plain re-run lost the dialled settings"; }
+
 # A run that DOES supply one rewrites it, exactly once.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T3 --adapter acp --acp-command "other-agent --acp" --no-start 2>&1) \

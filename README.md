@@ -257,11 +257,13 @@ Four things worth knowing before you use it:
 - **The working directory is the remote's.** `session/new` requires one, so the
   worker always sends a value: its own directory, which on loopback is a real
   path on the same filesystem, or `AGENT_CONNECT_ACP_REMOTE_CWD` when you are
-  dialling another host and this machine's paths mean nothing there. What the
-  worker *stops* doing is judging a remembered session by comparing that
-  directory to its own — over a socket that comparison would retire a live
-  session every turn. Whether a session is still good is the agent's answer,
-  given by refusing to resume it, and the room is told as it always was.
+  dialling another host and this machine's paths mean nothing there. A session
+  is retired when *that* directory changes, not when the worker's own does — and
+  the permission policy judges the same directory the session was opened in.
+- **A turn that overruns can only be asked to stop.** `session/cancel` is sent
+  first, as it always was. If the agent ignores it, a spawned agent's process is
+  ended; a dialled one is not yours to end, so the connection is dropped and the
+  room is told it may still be working.
 
 The bearer travels on the WebSocket handshake, is read fresh on every dial (so
 rotating it needs no restart), and lives in the same `0600` config file as your

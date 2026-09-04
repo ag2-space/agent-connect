@@ -271,25 +271,49 @@ async def _adapter_turn(door, adapter, prompt="hello", cwd=None):
     return await worker.run_turn(adapter, ctx)
 
 
-async def _adapter_over_ws():
+async def _adapter_over_ws(remote_cwd=None, second_cwd="/local/repo"):
+    """Two Turns on one Adapter, with the Worker's own directory moving between."""
     with tempfile.TemporaryDirectory() as tmp:
         async with Door(SCRIPT) as door:
             adapter = AcpAdapter(url=door.url, token=door.token,
+                                 remote_cwd=remote_cwd,
                                  store=SessionStore(Path(tmp) / "sessions.json"))
-            first = await _adapter_turn(door, adapter)
-            # A second Turn from a Worker whose own directory has moved. Over a
-            # socket the stored cwd is the remote's, so this must NOT retire it.
-            second = await _adapter_turn(door, adapter, cwd="/somewhere/else")
+            first = await _adapter_turn(door, adapter, cwd="/local/repo")
+            second = await _adapter_turn(door, adapter, cwd=second_cwd)
             return first, second, door
 
 
 first, second, door = run(_adapter_over_ws())
 check("PONG" in first, "the Adapter runs a Turn over a dialled door")
 check(door.dials == 2, "and dials once per Turn, as it spawns once per Turn")
-check("fresh conversation" not in second and "working directory changed" not in second,
-      "a Worker whose own cwd moved does not retire a dialled Session: "
-      "that directory belongs to the remote")
 check("PONG" in second, "and the second Turn answers normally")
+
+# The case the opaque-cwd decision was actually protecting: the Worker's own
+# directory moves, but the dialled Agent's does not, so nothing is retired.
+first, second, door = run(_adapter_over_ws(remote_cwd="/srv/agent",
+                                           second_cwd="/somewhere/else"))
+check("fresh conversation" not in second,
+      "a Worker whose own directory moved does not retire a dialled Session "
+      "whose remote directory has not")
+
+# And the case it must NOT protect: the directory the Session was opened in is
+# the one that changed, so continuing in it would put the Turn somewhere it does
+# not believe it is.
+async def _remote_cwd_changed():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SessionStore(Path(tmp) / "sessions.json")
+        async with Door(SCRIPT) as door:
+            a = AcpAdapter(url=door.url, token=door.token,
+                           remote_cwd="/srv/agent", store=store)
+            await _adapter_turn(door, a, cwd="/local/repo")
+            b = AcpAdapter(url=door.url, token=door.token,
+                           remote_cwd="/srv/other", store=store)
+            return await _adapter_turn(door, b, cwd="/local/repo")
+
+
+said = run(_remote_cwd_changed())
+check("fresh conversation" in said,
+      "but changing the dialled Agent's own directory does retire it, out loud")
 
 
 async def _adapter_dial_failure():
@@ -341,6 +365,42 @@ check(seen == ["/local/repo"],
 seen = run(_cwd_sent(remote_cwd="/srv/agent/workspace"))
 check(seen == ["/srv/agent/workspace"],
       "and the remote directory setting is what is sent when the operator gives one")
+
+
+# --- the Policy judges the directory the Session runs in ---------------------
+# They differ exactly when a dialled Agent was given a directory of its own, and
+# the wrong root is wrong twice over: paths under the Worker's directory that
+# are outside the Session's would be allowed, and paths under the Session's —
+# the only ones the agent can legitimately touch — refused.
+
+from agent_connect.acp import PermissionRequest, WorkingDirectoryPolicy  # noqa: E402
+
+
+async def _policy_root(remote_cwd):
+    seen = {}
+    real = WorkingDirectoryPolicy.__init__
+
+    def spy(policy_self, root, *a, **k):
+        seen["root"] = root
+        return real(policy_self, root, *a, **k)
+
+    WorkingDirectoryPolicy.__init__ = spy
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            async with Door(SCRIPT) as door:
+                adapter = AcpAdapter(url=door.url, token=door.token,
+                                     remote_cwd=remote_cwd,
+                                     store=SessionStore(Path(tmp) / "s.json"))
+                await _adapter_turn(door, adapter, cwd="/local/repo")
+    finally:
+        WorkingDirectoryPolicy.__init__ = real
+    return seen.get("root")
+
+
+check(run(_policy_root("/srv/agent")) == "/srv/agent",
+      "the Policy is built from the directory the Session was opened in")
+check(run(_policy_root(None)) == "/local/repo",
+      "which is the Worker's own when no remote directory was configured")
 
 
 # --- optional: the same, against a real listener ----------------------------
