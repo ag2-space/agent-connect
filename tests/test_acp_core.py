@@ -25,7 +25,10 @@ from pathlib import Path
 try:
     from agent_connect.acp import (
         AcpAgentGone,
+        AcpAuthRequired,
         AcpClient,
+        AcpCommandMissing,
+        AcpError,
         PermissionRequest,
         SessionResumeRefused,
         Update,
@@ -373,6 +376,93 @@ async def _missing():
 exc = run(_missing())
 check(exc is not None and "not found" in str(exc),
       "a missing ACP Agent command fails with a clear error, not a traceback")
+check(isinstance(exc, AcpCommandMissing),
+      "and has its own class, so the caller need not match on the wording")
+
+# --- an Agent's own explanation survives into the error ---------------------
+# JSON-RPC puts the message ("Internal error") in `message` and the cause in
+# `data`. Keeping only the first leaves a failed Turn with nothing to report.
+
+
+async def _prompt_error(script_error):
+    fake = Fake({"promptError": script_error})
+    async with fake.client() as client:
+        await client.initialize()
+        session_id = await client.new_session(cwd="/repo")
+        try:
+            await client.prompt(session_id, "go")
+            return None
+        except AcpError as exc:
+            return exc
+
+
+exc = run(_prompt_error({
+    "code": -32603, "message": "Internal error",
+    "data": {"reason": "API key not valid. Please pass a valid API key.",
+             "type": "ClientError"},
+}))
+check(exc is not None, "a prompt error raises")
+check("API key not valid" in str(exc), "`data.reason` reaches the error text")
+check("Internal error" in str(exc), "the JSON-RPC message is kept alongside it")
+check(getattr(exc, "data", None) == {
+          "reason": "API key not valid. Please pass a valid API key.",
+          "type": "ClientError"},
+      "the whole `data` member is kept for a caller that wants to branch on it")
+
+exc = run(_prompt_error({
+    "code": -32603, "message": "Internal error",
+    "data": {"details": "Run `ag2-assistant onboard` in a terminal."},
+}))
+check("ag2-assistant onboard" in str(exc),
+      "`details` is read as well as `reason` — the spelling is the Agent's")
+
+exc = run(_prompt_error({
+    "code": -32602, "message": "Invalid params", "data": {"uri": "file:///x"},
+}))
+check(str(exc) == "Invalid params",
+      "a `data` with no operator-facing key adds nothing to the message")
+check(getattr(exc, "data", None) == {"uri": "file:///x"},
+      "and is still carried for the caller")
+
+exc = run(_prompt_error({"code": -32603, "message": "Internal error"}))
+check(str(exc) == "Internal error", "an error with no `data` reads as it always did")
+check(getattr(exc, "data", None) is None, "and carries none")
+
+exc = run(_prompt_error({
+    "code": -32000, "message": "Authentication required",
+    "data": {"reason": "Call authenticate first."},
+}))
+check(isinstance(exc, AcpAuthRequired),
+      "the auth code still selects AcpAuthRequired")
+check("Call authenticate first." in str(exc),
+      "and the auth refusal carries its reason too")
+
+long_reason = "x" * 900
+exc = run(_prompt_error({
+    "code": -32603, "message": "Internal error", "data": {"reason": long_reason},
+}))
+check(len(str(exc)) < 600, "a runaway `data.reason` is bounded, as the stderr tail is")
+
+
+async def _refused_resume_data():
+    fake = Fake({"loadSessionError": {
+        "code": -32002, "message": "Resource not found",
+        "data": {"reason": "no such session", "category": "session_missing"},
+    }})
+    async with fake.client() as client:
+        await client.initialize()
+        try:
+            await client.load_session("old-session", cwd="/repo")
+            return None
+        except SessionResumeRefused as exc:
+            return exc
+
+
+exc = run(_refused_resume_data())
+check("no such session" in str(exc), "a refused resumption keeps its reason")
+check((getattr(exc, "data", None) or {}).get("category") == "session_missing",
+      "and `category` — the stable key — survives for branching")
+
 
 # --- the core knows nothing about Tasks, rooms or the relay -----------------
 

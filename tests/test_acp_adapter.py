@@ -294,6 +294,27 @@ out = bench.handle("auth2", "hello")
 check("not authenticated" not in out,
       "an unrelated protocol error is not dressed up as a login problem")
 
+# --- an Agent's reason reaches the room, and never reads as a missing bridge -
+
+bench = Bench({"promptError": {
+    "code": -32603, "message": "Internal error",
+    "data": {"reason": "API key not valid. Please pass a valid API key."},
+}})
+out = bench.handle("data1", "hello")
+check("API key not valid" in out,
+      "the Agent's own explanation reaches the room, not just 'Internal error'")
+
+# The bridge is present and answering; only the Turn failed. Install advice here
+# would send the operator to fix a bridge that is running.
+bench = Bench({"promptError": {
+    "code": -32603, "message": "Internal error",
+    "data": {"reason": "config file not found at ~/.config/agent.toml"},
+}})
+out = bench.handle("data2", "hello")
+check("not installed" not in out and "npm install -g" not in out,
+      "a wire error mentioning 'not found' is not mistaken for a missing bridge")
+check("config file not found" in out, "and its reason is reported as written")
+
 check("acp" in NATIVE, "the ACP Adapter is registered under the name 'acp'")
 selected = get_adapter("acp")
 check(hasattr(selected, "turn") and not hasattr(selected, "impl"),
