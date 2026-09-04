@@ -223,7 +223,8 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(client.next_task(timeout=0.1) is None,
           "a redelivered task the client already answered never reaches the consumer")
     replayed = broker.took("POST", "/v1/results")
-    check(len(replayed) == 1 and replayed[0].json == {"id": "task-1", "body": NO_SEND},
+    check(len(replayed) == 1 and replayed[0].json == {
+              "id": "task-1", "body": NO_SEND, "no_send": True},
           "it is re-completed upstream with a skip marker instead (F3, H1)")
     check(client.journal.is_done("task-1"), "and the id stays done")
     check(client.inflight() == [], "a re-completed redelivery leaves nothing in flight")
@@ -975,6 +976,38 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
           "and the ledger is retired by the POST that finally succeeded, "
           "because only success may retire one (F5)")
 
+
+# --- H1: a skip completes the lease, and says so twice -------------------
+#
+# Two clients have been completing skipped leases against this broker for a
+# year: sutando sends `no_send: true` and trusts the flag, this one sent the
+# marker in the body and trusted the broker to read it. Neither belief was ever
+# tested against the other, and the migration is what makes that a live
+# question rather than a curiosity. So both go, and the answer is correct
+# whichever half the broker actually honors.
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    client = client_for(broker, tmp)
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(wire_id="task-skip")]})
+    broker.on("POST", "/v1/results", json={"ok": True})
+    client.poll_once()
+    client.next_task(timeout=1)
+
+    client.complete("task-skip", "[no-send] recorded for the log, sent to nobody")
+    posted = broker.took("POST", "/v1/results")[-1].json
+    check(posted["no_send"] is True,
+          "a skipped result carries the flag sutando has always sent")
+    check(posted["body"] == "[no-send] recorded for the log, sent to nobody",
+          "and the marker stays in the body, which is what this client has "
+          "always sent — the two beliefs are no longer in competition")
+
+    broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(wire_id="task-said")]})
+    client.poll_once()
+    client.next_task(timeout=1)
+    client.complete("task-said", "an ordinary answer")
+    ordinary = broker.took("POST", "/v1/results")[-1].json
+    check("no_send" not in ordinary,
+          "an answer meant for the room carries no such flag — the field is a "
+          "statement about this result, not a client-wide setting")
 
 print("\n" + ("PASS — wire loop green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)
