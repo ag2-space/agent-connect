@@ -12,11 +12,19 @@ Run: python3 tests/test_journal.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
 import json
+import logging
 import os
+import subprocess
+import stat
+import sys
 import tempfile
+import time
 from pathlib import Path
 
+from ag2_relay_client import journal as journal_module
+from ag2_relay_client import locking
 from ag2_relay_client.journal import Journal, Reconciler
+from ag2_relay_client.locking import acquire_exclusive, release_exclusive
 from ag2_relay_client.state import write_private_atomic
 
 fails = 0
@@ -31,6 +39,19 @@ def check(cond, name):
 
 def fresh(tmp, name="journal.jsonl", **kwargs):
     return Journal(Path(tmp) / name, **kwargs)
+
+
+class Listening(logging.Handler):
+    def __init__(self):
+        logging.Handler.__init__(self)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append((record.levelno, record.getMessage()))
+
+    def warned(self, needle):
+        return any(level >= logging.WARNING and needle in text
+                   for level, text in self.lines)
 
 
 # --- durability: the fact is on disk before the mutator returns -------------
@@ -102,8 +123,15 @@ with tempfile.TemporaryDirectory() as tmp:
     journal.accept("task-a", room="!r:x")
     journal.accept("task-b", room="!r:y")
     path = journal.path
-    check(oct(os.stat(path).st_mode & 0o777) == oct(0o600),
-          "the journal is private — it is the id ledger of one bearer")
+    if os.name == "nt":
+        # Windows privacy is an ACL property, not a POSIX mode-bit property;
+        # chmod(0o600) maps only to the read-only file attribute there. Keep the
+        # applicable standard-library contract: the owner can update the file.
+        check(bool(os.stat(path).st_mode & stat.S_IWRITE),
+              "the Windows journal remains owner-writable (privacy is ACL-based)")
+    else:
+        check(oct(os.stat(path).st_mode & 0o777) == oct(0o600),
+              "the journal is private — it is the id ledger of one bearer")
     check(not [p for p in Path(tmp).iterdir() if p.name.endswith(".tmp")],
           "the temp file the atomic replace used does not survive it")
 
@@ -193,6 +221,70 @@ with tempfile.TemporaryDirectory() as tmp:
     check(fresh(tmp).load().is_accepted("task-C"),
           "an id another process created is adopted, not overwritten away")
 
+# The same merge, with genuinely separate processes leaving the gate together.
+JOURNAL_RACER = """
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from ag2_relay_client.journal import Journal
+journal = Journal(sys.argv[2]).load()
+Path(sys.argv[4]).write_text("ready", encoding="utf-8")
+gate = Path(sys.argv[5])
+deadline = time.monotonic() + 15.0
+while not gate.exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("parent did not release the Journal race gate")
+    time.sleep(0.005)
+if sys.argv[6] == "no-lock":
+    import ag2_relay_client.locking as locking
+    locking._BACKEND = None
+    locking._BACKEND_LOAD_ERROR = RuntimeError("deliberately unavailable")
+journal.accept(sys.argv[3])
+"""
+
+
+def run_process_journal_race(tmp, disable_lock=False):
+    path = Path(tmp) / "journal.jsonl"
+    gate = Path(tmp) / "release"
+    wire_ids = ("task-process-A", "task-process-B")
+    ready_markers = [Path(tmp) / (wire_id + ".ready") for wire_id in wire_ids]
+    writers = [
+        subprocess.Popen([
+            sys.executable, "-c", JOURNAL_RACER, str(_bootstrap.ROOT),
+            str(path), wire_id, str(ready), str(gate),
+            "no-lock" if disable_lock else "lock"
+        ])
+        for wire_id, ready in zip(wire_ids, ready_markers)
+    ]
+    deadline = time.monotonic() + 10.0
+    while not all(marker.exists() for marker in ready_markers):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.005)
+    both_ready = all(marker.exists() for marker in ready_markers)
+    gate.write_text("go", encoding="utf-8")
+    codes = []
+    for writer in writers:
+        try:
+            codes.append(writer.wait(timeout=30))
+        except subprocess.TimeoutExpired:
+            writer.terminate()
+            codes.append(writer.wait(timeout=5))
+    return both_ready, codes, fresh(tmp).load().inflight_ids()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    ready, codes, result = run_process_journal_race(tmp)
+    check(ready and codes == [0, 0] and set(result) == {
+        "task-process-A", "task-process-B"},
+        f"two processes changing different Task ids preserve both facts ({result})")
+
+with tempfile.TemporaryDirectory() as tmp:
+    ready, codes, result = run_process_journal_race(tmp, disable_lock=True)
+    check(ready and codes == [0, 0] and len(result) == 1 and
+          set(result) < {"task-process-A", "task-process-B"},
+          f"without the merge lock, the same stale-view race loses one fact ({result})")
+
 # --- F8 on the way back in, not only on the way out ------------------------
 # The journal is this library's own file, but "our own file" is not a trust
 # boundary a state dir can carry: it syncs, it is restored, and anything running
@@ -213,38 +305,101 @@ with tempfile.TemporaryDirectory() as tmp:
     check(loaded.inflight_ids() == ["task-ok"] and not loaded.done_ids(),
           "only ids this client would have been willing to write survive a load")
 
-# --- the lock a write could not take must not cost a descriptor ------------
+# --- lock fallback stays visible, bounded, fail-open, and leak-free --------
 # The give-up path is the *expected* one under J1: a standby exists by design, a
 # takeover has both views live at once, and a consumer may answer from somewhere
 # else — so a contended write is ordinary, not exotic. It used to `yield False`
 # with the lock file still open, which leaks one descriptor per contended write
 # and ends in `EMFILE` on the poll thread: a client that can no longer open a
 # socket, arrived at through the very condition the lock exists for.
-if hasattr(os, "listdir") and Path("/dev/fd").exists():
-    import fcntl
+def descriptor_count():
+    if Path("/dev/fd").exists():
+        return len(os.listdir("/dev/fd"))
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
 
-    import ag2_relay_client.journal as journal_module
+        count = wintypes.DWORD()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessHandleCount.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetProcessHandleCount.restype = wintypes.BOOL
+        if not kernel32.GetProcessHandleCount(
+                kernel32.GetCurrentProcess(), ctypes.byref(count)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(count.value)
+    return None
 
-    with tempfile.TemporaryDirectory() as tmp:
+
+with tempfile.TemporaryDirectory() as tmp:
+    listener = Listening()
+    logging.getLogger("ag2_relay_client").addHandler(listener)
+    journal = fresh(tmp)
+    rival = os.open(str(Path(tmp) / "journal.jsonl.lock"),
+                    os.O_RDWR | os.O_CREAT, 0o600)
+    acquire_exclusive(rival, time.monotonic() + 1.0)
+    was, journal_module.LOCK_WAIT_S = journal_module.LOCK_WAIT_S, 0.01
+    try:
+        before = descriptor_count()
+        started = time.monotonic()
+        for index in range(20):
+            journal.accept("task-%d" % index, room="!room:ag2.space")
+        elapsed = time.monotonic() - started
+        after = descriptor_count()
+    finally:
+        journal_module.LOCK_WAIT_S = was
+        release_exclusive(rival)
+        os.close(rival)
+    if os.name == "nt":
+        counts_available = before is not None and after is not None
+        check(counts_available,
+              "Windows handle counts are available around contended writes")
+        counts_match = counts_available and after == before
+    else:
+        counts_match = before is None or after == before
+    check(counts_match,
+          "twenty writes made while another process holds the lock leak no "
+          "descriptors — the give-up path closes the file it opened")
+    check(elapsed < 1.0,
+          f"journal contention stays bounded ({elapsed:.3f}s for twenty writes)")
+    check(listener.warned("stayed held"),
+          "a journal lock timeout makes the write-without-merge fallback visible")
+    check(fresh(tmp).load().inflight() == 20,
+          "and every one of them still landed: the lock is a merge, never a "
+          "precondition (D4)")
+    logging.getLogger("ag2_relay_client").removeHandler(listener)
+
+with tempfile.TemporaryDirectory() as tmp:
+    listener = Listening()
+    logging.getLogger("ag2_relay_client").addHandler(listener)
+    saved_backend = locking._BACKEND
+    saved_error = locking._BACKEND_LOAD_ERROR
+    locking._BACKEND = None
+    locking._BACKEND_LOAD_ERROR = RuntimeError("deliberately unavailable")
+    try:
+        before = descriptor_count()
         journal = fresh(tmp)
-        rival = os.open(str(Path(tmp) / "journal.jsonl.lock"),
-                        os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(rival, fcntl.LOCK_EX)
-        was, journal_module.LOCK_WAIT_S = journal_module.LOCK_WAIT_S, 0.01
-        try:
-            before = len(os.listdir("/dev/fd"))
-            for index in range(20):
-                journal.accept("task-%d" % index, room="!room:ag2.space")
-            after = len(os.listdir("/dev/fd"))
-        finally:
-            journal_module.LOCK_WAIT_S = was
-            os.close(rival)
-        check(after == before,
-              "twenty writes made while another process holds the lock leak no "
-              "descriptors — the give-up path closes the file it opened")
-        check(fresh(tmp).load().inflight() == 20,
-              "and every one of them still landed: the lock is a merge, never a "
-              "precondition (D4)")
+        journal.accept("task-backend-fallback")
+        after = descriptor_count()
+    finally:
+        locking._BACKEND = saved_backend
+        locking._BACKEND_LOAD_ERROR = saved_error
+    check(fresh(tmp).load().is_accepted("task-backend-fallback"),
+          "backend failure still writes the Journal without a merge lock")
+    check(listener.warned("backend failed"),
+          "and the backend-failure fallback is visible in logs")
+    if os.name == "nt":
+        counts_available = before is not None and after is not None
+        check(counts_available,
+              "Windows handle counts are available around backend failure")
+        counts_match = counts_available and after == before
+    else:
+        counts_match = before is None or after == before
+    check(counts_match,
+          "and backend failure closes the Journal lock descriptor")
+    logging.getLogger("ag2_relay_client").removeHandler(listener)
 
 
 print("\n" + ("PASS — journal green" if fails == 0 else f"FAIL — {fails} failing"))
