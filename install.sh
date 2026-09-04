@@ -74,6 +74,11 @@ ACP_TOKEN="${AGENT_CONNECT_ACP_TOKEN:-}"
 # re-run that only supplies a new one must replace the stored bearer rather than
 # leave the worker authenticating with a credential the operator just revoked.
 ACP_TOKEN_GIVEN=0
+# Supplied is supplied: the documented interface is a flag *or* the environment
+# variable, and an operator who exported a fresh bearer and re-ran the installer
+# has rotated it just as much as one who typed the flag. Reading only the flag
+# left the revoked credential in the file.
+[ -z "$ACP_TOKEN" ] || ACP_TOKEN_GIVEN=1
 # The ACP bridge that makes Claude Code an ACP Agent, PINNED to an exact
 # version. It renamed itself once already (the older name is dead — do not
 # reintroduce it) and moved through many major versions inside six months; an

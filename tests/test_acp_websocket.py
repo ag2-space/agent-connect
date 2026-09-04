@@ -88,10 +88,54 @@ check(ALLOW_REMOTE_ENV in remote,
 check("this machine" in remote or "guess" in remote,
       "and says why: the Permission Policy resolves paths on this filesystem")
 
-check(resolve_url("ws://10.0.0.5:8802/acp", {ALLOW_REMOTE_ENV: "1"}) ==
-      "ws://10.0.0.5:8802/acp",
+check(resolve_url("wss://10.0.0.5:8802/acp", {ALLOW_REMOTE_ENV: "1"}) ==
+      "wss://10.0.0.5:8802/acp",
       "and the opt-out is honoured once it is set on purpose")
-for host in ("ws://localhost:8802/acp", "ws://127.0.0.1:8802/acp", "ws://[::1]:8802/acp"):
+
+# The host is whatever the dialling library will dial, read by the same parser.
+# A hand-rolled split reads the last `@` before the first `/` and calls
+# `ws://attacker.example?@127.0.0.1` loopback, while `websockets` connects to
+# `attacker.example` — bearer and all.
+for sneaky in ("ws://attacker.example?@127.0.0.1",
+               "ws://attacker.example/?@127.0.0.1",
+               "ws://attacker.example?x=@localhost"):
+    try:
+        resolve_url(sneaky, {})
+        said = ""
+    except AcpError as exc:
+        said = str(exc)
+    check("attacker.example" in said,
+          f"{sneaky!r} is judged on the host that would actually be dialled")
+
+for bad in ("ws://attacker.example#@127.0.0.1",):
+    try:
+        resolve_url(bad, {})
+        said = ""
+    except AcpError as exc:
+        said = str(exc)
+    check("fragment" in said, "a fragment is refused rather than parsed around")
+
+try:
+    resolve_url("ws://user:pw@127.0.0.1:8802/acp", {})
+    said = ""
+except AcpError as exc:
+    said = str(exc)
+check(TOKEN_ENV in said,
+      "credentials in the URL are refused, and the bearer's own setting is named")
+
+# Off loopback the bearer is on the wire, which the filesystem opt-out says
+# nothing about. Separate refusal, separate reason.
+try:
+    resolve_url("ws://10.0.0.5:8802/acp", {ALLOW_REMOTE_ENV: "1"})
+    said = ""
+except AcpError as exc:
+    said = str(exc)
+check("clear text" in said and "wss://" in said,
+      "plaintext ws:// to another host is refused: the handshake carries the bearer")
+check(resolve_url("ws://127.0.0.1:8802/acp", {}) == "ws://127.0.0.1:8802/acp",
+      "while loopback ws:// stays fine — nothing leaves the machine")
+for host in ("ws://localhost:8802/acp", "ws://127.0.0.1:8802/acp", "ws://[::1]:8802/acp",
+             "ws://LocalHost:8802/acp"):
     check(resolve_url(host, {}) == host, f"{host} needs no opt-out")
 
 check(Endpoint(url="ws://x").dialled and not Endpoint(command=("a",)).dialled,
@@ -365,6 +409,41 @@ check(seen == ["/local/repo"],
 seen = run(_cwd_sent(remote_cwd="/srv/agent/workspace"))
 check(seen == ["/srv/agent/workspace"],
       "and the remote directory setting is what is sent when the operator gives one")
+
+
+# --- a door that accepts and then says nothing --------------------------------
+
+
+async def _silent_door_preflight():
+    """Accept the WebSocket, answer no ACP frame. Preflight must not hang."""
+    import agent_connect.adapters.acp as mod
+
+    release = asyncio.Event()
+
+    async def hold(ws):
+        # Parked, not closed — the failure being reproduced is a peer that
+        # accepts and then says nothing. Released by the test rather than left
+        # on a bare Future, so the server can actually be shut down afterwards.
+        await release.wait()
+
+    server = await ws_serve(hold, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    was = mod.PREFLIGHT_TIMEOUT
+    mod.PREFLIGHT_TIMEOUT = 1.0
+    try:
+        adapter = AcpAdapter(url=f"ws://127.0.0.1:{port}/acp", token="t")
+        return await asyncio.wait_for(adapter.preflight(), timeout=15)
+    finally:
+        mod.PREFLIGHT_TIMEOUT = was
+        release.set()
+        server.close()
+        await server.wait_closed()
+
+
+said = run(_silent_door_preflight())
+check(said is not None and "did not answer" in said,
+      "a listener that accepts the socket and never speaks fails preflight "
+      "instead of holding the Worker in startup for ever")
 
 
 # --- the Policy judges the directory the Session runs in ---------------------

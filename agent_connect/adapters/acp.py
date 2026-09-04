@@ -119,6 +119,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 from .. import attachments as att
 from .. import outgoing
@@ -187,6 +188,13 @@ DEFAULT_TIMEOUT = 600.0
 #: through an agent that is already misbehaving. When it runs out the Turn's own
 #: child process is reaped — see `_deadline`.
 CANCEL_GRACE = 15.0
+
+#: How long the startup check waits for an ACP Agent to answer `initialize`.
+#: A peer that accepts a connection and then says nothing would otherwise hold
+#: the Worker in preflight for ever — never serving, never exiting, and never
+#: giving a service manager anything to restart. Generous enough for a cold
+#: `npx` bridge; a door slower than this is a door to fix.
+PREFLIGHT_TIMEOUT = 45.0
 
 #: The bridge that makes Claude Code an ACP Agent, pinned.
 #:
@@ -429,8 +437,10 @@ TOOL_ACTIONS = {
 }
 
 
-#: Hosts the Permission Policy's reasoning survives. See `resolve_url`.
-LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+#: Hosts the Permission Policy's reasoning survives. See `resolve_url`. Written
+#: as `urlsplit` reports them: lower-cased, and an IPv6 literal without the
+#: brackets it wears in the URL.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 #: The only schemes dialled. The remote-transport RFD requires HTTP/2 for its
 #: Streamable HTTP profile and says a server may be WebSocket-only, so WebSocket
@@ -462,6 +472,20 @@ def resolve_url(raw: str, env: Optional[dict] = None) -> str:
     would be guesses wearing the shape of a guarantee. `docs/adr/0001` already
     concedes the confinement is cooperative; a remote endpoint moves further in
     that direction, so it has to be asked for by name.
+
+    **The host is read the way the dialling library reads it, and by the same
+    parser.** A hand-rolled split is how this rule gets bypassed rather than
+    broken: `ws://attacker.example?@127.0.0.1` has an authority ending at the
+    `?`, so it names `attacker.example` — while a parser that looks for the last
+    `@` before the first `/` reads `127.0.0.1`, calls it loopback, and hands the
+    bearer to whoever answers. `urlsplit` and `websockets` agree; a private
+    guess does not have to.
+
+    **Off loopback, TLS is required.** The bearer travels on the handshake, so
+    plaintext `ws://` to another host puts the listener's credential and every
+    prompt, reply and tool call on the wire for anyone on the path. Nothing
+    about that is implied by accepting the Policy's uncertainty, so it is a
+    separate refusal rather than a footnote to the same opt-out.
     """
     env = os.environ if env is None else env
     if not raw.startswith(URL_SCHEMES):
@@ -469,25 +493,39 @@ def resolve_url(raw: str, env: Optional[dict] = None) -> str:
             f"{URL_ENV}={raw!r} is not a WebSocket URL. It must start with "
             f"{' or '.join(URL_SCHEMES)} — ACP's remote transport is WebSocket here."
         )
-    host = _host_of(raw)
-    if host not in LOOPBACK_HOSTS and not _truthy(env.get(ALLOW_REMOTE_ENV)):
+    parts = urlsplit(raw)
+    if parts.fragment:
+        raise AcpError(f"{URL_ENV}={raw!r} carries a fragment, which a WebSocket URL may not.")
+    if parts.username or parts.password:
         raise AcpError(
-            f"{URL_ENV}={raw!r} names {host or 'another host'}, and the "
+            f"{URL_ENV}={raw!r} carries credentials in the URL. The bearer for "
+            f"this door belongs in {TOKEN_ENV}, where it is sent as a header "
+            f"rather than written into a config file's URL."
+        )
+    try:
+        host = (parts.hostname or "").lower()
+    except ValueError as exc:  # a malformed authority, e.g. a bad port
+        raise AcpError(f"{URL_ENV}={raw!r} is not a URL this Worker can dial: {exc}") from exc
+    if not host:
+        raise AcpError(f"{URL_ENV}={raw!r} names no host.")
+    loopback = host in LOOPBACK_HOSTS
+    if not loopback and not _truthy(env.get(ALLOW_REMOTE_ENV)):
+        raise AcpError(
+            f"{URL_ENV}={raw!r} names {host}, and the "
             f"Permission Policy that guards file operations resolves paths on "
             f"*this* machine — against a different host it is guesswork. Keep "
             f"the ACP Agent on loopback, or say you accept that:\n"
             f"    export {ALLOW_REMOTE_ENV}=1"
         )
+    if not loopback and parts.scheme != "wss":
+        raise AcpError(
+            f"{URL_ENV}={raw!r} would send this door's bearer token, and every "
+            f"prompt and reply with it, in clear text to {host}. Use wss://. "
+            f"({ALLOW_REMOTE_ENV} accepts the Permission Policy's uncertainty "
+            f"about another host's filesystem; it does not accept putting the "
+            f"credential on the wire.)"
+        )
     return raw
-
-
-def _host_of(url: str) -> str:
-    """The host in `url`, without scheme, credentials, port or path."""
-    rest = url.split("://", 1)[1] if "://" in url else url
-    rest = rest.split("/", 1)[0].split("@")[-1]
-    if rest.startswith("["):
-        return rest.split("]", 1)[0] + "]"
-    return rest.rsplit(":", 1)[0] if ":" in rest else rest
 
 
 def command_from_env(env: Optional[dict] = None) -> List[str]:
@@ -1038,9 +1076,22 @@ class AcpAdapter:
             return str(exc)
         if not endpoint.dialled and shutil.which(endpoint.command[0]) is None:
             return install_advice(list(endpoint.command))
-        try:
+        async def contact():
             async with self._connect(endpoint, cwd=os.getcwd()) as client:
-                agent = await client.initialize()
+                return await client.initialize()
+
+        try:
+            # Bounded, because neither half of this is guaranteed to return: a
+            # spawned bridge can start and never speak, and a dialled door can
+            # accept the socket and never answer. Both look identical from here
+            # — a Worker that is still starting — which is the reason to put a
+            # clock on it rather than a note in the log.
+            agent = await asyncio.wait_for(contact(), timeout=PREFLIGHT_TIMEOUT)
+        except asyncio.TimeoutError:
+            return (
+                f"the ACP Agent at {endpoint.describe()} accepted a connection "
+                f"but did not answer `initialize` within {PREFLIGHT_TIMEOUT:.0f}s"
+            )
         except AcpDialFailed as exc:
             # A door that is merely not up yet is a real state, and it is not
             # the same failure as a bridge that is not installed. Said plainly

@@ -485,6 +485,17 @@ grep -q '^AGENT_CONNECT_ACP_TOKEN="ROTATED"$' "$ACPCFG" \
   && ok "a re-run with no ACP flags keeps the dialled door and its bearer" \
   || { sed 's/^/    /' "$ACPCFG"; bad "a plain re-run lost the dialled settings"; }
 
+# The documented interface is the flag OR the environment variable, so a bearer
+# rotated through the environment must replace the stored one too. Reading only
+# the flag left the revoked credential in the file.
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  AGENT_CONNECT_ACP_TOKEN="FROM_ENV" \
+  sh "$SCRIPT" --token T --adapter acp --no-start >/dev/null 2>&1 \
+  || bad "env-var token rotation failed"
+grep -q '^AGENT_CONNECT_ACP_TOKEN="FROM_ENV"$' "$ACPCFG" \
+  && ok "a bearer rotated through AGENT_CONNECT_ACP_TOKEN replaces the stored one" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "an env-supplied token did not replace the stored bearer"; }
+
 # A run that DOES supply one rewrites it, exactly once.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T3 --adapter acp --acp-command "other-agent --acp" --no-start 2>&1) \

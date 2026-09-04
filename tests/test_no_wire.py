@@ -59,10 +59,20 @@ PACKAGE = _bootstrap.ROOT / "agent_connect"
 #: Modules that are, or open, a socket. `email`/`json`/`base64` are not here:
 #: parsing is not speaking.
 WIRE_MODULES = {
-    "urllib", "urllib.request", "urllib.error", "urllib.parse",
+    "urllib", "urllib.request", "urllib.error",
     "http", "http.client", "http.server", "socket", "ssl", "requests",
     "httpx", "aiohttp",
 }
+
+#: Named back out of the set above, on the set's own rule: parsing is not
+#: speaking. `urllib.parse` opens nothing — it is `json` with a different
+#: grammar — and the ACP Adapter needs it for one job that a hand-rolled split
+#: got wrong: deciding which host a `ws://` URL will actually be dialled at.
+#: That decision is what the loopback rule rests on, and `ws://x?@127.0.0.1`
+#: reads as loopback to a private parser while the WebSocket library dials `x`.
+#: The rest of `urllib` — `request`, `error`, and the bare package that reaches
+#: them — stays refused everywhere, this file included.
+PARSE_ONLY = {"urllib.parse"}
 
 #: The library's own raw-request surface — refused everywhere, Adapters
 #: included. It is not a socket module, and it is the same thing by a shorter
@@ -187,6 +197,10 @@ for path, tree in sources():
         head = name.split(".")[0]
         internal = any(name == refused or name.startswith(refused + ".")
                        for refused in RELAY_INTERNALS)
+        # Matched as a prefix: `from urllib.parse import urlsplit` arrives here
+        # as `urllib.parse.urlsplit`.
+        if any(name == ok or name.startswith(ok + ".") for ok in PARSE_ONLY):
+            continue
         if not (internal or name in WIRE_MODULES or head in WIRE_MODULES):
             continue
         if (not internal and path.parent.name == "adapters"

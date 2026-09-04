@@ -71,6 +71,22 @@ instead would be wrong in both directions at once: allowing paths under the Work
 directory that are outside the Session's, and refusing paths under the Session's, which are
 the only ones the Agent can legitimately touch.
 
+**Off loopback, TLS is required, and that is a second refusal rather than a footnote to
+the first.** The bearer travels on the handshake, so plaintext `ws://` to another host puts
+the listener's credential — and every prompt, reply and tool call — in front of anyone on
+the path. Accepting that the Permission Policy cannot reason about a remote filesystem says
+nothing about accepting an unencrypted credential, so the two are not folded into one
+opt-out: `AGENT_CONNECT_ACP_ALLOW_REMOTE` covers the first, and `wss://` is simply required
+for the second. Loopback keeps plaintext, because nothing leaves the machine.
+
+**The host is read by the parser that will do the dialling.** A hand-rolled split of the
+authority is how a loopback rule gets bypassed rather than broken:
+`ws://attacker.example?@127.0.0.1` has an authority that ends at the `?`, so the library
+dials `attacker.example` while a parser looking for the last `@` before the first `/` reads
+`127.0.0.1` and calls it local. `urlsplit` and `websockets` agree on the host; anything
+written here by hand only has to be wrong once. Credentials in the URL and a fragment are
+refused outright rather than normalised.
+
 **The bearer is the Agent's, not the relay's.** It rides the WebSocket handshake as an
 `Authorization` header, where a door that authenticates can refuse it before any ACP frame
 exists, and it is read per dial rather than captured so a rotation needs no restart. This
