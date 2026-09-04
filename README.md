@@ -254,9 +254,14 @@ Four things worth knowing before you use it:
   operations resolves paths on *this* machine; against an agent on another host
   its answers are guesses shaped like a guarantee. `AGENT_CONNECT_ACP_ALLOW_REMOTE=1`
   is how you accept that, deliberately.
-- **The working directory belongs to the remote.** In URL mode the worker stops
-  comparing its own; whether a session is still good is answered by the agent,
-  which says so by refusing to resume it — and the room is told, as it always was.
+- **The working directory is the remote's.** `session/new` requires one, so the
+  worker always sends a value: its own directory, which on loopback is a real
+  path on the same filesystem, or `AGENT_CONNECT_ACP_REMOTE_CWD` when you are
+  dialling another host and this machine's paths mean nothing there. What the
+  worker *stops* doing is judging a remembered session by comparing that
+  directory to its own — over a socket that comparison would retire a live
+  session every turn. Whether a session is still good is the agent's answer,
+  given by refusing to resume it, and the room is told as it always was.
 
 The bearer travels on the WebSocket handshake, is read fresh on every dial (so
 rotating it needs no restart), and lives in the same `0600` config file as your
@@ -741,6 +746,7 @@ ACP adapter (see the section above):
 | `AGENT_CONNECT_ACP_COMMAND` | the ACP agent's command line, split as a shell would. **Overrides any preset**. `install.sh --acp-command` writes it; a re-run without that flag keeps it | *(unset)* |
 | `AGENT_CONNECT_ACP_URL` | an ACP agent **already running** behind a WebSocket URL, dialled instead of spawned (e.g. `ws://127.0.0.1:8802/acp`). Mutually exclusive with `AGENT_CONNECT_ACP_COMMAND` — setting both is refused rather than resolved, because they name two different agents. Needs the SDK's transport extra: `pip install 'agent-client-protocol[http]'` | *(unset)* |
 | `AGENT_CONNECT_ACP_TOKEN` | bearer for that URL's door, sent on the WebSocket handshake. Read at dial time, so rotating it needs no restart | *(unset)* |
+| `AGENT_CONNECT_ACP_REMOTE_CWD` | the directory a **dialled** agent opens its sessions in. `session/new` requires one, so something is always sent; unset means "this worker's own directory", which is correct on loopback and wrong across hosts | *(unset)* |
 | `AGENT_CONNECT_ACP_ALLOW_REMOTE` | `1` to allow `AGENT_CONNECT_ACP_URL` to name a host other than loopback. Off by default because the Permission Policy resolves paths on *this* machine: against another host its answers are guesses shaped like a guarantee | *(unset)* |
 | `AGENT_CONNECT_ACP_MODE` | session mode id to request. Left alone by default: every bridge's own default already routes permission requests to the worker, and mode ids are the agent's to name | *(unset)* |
 | `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK` | `1` to start even when the agent advertises authentication methods. The escape hatch for an agent whose `authMethods` mean something else | *(unset)* |

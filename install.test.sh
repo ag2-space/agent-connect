@@ -404,6 +404,61 @@ else
   ok "--acp-url and --acp-command together are refused, not silently resolved"
 fi
 
+# 9d) The transition either way must leave exactly ONE endpoint behind. Both
+#     settings in one config is a config the worker refuses to start on, so an
+#     installer that leaves the old one has produced a file that will not run.
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:8802/acp" \
+     --acp-token "sec" --no-start >/dev/null 2>&1 || bad "url install failed"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" \
+     --no-start >/dev/null 2>&1 || bad "url→command install failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" \
+  && ! grep -q '^AGENT_CONNECT_ACP_URL=' "$ACPCFG" \
+  && ! grep -q '^AGENT_CONNECT_ACP_TOKEN=' "$ACPCFG" \
+  && ok "switching from a dialled door to a command removes the URL and its token" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "url→command left both endpoints set"; }
+
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:9999/acp" \
+     --acp-token "s2" --no-start >/dev/null 2>&1 || bad "command→url install failed"
+grep -q '^AGENT_CONNECT_ACP_URL="ws://127.0.0.1:9999/acp"$' "$ACPCFG" \
+  && ! grep -q '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" \
+  && ok "and switching back to a dialled door removes the command" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "command→url left both endpoints set"; }
+
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-agent claude --no-start >/dev/null 2>&1 \
+  || bad "url→preset install failed"
+! grep -q '^AGENT_CONNECT_ACP_URL=' "$ACPCFG" \
+  && ok "and naming a preset — which means spawning — removes it too" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "url→preset left the URL set"; }
+
+# 9e) The extra has to reach the environment the worker runs in: it is installed
+#     into pipx or a private venv, which a later plain `pip install` never sees.
+: > "$NPM_LOG"
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+: > "$PIPX_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:8802/acp" \
+         --acp-token "sec" --no-start 2>&1) || bad "url install failed"
+grep -q 'ag2-agent-connect\[websocket\]' "$PIPX_LOG" \
+  && ok "a dialled install asks pipx for the [websocket] extra, in the worker's own environment" \
+  || { sed 's/^/    /' "$PIPX_LOG"; bad "the websocket extra was not on the install spec"; }
+
+# And a spawning install must NOT drag the extra in.
+: > "$PIPX_LOG"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-agent gemini --no-start >/dev/null 2>&1 \
+  || bad "preset install failed"
+grep -q 'websocket' "$PIPX_LOG" \
+  && { sed 's/^/    /' "$PIPX_LOG"; bad "a spawning install pulled in the websocket extra"; } \
+  || ok "and a spawning install does not pull it in"
+grep -q "claude-agent-acp" "$NPM_LOG" \
+  && { sed 's/^/    /' "$NPM_LOG"; bad "a bridge was installed for an agent that is only dialled"; } \
+  || ok "and no bridge is fetched, because nothing is spawned"
+
 # A run that DOES supply one rewrites it, exactly once.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T3 --adapter acp --acp-command "other-agent --acp" --no-start 2>&1) \

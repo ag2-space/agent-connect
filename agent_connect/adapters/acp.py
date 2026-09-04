@@ -169,6 +169,8 @@ URL_ENV = "AGENT_CONNECT_ACP_URL"
 TOKEN_ENV = "AGENT_CONNECT_ACP_TOKEN"
 #: Opt out of the loopback-only rule, deliberately and per install.
 ALLOW_REMOTE_ENV = "AGENT_CONNECT_ACP_ALLOW_REMOTE"
+#: The directory to open Sessions in on the *dialled* Agent's machine.
+REMOTE_CWD_ENV = "AGENT_CONNECT_ACP_REMOTE_CWD"
 SKIP_AUTH_ENV = "AGENT_CONNECT_ACP_SKIP_AUTH_CHECK"
 TIMEOUT_ENV = "AGENT_CONNECT_TURN_TIMEOUT"
 
@@ -882,6 +884,7 @@ class AcpAdapter:
         timeout: Optional[float] = None,
         url: Optional[str] = None,
         token: Optional[str] = None,
+        remote_cwd: Optional[str] = None,
     ):
         # Injectable so a test does not have to set process environment; `None`
         # means "read the environment when the Turn runs", which is what the
@@ -889,6 +892,7 @@ class AcpAdapter:
         self._command = list(command) if command else None
         self._url = url or None
         self._token = token or ""
+        self._remote_cwd = remote_cwd
         # One store for this Adapter's whole life, because affinity cookies are
         # about the *next* dial: a fresh one per dial loses the sticky session a
         # load balancer handed out.
@@ -907,6 +911,26 @@ class AcpAdapter:
 
     def command(self) -> List[str]:
         return list(self._command) if self._command else resolve_command()
+
+    def remote_cwd(self) -> str:
+        """The directory a dialled Agent should open its Sessions in.
+
+        `session/new` requires a working directory, so one is always sent — the
+        protocol has no way to say "you choose". On loopback, which is the
+        default, this Worker's own directory is a real path on the same
+        filesystem and is the right thing to send. Across hosts it is not, and
+        there is nothing this Worker can compute that would be: hence a setting,
+        for the case the operator has already opted into with
+        `AGENT_CONNECT_ACP_ALLOW_REMOTE`.
+
+        Empty means "send this Worker's own", which is what a loopback install
+        wants and never has to configure. Note that what an Agent *does* with
+        the value is its own business — the one we verified against accepts any
+        string, including a path that exists nowhere.
+        """
+        if self._remote_cwd is not None:
+            return self._remote_cwd
+        return os.environ.get(REMOTE_CWD_ENV, "").strip()
 
     def endpoint(self) -> Endpoint:
         """Where this Adapter's ACP Agent is — injected, or from the settings."""
@@ -1047,6 +1071,13 @@ class AcpAdapter:
 
         cwd = ctx.cwd or os.getcwd()
         policy = WorkingDirectoryPolicy(cwd)
+        # What the Agent is told to open its Session in. The same directory when
+        # it runs here — which is every loopback install — and the operator's
+        # own value when they have opted into dialling another host, where this
+        # Worker's paths mean nothing.
+        session_cwd = cwd
+        if endpoint.dialled:
+            session_cwd = self.remote_cwd() or cwd
         queue: asyncio.Queue = asyncio.Queue()
         settings = self.session_settings()
         store = self.store() if settings.memory else None
@@ -1127,7 +1158,9 @@ class AcpAdapter:
                     session_id, turns = "", 0
                     if record is not None:
                         try:
-                            await client.load_session(record.session_id, cwd=cwd)
+                            await client.load_session(
+                                record.session_id, cwd=session_cwd
+                            )
                             session_id, turns = record.session_id, record.turns
                         except SessionResumeRefused as exc:
                             queue.put_nowait(
@@ -1135,7 +1168,7 @@ class AcpAdapter:
                                     why=WHY_REFUSED.format(detail=exc)))
                             )
                     if not session_id:
-                        session_id = await client.new_session(cwd=cwd)
+                        session_id = await client.new_session(cwd=session_cwd)
                         turns = 0
                     mode = self.mode()
                     if mode:
@@ -1146,7 +1179,7 @@ class AcpAdapter:
                         # is in the Local Agent's Session whatever this Worker
                         # does next. Counting it now is also what makes the Turn
                         # budget bound the tokens rather than the successes.
-                        store.remember(key, session_id, cwd, turns + 1)
+                        store.remember(key, session_id, session_cwd, turns + 1)
                 finally:
                     muted.on = False
                 # The deadline may have passed while the Session was being

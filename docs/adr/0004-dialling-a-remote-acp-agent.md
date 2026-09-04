@@ -48,14 +48,22 @@ than enforced; a remote endpoint moves further in that direction, so it must be 
 by name (`AGENT_CONNECT_ACP_ALLOW_REMOTE=1`) rather than arrived at by typing a hostname.
 ACP stays owner-tier-only either way.
 
-**The working directory belongs to whoever the Agent runs on.** A Session's directory is
-fixed when it opens, and the Session map records it so a differently configured Worker gets
-a fresh Session instead of someone else's context. Over a socket that comparison is between
-this Worker's directory and a directory on another host: it would retire a live Session
-every Turn and cost the room its history for a mismatch that was never a mismatch. So in
-URL mode the stored value is opaque, and whether the Session survives is the remote's to
-answer — which it does by refusing `session/load`, a path that already exists and already
-says so in the room.
+**The working directory is the remote's, but one is still sent.** `session/new` takes a
+directory and the protocol offers no way to say "you choose", so a dialled Session is opened
+with *something*. On loopback — the default, and the only case not opted into — this
+Worker's own directory is a real path on the same filesystem and is the right value.
+Across hosts it is not, and nothing this Worker can compute would be, so
+`AGENT_CONNECT_ACP_REMOTE_CWD` exists for the operator who has already opted into dialling
+elsewhere. What an Agent does with the value is its own business; the listener we verified
+against accepts any string, including a path that exists nowhere.
+
+What changes in URL mode is the *judging*, not the sending. The Session map records the
+directory so a differently configured Worker gets a fresh Session rather than someone
+else's context — a comparison that is right when this Worker owns the filesystem and wrong
+when it does not, where it would retire a live Session every Turn and cost the room its
+history for a mismatch that was never a mismatch. So dialled, that comparison is dropped,
+and whether the Session survives becomes the remote's answer — given by refusing
+`session/load`, a path that already exists and already says so in the room.
 
 **The bearer is the Agent's, not the relay's.** It rides the WebSocket handshake as an
 `Authorization` header, where a door that authenticates can refuse it before any ACP frame

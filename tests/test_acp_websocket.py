@@ -309,6 +309,40 @@ check("reach" in said or "connect" in said or "refused" in said,
       "it says the Agent could not be reached")
 
 
+# --- the directory a dialled Session is opened in ----------------------------
+
+
+async def _cwd_sent(remote_cwd=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        async with Door(SCRIPT) as door:
+            seen = []
+            original = FakeAcpAgent._new_session
+
+            def spy(agent_self, params):
+                seen.append(params.get("cwd"))
+                return original(agent_self, params)
+
+            FakeAcpAgent._new_session = spy
+            try:
+                adapter = AcpAdapter(url=door.url, token=door.token,
+                                     remote_cwd=remote_cwd,
+                                     store=SessionStore(Path(tmp) / "s.json"))
+                await _adapter_turn(door, adapter, cwd="/local/repo")
+            finally:
+                FakeAcpAgent._new_session = original
+            return seen
+
+
+seen = run(_cwd_sent())
+check(seen == ["/local/repo"],
+      "with no remote directory set, a dialled Session opens in the Worker's own "
+      "— which on loopback is a real path on the same filesystem")
+
+seen = run(_cwd_sent(remote_cwd="/srv/agent/workspace"))
+check(seen == ["/srv/agent/workspace"],
+      "and the remote directory setting is what is sent when the operator gives one")
+
+
 # --- optional: the same, against a real listener ----------------------------
 # Gated like the real-bridge test: it needs somebody's actual door.
 #     AGENT_CONNECT_ACP_URL=ws://127.0.0.1:8802/acp \

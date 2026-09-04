@@ -211,6 +211,7 @@ stored() {  # <KEY>
 }
 ACP_COMMAND_STORED="$(stored AGENT_CONNECT_ACP_COMMAND)"
 ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
+ACP_URL_STORED="$(stored AGENT_CONNECT_ACP_URL)"
 
 # A stored command outranks any preset at runtime, so each way of arriving has
 # to say what happens to one that is already there:
@@ -219,20 +220,55 @@ ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
 #   neither                     → change nothing, name included
 # Scoped to --adapter acp: otherwise `--adapter codex --acp-agent claude` hits
 # the first case and deletes a working command on its way past.
+# A URL and a command are mutually exclusive *at runtime* — the worker refuses
+# to start with both — so choosing one here has to remove the other. Leaving the
+# old one behind writes a config file that the worker rejects, which is a worse
+# outcome than either setting winning.
 ACP_CMD_CLEAR=0
+ACP_URL_CLEAR=0
 if [ "$ADAPTER" != "acp" ]; then
   if [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
     echo "install.sh: WARNING — --acp-agent applies only to --adapter acp; ignoring it for adapter '$ADAPTER'. Your stored ACP settings are left alone." >&2
   fi
   ACP_AGENT=""
+elif [ -n "$ACP_URL" ]; then
+  # Dialling: nothing is spawned, so a stored command and any preset name that
+  # implies one are both stale.
+  ACP_AGENT="custom"
+  [ -z "$ACP_COMMAND_STORED" ] || ACP_CMD_CLEAR=1
 elif [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
   [ -n "$ACP_COMMAND" ] || ACP_CMD_CLEAR=1
+  [ -z "$ACP_URL_STORED" ] || ACP_URL_CLEAR=1
 elif [ -n "$ACP_COMMAND" ]; then
   ACP_AGENT="custom"
+  [ -z "$ACP_URL_STORED" ] || ACP_URL_CLEAR=1
 elif [ -n "$ACP_COMMAND_STORED" ]; then
   ACP_AGENT="${ACP_AGENT_STORED:-custom}"
 else
   ACP_AGENT="${ACP_AGENT_STORED:-claude}"
+fi
+
+# Whether this install ends up dialling, which decides two things below: the
+# WebSocket extra has to reach the environment the worker actually runs in, and
+# no bridge is fetched for an agent that will never be spawned.
+ACP_DIAL=0
+if [ "$ADAPTER" = "acp" ]; then
+  if [ -n "$ACP_URL" ]; then
+    ACP_DIAL=1
+  elif [ "$ACP_URL_CLEAR" -eq 0 ] && [ -z "$ACP_COMMAND" ] && [ -n "$ACP_URL_STORED" ]; then
+    ACP_DIAL=1
+  fi
+fi
+# The extra goes on the spec, not into a second `pip install` the reader runs
+# afterwards: the worker lives in pipx's own environment or in a private venv,
+# and a plain `pip install` reaches neither.
+if [ "$ACP_DIAL" -eq 1 ]; then
+  case "$AC_PIP_SPEC" in
+    *"["*) : ;;                      # the operator already asked for extras
+    ag2-agent-connect*)
+      AC_PIP_SPEC="$(printf '%s' "$AC_PIP_SPEC" | sed 's/^ag2-agent-connect/ag2-agent-connect[websocket]/')" ;;
+    *) say "note: AGENT_CONNECT_PIP_SPEC is custom; add the [websocket] extra yourself for a dialled agent" ;;
+  esac
 fi
 
 # ── 1) install the worker ───────────────────────────────────────────────────
@@ -270,11 +306,24 @@ if [ "$ADAPTER" = "acp" ]; then
   ACP_KV="AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
   [ -z "$ACP_COMMAND" ] || ACP_CMD_KV="AGENT_CONNECT_ACP_COMMAND=$ACP_COMMAND"
   [ -z "$ACP_URL" ] || ACP_URL_KV="AGENT_CONNECT_ACP_URL=$ACP_URL"
+  if [ "$ACP_URL_CLEAR" -eq 1 ]; then
+    say "this run selects an ACP agent to spawn, so the dialled door already in your config is removed"
+    say "  (was: $ACP_URL_STORED) — the worker refuses to start with both, so keeping it would have"
+    say "  produced a config that will not run. Previous file: $CONFIG.bak"
+  fi
+  if [ "$ACP_CMD_CLEAR" -eq 1 ] && [ -n "$ACP_COMMAND_STORED" ] && [ -n "$ACP_URL" ]; then
+    say "--acp-url replaces the AGENT_CONNECT_ACP_COMMAND already in your config"
+    say "  (was: $ACP_COMMAND_STORED) — the worker refuses to start with both. Previous file: $CONFIG.bak"
+  fi
   if [ "$ACP_CMD_CLEAR" -eq 1 ] && [ -n "$ACP_COMMAND_STORED" ]; then
     say "--acp-agent '$ACP_AGENT' replaces the AGENT_CONNECT_ACP_COMMAND already in your config"
     say "  (was: $ACP_COMMAND_STORED) — a command overrides every preset, so keeping it would have"
     say "  gone on running that agent while this install reported '$ACP_AGENT'. Previous file: $CONFIG.bak"
   fi
+  if [ "$ACP_DIAL" -eq 1 ]; then
+    say "dialling ${ACP_URL:-$ACP_URL_STORED} — no bridge is installed, because nothing is spawned"
+    say "start that listener yourself, and keep its token: the worker only dials it"
+  else
   case "$ACP_AGENT" in
     claude)
       if command -v npm >/dev/null 2>&1; then
@@ -290,6 +339,7 @@ if [ "$ADAPTER" = "acp" ]; then
       say "ACP agent '$ACP_AGENT': install and log into it yourself; agent-connect only pins the Claude Code bridge"
       ;;
   esac
+  fi
 fi
 
 # ── 1c) write the config file ───────────────────────────────────────────────
@@ -316,7 +366,7 @@ if [ -f "$CONFIG" ]; then
   fi
   # Same rule as the command: rewritten only when this run set one, so a re-run
   # without the flag keeps the URL and token already in the file.
-  if [ -n "$ACP_URL_KV" ]; then
+  if [ -n "$ACP_URL_KV" ] || [ "$ACP_URL_CLEAR" -eq 1 ]; then
     MANAGED="$MANAGED|AGENT_CONNECT_ACP_URL|AGENT_CONNECT_ACP_TOKEN"
   fi
   KEPT="$(grep -v -E "^[[:space:]]*($MANAGED)[[:space:]]*=" "$CONFIG" \
