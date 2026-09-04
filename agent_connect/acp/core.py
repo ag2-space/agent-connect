@@ -56,7 +56,16 @@ CLIENT_CAPABILITIES = {"fs": {"readTextFile": False, "writeTextFile": False}}
 
 
 class AcpError(Exception):
-    """Anything the ACP Agent, or the connection to it, got wrong."""
+    """Anything the ACP Agent, or the connection to it, got wrong.
+
+    `data` is the JSON-RPC error's `data` member when there was one, kept whole
+    so a caller can branch on it (`category` is the stable key; `type` is
+    whichever exception the Agent happened to raise).
+    """
+
+    def __init__(self, message: str, data: Any = None):
+        super().__init__(message)
+        self.data = data
 
 
 class SessionResumeRefused(AcpError):
@@ -64,6 +73,15 @@ class SessionResumeRefused(AcpError):
 
     A Session that cannot be resumed costs context, not an error: the caller is
     expected to open a fresh one and say so.
+    """
+
+
+class AcpCommandMissing(AcpError):
+    """The ACP Agent's command is not on PATH — nothing was started.
+
+    Its own class because the caller answers it with install advice, and the
+    alternative was matching "not found" against an error string that now
+    carries text the Agent wrote.
     """
 
 
@@ -292,7 +310,9 @@ class AcpClient:
         except FileNotFoundError as exc:
             # Ticket 05 turns this into operator-facing install advice; the core
             # only promises that "the bridge is missing" is distinguishable.
-            raise AcpError(f"ACP Agent command not found: {command[0]}") from exc
+            raise AcpCommandMissing(
+                f"ACP Agent command not found: {command[0]}"
+            ) from exc
 
         stderr_tail: deque = deque(maxlen=200)
         drain = asyncio.ensure_future(_drain(process.stderr, stderr_tail))
@@ -387,7 +407,7 @@ class AcpClient:
         except AcpAgentGone:
             raise
         except AcpError as exc:
-            raise SessionResumeRefused(str(exc)) from exc
+            raise SessionResumeRefused(str(exc), getattr(exc, "data", None)) from exc
 
     async def set_session_mode(self, session_id: str, mode_id: str) -> None:
         await self._guard(
@@ -443,9 +463,10 @@ class AcpClient:
                 try:
                     return call.result()
                 except acp.RequestError as exc:
+                    data = getattr(exc, "data", None)
                     if getattr(exc, "code", None) == AUTH_REQUIRED_CODE:
-                        raise AcpAuthRequired(str(exc)) from exc
-                    raise AcpError(str(exc)) from exc
+                        raise AcpAuthRequired(_error_text(exc), data) from exc
+                    raise AcpError(_error_text(exc), data) from exc
                 except (ConnectionError, EOFError) as exc:
                     # The transport noticed the closed pipe before `wait()`
                     # resolved. Same event, whichever got there first.
@@ -499,6 +520,35 @@ async def _drain(stream: Any, sink: deque) -> None:
 def _suffix(stderr: str) -> str:
     stderr = stderr.strip()
     return f": {stderr[-500:]}" if stderr else ""
+
+
+#: Where an ACP Agent puts the operator-facing cause inside `error.data`.
+#: JSON-RPC leaves the member's shape to the Agent, so both spellings seen in
+#: the wild are read rather than one being assumed.
+DETAIL_KEYS = ("reason", "details")
+
+
+def _detail(data: Any) -> str:
+    """The cause an Agent put in `error.data`, or "" if it put none there."""
+    if not isinstance(data, dict):
+        return ""
+    for key in DETAIL_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[-500:]
+    return ""
+
+
+def _error_text(exc: Any) -> str:
+    """`message`, plus the cause from `data` when the Agent supplied one.
+
+    `RequestError.__str__` is the bare message — "Internal error" — while the
+    reason it was raised for sits in `data`. Dropping that costs a failed Turn
+    the only explanation anyone gets, on either transport.
+    """
+    message = str(exc)
+    detail = _detail(getattr(exc, "data", None))
+    return f"{message}: {detail}" if detail and detail != message else message
 
 
 def _prompt_blocks(prompt: Any) -> list:

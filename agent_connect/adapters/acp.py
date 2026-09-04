@@ -125,6 +125,7 @@ from ..acp.core import (
     AcpAgentGone,
     AcpAuthRequired,
     AcpClient,
+    AcpCommandMissing,
     AcpError,
     SessionResumeRefused,
     TurnResult,
@@ -852,7 +853,7 @@ class AcpAdapter:
             async with AcpClient.spawn(command, cwd=os.getcwd()) as client:
                 agent = await client.initialize()
         except AcpError as exc:
-            if "not found" in str(exc):
+            if isinstance(exc, AcpCommandMissing):
                 return install_advice(command)
             return f"the ACP Agent would not start: {exc}"
         except Exception as exc:  # noqa: BLE001 — a startup check reports, never raises
@@ -1040,7 +1041,8 @@ class AcpAdapter:
         except AcpError as exc:
             # A missing bridge mid-Turn gets the same install advice the startup
             # check gives, rather than a bare "command not found".
-            note = (install_advice(command) if "not found" in str(exc) else str(exc))
+            note = (install_advice(command)
+                    if isinstance(exc, AcpCommandMissing) else str(exc))
             yield Done(reason=FAILED, text="".join(chunks),
                        note=f"agent-connect: {note}")
             return
