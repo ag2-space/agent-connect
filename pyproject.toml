@@ -46,6 +46,14 @@ ag2-relay-client = { path = "relay-client", editable = true }
 # install the sibling first or you are testing PyPI's copy of it:
 #     pip install -e relay-client && pip install -e .
 
+[project.optional-dependencies]
+# The ACP SDK ships its WebSocket client behind its own `http` extra
+# (`httpx[http2]` + `websockets`), so dialling a remote ACP Agent is an extra on
+# a dependency already pinned rather than a new one. It stays optional because
+# the stdio path — every Adapter but a dialled ACP one — needs none of it.
+# See `docs/adr/0004`.
+websocket = ["agent-client-protocol[http]>=0.12,<1.0"]
+
 [project.scripts]
 agent-connect = "agent_connect.worker:main"
 

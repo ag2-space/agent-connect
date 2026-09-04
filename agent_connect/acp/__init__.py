@@ -9,12 +9,14 @@ from .core import (  # noqa: F401
     AcpAuthRequired,
     AcpClient,
     AcpCommandMissing,
+    AcpDialFailed,
     AcpError,
     AgentDescription,
     PermissionRequest,
     SessionResumeRefused,
     TurnResult,
     Update,
+    new_cookie_store,
     reject_all,
 )
 from .policy import Decision, WorkingDirectoryPolicy  # noqa: F401
@@ -26,11 +28,13 @@ __all__ = [
     "AcpAuthRequired",
     "AcpClient",
     "AcpCommandMissing",
+    "AcpDialFailed",
     "AcpError",
     "AgentDescription",
     "PermissionRequest",
     "SessionResumeRefused",
     "TurnResult",
     "Update",
+    "new_cookie_store",
     "reject_all",
 ]

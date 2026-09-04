@@ -126,10 +126,12 @@ from ..acp.core import (
     AcpAuthRequired,
     AcpClient,
     AcpCommandMissing,
+    AcpDialFailed,
     AcpError,
     SessionResumeRefused,
     TurnResult,
     Update,
+    new_cookie_store,
 )
 from ..acp.policy import WorkingDirectoryPolicy
 from ..events import (
@@ -161,6 +163,12 @@ OWNER = "owner"
 COMMAND_ENV = "AGENT_CONNECT_ACP_COMMAND"
 MODE_ENV = "AGENT_CONNECT_ACP_MODE"
 AGENT_ENV = "AGENT_CONNECT_ACP_AGENT"
+#: An ACP Agent already running behind a URL, dialled instead of spawned.
+URL_ENV = "AGENT_CONNECT_ACP_URL"
+#: The bearer that URL's door checks at the WebSocket upgrade.
+TOKEN_ENV = "AGENT_CONNECT_ACP_TOKEN"
+#: Opt out of the loopback-only rule, deliberately and per install.
+ALLOW_REMOTE_ENV = "AGENT_CONNECT_ACP_ALLOW_REMOTE"
 SKIP_AUTH_ENV = "AGENT_CONNECT_ACP_SKIP_AUTH_CHECK"
 TIMEOUT_ENV = "AGENT_CONNECT_TURN_TIMEOUT"
 
@@ -407,6 +415,67 @@ TOOL_ACTIONS = {
 }
 
 
+#: Hosts the Permission Policy's reasoning survives. See `resolve_url`.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+#: The only schemes dialled. The remote-transport RFD requires HTTP/2 for its
+#: Streamable HTTP profile and says a server may be WebSocket-only, so WebSocket
+#: is the profile that excludes no conforming door.
+URL_SCHEMES = ("ws://", "wss://")
+
+
+def url_from_env(env: Optional[dict] = None) -> str:
+    """The ACP Agent's URL as the operator wrote it, validated."""
+    raw = (env if env is not None else os.environ).get(URL_ENV, "").strip()
+    return resolve_url(raw, env) if raw else ""
+
+
+def token_from_env(env: Optional[dict] = None) -> str:
+    """The bearer for that door, read at dial time so a rotation needs no restart."""
+    return (env if env is not None else os.environ).get(TOKEN_ENV, "").strip()
+
+
+def resolve_url(raw: str, env: Optional[dict] = None) -> str:
+    """`raw`, if it is a URL this Worker will dial. Otherwise `AcpError`.
+
+    **Loopback unless the operator says otherwise, and that is a safety rule
+    rather than a convenience.** The Permission Policy answers
+    `session/request_permission` by resolving the requested paths and comparing
+    them against the Session's working directory — on *this* machine's
+    filesystem. When the ACP Agent runs somewhere else, those resolutions are
+    about the wrong filesystem: different symlinks, different mounts, a `..`
+    that climbs somewhere else. The Policy would still answer, and its answers
+    would be guesses wearing the shape of a guarantee. `docs/adr/0001` already
+    concedes the confinement is cooperative; a remote endpoint moves further in
+    that direction, so it has to be asked for by name.
+    """
+    env = os.environ if env is None else env
+    if not raw.startswith(URL_SCHEMES):
+        raise AcpError(
+            f"{URL_ENV}={raw!r} is not a WebSocket URL. It must start with "
+            f"{' or '.join(URL_SCHEMES)} — ACP's remote transport is WebSocket here."
+        )
+    host = _host_of(raw)
+    if host not in LOOPBACK_HOSTS and not _truthy(env.get(ALLOW_REMOTE_ENV)):
+        raise AcpError(
+            f"{URL_ENV}={raw!r} names {host or 'another host'}, and the "
+            f"Permission Policy that guards file operations resolves paths on "
+            f"*this* machine — against a different host it is guesswork. Keep "
+            f"the ACP Agent on loopback, or say you accept that:\n"
+            f"    export {ALLOW_REMOTE_ENV}=1"
+        )
+    return raw
+
+
+def _host_of(url: str) -> str:
+    """The host in `url`, without scheme, credentials, port or path."""
+    rest = url.split("://", 1)[1] if "://" in url else url
+    rest = rest.split("/", 1)[0].split("@")[-1]
+    if rest.startswith("["):
+        return rest.split("]", 1)[0] + "]"
+    return rest.rsplit(":", 1)[0] if ":" in rest else rest
+
+
 def command_from_env(env: Optional[dict] = None) -> List[str]:
     """The ACP Agent's command line, as the operator wrote it.
 
@@ -425,8 +494,58 @@ def _unconfigured() -> str:
         f"the ACP Adapter needs to know which agent to run. Either name one:\n"
         f"    export {AGENT_ENV}={'|'.join(sorted(PRESETS))}\n"
         f"or give the command yourself, which overrides any preset:\n"
-        f'    export {COMMAND_ENV}="npx -y {BRIDGE_SPEC}"'
+        f'    export {COMMAND_ENV}="npx -y {BRIDGE_SPEC}"\n'
+        f"or dial one that is already running:\n"
+        f'    export {URL_ENV}="ws://127.0.0.1:8802/acp"'
     )
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """Where this Worker's ACP Agent is: a URL to dial, or a command to run."""
+
+    url: str = ""
+    token: str = ""
+    command: Tuple[str, ...] = ()
+
+    @property
+    def dialled(self) -> bool:
+        return bool(self.url)
+
+    def describe(self) -> str:
+        return self.url if self.dialled else " ".join(self.command)
+
+
+def resolve_endpoint(env: Optional[dict] = None) -> Endpoint:
+    """The one ACP Agent this Worker drives, from the settings as written.
+
+    **A URL and a command are mutually exclusive, and that is a rejection rather
+    than a precedence.** Silently preferring one would mean an operator who set
+    both gets answers from an agent they did not pick — different credentials, a
+    different filesystem, a different conversation — with nothing in the room to
+    say which one spoke. A precedence is right for a *preset* versus a command,
+    where both name the same kind of thing; it is wrong for two different agents.
+
+    There is deliberately no fallback from a URL to spawning. A door that is
+    down is a door that is down: starting a second agent locally to cover for it
+    would answer the room as something other than what the operator configured,
+    and would do it exactly when nobody is watching.
+    """
+    env = os.environ if env is None else env
+    url = (env.get(URL_ENV) or "").strip()
+    command = (env.get(COMMAND_ENV) or "").strip()
+    if url and command:
+        raise AcpError(
+            f"{URL_ENV} and {COMMAND_ENV} are both set, and they name two "
+            f"different ACP Agents:\n"
+            f"    {URL_ENV}={url}\n"
+            f"    {COMMAND_ENV}={command}\n"
+            f"Unset one. A Worker that guessed would answer the room as an "
+            f"agent nobody chose."
+        )
+    if url:
+        return Endpoint(url=resolve_url(url, env), token=token_from_env(env))
+    return Endpoint(command=tuple(resolve_command(env)))
 
 
 def preset_for(name: str) -> Preset:
@@ -761,11 +880,19 @@ class AcpAdapter:
         store: Optional[SessionStore] = None,
         session_settings: Optional[SessionSettings] = None,
         timeout: Optional[float] = None,
+        url: Optional[str] = None,
+        token: Optional[str] = None,
     ):
         # Injectable so a test does not have to set process environment; `None`
         # means "read the environment when the Turn runs", which is what the
         # Worker gets.
         self._command = list(command) if command else None
+        self._url = url or None
+        self._token = token or ""
+        # One store for this Adapter's whole life, because affinity cookies are
+        # about the *next* dial: a fresh one per dial loses the sticky session a
+        # load balancer handed out.
+        self._cookies = None
         self._mode = mode
         self._timeout = timeout
         # The Session map is per-Adapter, and the Adapter is per-Worker: the
@@ -776,10 +903,36 @@ class AcpAdapter:
         self.agent_description = None
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
-        return f"<AcpAdapter {self._command or 'from ' + COMMAND_ENV}>"
+        return f"<AcpAdapter {self._url or self._command or 'from ' + COMMAND_ENV}>"
 
     def command(self) -> List[str]:
         return list(self._command) if self._command else resolve_command()
+
+    def endpoint(self) -> Endpoint:
+        """Where this Adapter's ACP Agent is — injected, or from the settings."""
+        if self._url:
+            return Endpoint(url=resolve_url(self._url), token=self._token)
+        if self._command:
+            return Endpoint(command=tuple(self._command))
+        return resolve_endpoint()
+
+    def _connect(self, endpoint: Endpoint, *, cwd: str, **kwargs):
+        """A live connection to `endpoint`, dialled or spawned.
+
+        The two are never alternatives at runtime: `resolve_endpoint` has
+        already settled which one this Worker has, and a dial that fails stays
+        failed rather than falling back to starting something locally.
+        """
+        if endpoint.dialled:
+            if self._cookies is None:
+                self._cookies = new_cookie_store()
+            return AcpClient.dial(
+                endpoint.url,
+                token=endpoint.token,
+                cookie_store=self._cookies,
+                **kwargs,
+            )
+        return AcpClient.spawn(list(endpoint.command), cwd=cwd, **kwargs)
 
     def mode(self) -> str:
         return self._mode if self._mode is not None else os.environ.get(MODE_ENV, "").strip()
@@ -844,17 +997,22 @@ class AcpAdapter:
         editing the package.
         """
         try:
-            command = self.command()
+            endpoint = self.endpoint()
         except AcpError as exc:
             return str(exc)
-        if shutil.which(command[0]) is None:
-            return install_advice(command)
+        if not endpoint.dialled and shutil.which(endpoint.command[0]) is None:
+            return install_advice(list(endpoint.command))
         try:
-            async with AcpClient.spawn(command, cwd=os.getcwd()) as client:
+            async with self._connect(endpoint, cwd=os.getcwd()) as client:
                 agent = await client.initialize()
+        except AcpDialFailed as exc:
+            # A door that is merely not up yet is a real state, and it is not
+            # the same failure as a bridge that is not installed. Said plainly
+            # so the operator fixes the listener rather than the install.
+            return f"the ACP Agent at {endpoint.url} could not be reached: {exc}"
         except AcpError as exc:
             if isinstance(exc, AcpCommandMissing):
-                return install_advice(command)
+                return install_advice(list(endpoint.command))
             return f"the ACP Agent would not start: {exc}"
         except Exception as exc:  # noqa: BLE001 — a startup check reports, never raises
             return f"the ACP Agent would not start: {exc}"
@@ -882,7 +1040,7 @@ class AcpAdapter:
             return
 
         try:
-            command = self.command()
+            endpoint = self.endpoint()
         except AcpError as exc:
             yield Done(reason=FAILED, text="", note=f"agent-connect: {exc}")
             return
@@ -942,15 +1100,17 @@ class AcpAdapter:
         # hears about it whether or not the agent turns out to be reachable.
         record = store.get(key) if store is not None else None
         if record is not None:
-            why = _why_unusable(record, cwd, settings)
+            why = _why_unusable(
+                record, cwd, settings, owns_cwd=not endpoint.dialled
+            )
             if why:
                 store.forget(key)
                 record = None
                 queue.put_nowait(Notice(text=RESET.format(why=why)))
 
         async def run():
-            async with AcpClient.spawn(
-                command, cwd=cwd, on_update=on_update, permission_handler=on_permission
+            async with self._connect(
+                endpoint, cwd=cwd, on_update=on_update, permission_handler=on_permission
             ) as client:
                 agent = await client.initialize()
                 live.client = client
@@ -1041,7 +1201,7 @@ class AcpAdapter:
         except AcpError as exc:
             # A missing bridge mid-Turn gets the same install advice the startup
             # check gives, rather than a bare "command not found".
-            note = (install_advice(command)
+            note = (install_advice(list(endpoint.command))
                     if isinstance(exc, AcpCommandMissing) else str(exc))
             yield Done(reason=FAILED, text="".join(chunks),
                        note=f"agent-connect: {note}")
@@ -1184,7 +1344,9 @@ class _Suppression:
         self.on = False
 
 
-def _why_unusable(record, cwd: str, settings: SessionSettings) -> str:
+def _why_unusable(
+    record, cwd: str, settings: SessionSettings, *, owns_cwd: bool = True
+) -> str:
     """Why this remembered Session cannot serve this Task — or `""`.
 
     Two reasons, and neither involves asking the Local Agent. A Session's
@@ -1194,8 +1356,17 @@ def _why_unusable(record, cwd: str, settings: SessionSettings) -> str:
     which is the point of the budget: the boundary is the Worker's to enforce
     and to announce, not something to discover when the context is already
     enormous.
+
+    **`owns_cwd` is false when the Agent was dialled rather than spawned**, and
+    the working-directory reason goes with it. A dialled Agent's directory
+    belongs to *its* host: the value in the map is the one that Agent reported,
+    it means nothing on this filesystem, and comparing it against this Worker's
+    own would retire a live Session every Turn and lose the room its history for
+    a mismatch that was never a mismatch. Whether the Session is still good is
+    then the remote's to answer, and it answers by refusing `session/load` —
+    which is already handled, and already says so in the room.
     """
-    if not record.matches(cwd):
+    if owns_cwd and not record.matches(cwd):
         return WHY_MOVED
     reason = settings.retirement(record)
     return WHY_RETIRED.format(reason=reason) if reason else ""

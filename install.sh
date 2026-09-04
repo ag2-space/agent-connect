@@ -19,6 +19,10 @@
 #   --adapter AGENT_CONNECT_ADAPTER  codex | omnigent | ollama | cline | acp  [default: codex]
 #   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini
 #             [default: claude, or `custom` when --acp-command is given]
+#   --acp-url AGENT_CONNECT_ACP_URL      dial an ACP agent already running behind
+#                                        this ws:// URL instead of spawning one.
+#                                        Mutually exclusive with --acp-command.
+#   --acp-token AGENT_CONNECT_ACP_TOKEN  bearer for that URL's door
 #   --acp-command AGENT_CONNECT_ACP_COMMAND  the ACP agent's command line, run as
 #             typed. Overrides any preset. Omitted on a re-run, the stored one is kept.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
@@ -64,6 +68,8 @@ ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-}"
 # Empty means "not asked for". The default is settled after arg parsing,
 # because it depends on whether a command was supplied.
 ACP_COMMAND="${AGENT_CONNECT_ACP_COMMAND:-}"
+ACP_URL="${AGENT_CONNECT_ACP_URL:-}"
+ACP_TOKEN="${AGENT_CONNECT_ACP_TOKEN:-}"
 # The ACP bridge that makes Claude Code an ACP Agent, PINNED to an exact
 # version. It renamed itself once already (the older name is dead — do not
 # reintroduce it) and moved through many major versions inside six months; an
@@ -106,6 +112,8 @@ while [ $# -gt 0 ]; do
     --adapter) ADAPTER="$2"; shift 2 ;;
     --acp-agent) ACP_AGENT="$2"; shift 2 ;;
     --acp-command) ACP_COMMAND="$2"; shift 2 ;;
+    --acp-url) ACP_URL="$2"; shift 2 ;;
+    --acp-token) ACP_TOKEN="$2"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --sutando-workspace|--sutando-workspace=*) sutando_gone ;;
     --no-start) START=0; shift ;;
@@ -113,6 +121,8 @@ while [ $# -gt 0 ]; do
     --adapter=*) ADAPTER="${1#*=}"; shift ;;
     --acp-agent=*) ACP_AGENT="${1#*=}"; shift ;;
     --acp-command=*) ACP_COMMAND="${1#*=}"; shift ;;
+    --acp-url=*) ACP_URL="${1#*=}"; shift ;;
+    --acp-token=*) ACP_TOKEN="${1#*=}"; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
     *) echo "install.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -129,6 +139,11 @@ ACP_AGENT_GIVEN=0
 [ -z "$ACP_AGENT" ] || ACP_AGENT_GIVEN=1
 
 # A flag that silently does nothing is the bug class this file keeps fixing.
+if [ -n "$ACP_URL" ] && [ "$ADAPTER" != "acp" ]; then
+  echo "install.sh: WARNING — --acp-url applies only to --adapter acp; ignoring it for adapter '$ADAPTER'." >&2
+  ACP_URL=""
+  ACP_TOKEN=""
+fi
 if [ -n "$ACP_COMMAND" ] && [ "$ADAPTER" != "acp" ]; then
   echo "install.sh: WARNING — --acp-command applies only to --adapter acp; ignoring it for adapter '$ADAPTER'." >&2
   ACP_COMMAND=""
@@ -154,6 +169,16 @@ reject_multiline --token "$TOKEN"
 reject_multiline --repo "$REPO"
 reject_multiline --adapter "$ADAPTER"
 [ -z "$ACP_COMMAND" ] || reject_multiline --acp-command "$ACP_COMMAND"
+[ -z "$ACP_URL" ] || reject_multiline --acp-url "$ACP_URL"
+[ -z "$ACP_TOKEN" ] || reject_multiline --acp-token "$ACP_TOKEN"
+
+# Refused here rather than resolved, for the same reason the adapter refuses it:
+# a URL and a command name two different agents, and a Worker that picked one
+# would answer rooms as something nobody chose.
+if [ -n "$ACP_URL" ] && [ -n "$ACP_COMMAND" ]; then
+  echo "install.sh: --acp-url and --acp-command name two different ACP agents; pass one." >&2
+  exit 2
+fi
 [ -z "$ACP_AGENT" ] || reject_multiline --acp-agent "$ACP_AGENT"
 
 # Working directory: state it loudly (invisible defaults are how agents end up
@@ -240,9 +265,11 @@ export PATH
 # Only for --adapter acp. The pin is the point: see ACP_BRIDGE_SPEC above.
 ACP_KV=""
 ACP_CMD_KV=""
+ACP_URL_KV=""
 if [ "$ADAPTER" = "acp" ]; then
   ACP_KV="AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
   [ -z "$ACP_COMMAND" ] || ACP_CMD_KV="AGENT_CONNECT_ACP_COMMAND=$ACP_COMMAND"
+  [ -z "$ACP_URL" ] || ACP_URL_KV="AGENT_CONNECT_ACP_URL=$ACP_URL"
   if [ "$ACP_CMD_CLEAR" -eq 1 ] && [ -n "$ACP_COMMAND_STORED" ]; then
     say "--acp-agent '$ACP_AGENT' replaces the AGENT_CONNECT_ACP_COMMAND already in your config"
     say "  (was: $ACP_COMMAND_STORED) — a command overrides every preset, so keeping it would have"
@@ -287,6 +314,11 @@ if [ -f "$CONFIG" ]; then
   if [ -n "$ACP_CMD_KV" ] || [ "$ACP_CMD_CLEAR" -eq 1 ]; then
     MANAGED="$MANAGED|AGENT_CONNECT_ACP_COMMAND"
   fi
+  # Same rule as the command: rewritten only when this run set one, so a re-run
+  # without the flag keeps the URL and token already in the file.
+  if [ -n "$ACP_URL_KV" ]; then
+    MANAGED="$MANAGED|AGENT_CONNECT_ACP_URL|AGENT_CONNECT_ACP_TOKEN"
+  fi
   KEPT="$(grep -v -E "^[[:space:]]*($MANAGED)[[:space:]]*=" "$CONFIG" \
           | grep -v -E '^[[:space:]]*(#|$)' || true)"
 fi
@@ -309,6 +341,8 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     printf '%s\n' "AGENT_CONNECT_REPO=\"$REPO\""
     [ -z "$ACP_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
     [ -z "$ACP_CMD_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_COMMAND=\"$ACP_COMMAND\""
+    [ -z "$ACP_URL_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_URL=\"$ACP_URL\""
+    [ -z "$ACP_URL_KV" ] || [ -z "$ACP_TOKEN" ] || printf '%s\n' "AGENT_CONNECT_ACP_TOKEN=\"$ACP_TOKEN\""
     if [ -n "$KEPT" ]; then
       printf '\n'
       printf '%s\n' "# kept from your previous config.env:"

@@ -374,6 +374,36 @@ grep -q '^AGENT_CONNECT_TOKEN="T2"$' "$ACPCFG" \
   && ok "while the managed settings still update around it" \
   || bad "re-run did not update the token"
 
+# 9c) --acp-url: the dialled door. Written through with its token, kept across a
+#     re-run the same way a command is, and refused outright beside one.
+: > "$NPM_LOG"
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:8802/acp" \
+         --acp-token "listener-secret" --no-start 2>&1) \
+  || bad "acp --acp-url dry-run failed"
+grep -q '^AGENT_CONNECT_ACP_URL="ws://127.0.0.1:8802/acp"$' "$ACPCFG" \
+  && ok "--acp-url is written to config.env" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--acp-url not written"; }
+grep -q '^AGENT_CONNECT_ACP_TOKEN="listener-secret"$' "$ACPCFG" \
+  && ok "and its bearer goes with it, into the 0600 file that already holds one" \
+  || bad "--acp-token not written"
+
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T3 --adapter acp --no-start 2>&1) \
+  || bad "acp re-run without --acp-url failed"
+grep -q '^AGENT_CONNECT_ACP_URL="ws://127.0.0.1:8802/acp"$' "$ACPCFG" \
+  && ok "a re-run WITHOUT --acp-url keeps the dialled door" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a re-run without --acp-url wiped the URL"; }
+
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
+     --acp-url "ws://127.0.0.1:8802/acp" --acp-command "my-agent --acp" \
+     --no-start >/dev/null 2>&1; then
+  bad "--acp-url beside --acp-command was accepted; they name two different agents"
+else
+  ok "--acp-url and --acp-command together are refused, not silently resolved"
+fi
+
 # A run that DOES supply one rewrites it, exactly once.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T3 --adapter acp --acp-command "other-agent --acp" --no-start 2>&1) \

@@ -80,6 +80,20 @@ RELAY_INTERNALS = ("ag2_relay_client.transport",)
 #: not the relay; a new name here is a decision somebody made on purpose.
 LOCAL_AGENT_SOCKETS = {"ollama.py": "the Ollama server on this machine"}
 
+#: The credential words above belong to the relay and to nothing else — except
+#: where a *Local Agent's own* door asks for one. Same shape as the socket
+#: allowance: by file, with a reason, so the next one is a decision somebody
+#: made rather than a directory-wide excuse. The ACP core dials a listener that
+#: authenticates its WebSocket upgrade; that bearer is the Agent's, is read from
+#: its own setting, and never touches the relay credential.
+LOCAL_AGENT_AUTH = {
+    "core.py": "the ACP Agent's own listener token, on its own handshake",
+}
+
+#: The two needles `LOCAL_AGENT_AUTH` excuses. The rest of `FORBIDDEN_TEXT` —
+#: the relay's host, its endpoint paths, the token grammar — is excused nowhere.
+AUTH_NEEDLES = ("Bearer ", "Authorization")
+
 #: Substrings that have no business in a string this package evaluates —
 #: anywhere, Adapters included.
 FORBIDDEN_TEXT = {
@@ -193,13 +207,24 @@ check(excused == set(LOCAL_AGENT_SOCKETS),
 # --- no credential handling, and no gateway --------------------------------
 
 offenders = []
+auth_excused = set()
 for path, tree in sources():
     for node, text in code_strings(tree):
         for needle, why in FORBIDDEN_TEXT.items():
-            if needle in text:
-                offenders.append(f"{path.name}:{node.lineno} {why}")
+            if needle not in text:
+                continue
+            if (needle in AUTH_NEEDLES
+                    and path.parent.name == "acp"
+                    and path.name in LOCAL_AGENT_AUTH):
+                auth_excused.add(path.name)
+                continue
+            offenders.append(f"{path.name}:{node.lineno} {why}")
 check(not offenders, f"no bearer, no relay host, no relay path, no token "
                      f"grammar in code ({offenders or 'none'})")
+check(auth_excused == set(LOCAL_AGENT_AUTH),
+      "and the one file allowed a credential of its own is still the ACP core, "
+      "still using it: an entry that stopped being needed is an entry that goes "
+      f"(excused: {sorted(auth_excused)}, listed: {sorted(LOCAL_AGENT_AUTH)})")
 
 offenders = []
 url_excused = set()
