@@ -37,16 +37,14 @@ SOURCES = sorted(PACKAGE.glob("*.py"))
 #: Everything this library is allowed to import. Standard library only, and a
 #: short list of it — every entry here is a deliberate decision.
 ALLOWED = {
-    "__future__", "base64", "collections", "contextlib", "dataclasses", "email",
-    "errno", "fcntl", "hashlib", "http", "io", "json", "logging", "mimetypes",
+    "__future__", "base64", "collections", "contextlib", "ctypes", "dataclasses", "email",
+    "errno", "fcntl", "hashlib", "http", "io", "json", "logging", "mimetypes", "msvcrt",
     "math", "os", "pathlib", "queue", "re", "shutil", "socket", "ssl", "stat", "sys",
     "tempfile", "threading", "time", "traceback", "types", "typing", "urllib",
     "uuid",
 }
-#: `fcntl` is the one entry that is not portable, and it is imported in a `try`
-#: for that reason: it is how the singleton guard is atomic, and a platform
-#: without it gets a guard that degrades to polling rather than an ImportError
-#: at startup (J1's fail-open rule, applied to the import itself).
+#: `fcntl` and `msvcrt` are platform-specific halves of the shared lock module;
+#: each is imported only by the backend selected for that platform.
 
 # --- no third-party imports, and no asyncio
 for source in SOURCES:

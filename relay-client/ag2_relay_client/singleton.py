@@ -68,12 +68,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
-log = logging.getLogger(__name__)
+from .locking import acquire_exclusive, release_exclusive
 
-try:  # POSIX advisory locking, and the atomicity of the whole guard.
-    import fcntl
-except ImportError:  # pragma: no cover — non-POSIX; see `_locked`
-    fcntl = None  # type: ignore[assignment]
+log = logging.getLogger(__name__)
 
 #: This client holds the bearer's guard and may poll.
 HELD = "held"
@@ -143,11 +140,6 @@ FUTURE_SKEW_S = 5.0
 #: in microseconds; this bound exists because nothing in the poll loop may block
 #: unboundedly (F1), not because waiting a second is ever expected.
 LOCK_WAIT_S = 1.0
-
-
-class GuardUnavailable(Exception):
-    """The guard file could not be locked. Always caught here, and always
-    downgraded to `DEGRADED` — never to `LOST`."""
 
 
 class PollerGuard:
@@ -414,50 +406,17 @@ class PollerGuard:
         outside it is a read-then-write with a gap in the middle, and that gap
         is the simultaneous-start incident.
         """
-        if fcntl is None:  # pragma: no cover — non-POSIX
-            raise GuardUnavailable(
-                "this platform has no fcntl; there is no atomic guard to take")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            self._lock(handle)
+            acquire_exclusive(
+                handle, time.monotonic() + max(0.0, self.lock_wait))
             try:
                 yield handle
             finally:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_UN)
-                except OSError:  # pragma: no cover — closing releases it anyway
-                    pass
+                release_exclusive(handle)
         finally:
             os.close(handle)
-
-    def _lock(self, handle: int) -> None:
-        """Wait for the lock, but never unboundedly (F1).
-
-        `LOCK_NB` and a short spin rather than a blocking `flock`: the poll loop
-        is the thing that keeps leases alive, and a call in it that can wait
-        forever is how a client stops delivering without ever looking broken.
-
-        `lock` is bound locally so the platform check reads as one here too:
-        `_locked` refuses a platform without `fcntl` before it ever calls this,
-        and a guard in the caller is not visible to a reader — or to a type
-        checker — standing in this function.
-        """
-        lock = fcntl
-        if lock is None:  # pragma: no cover — non-POSIX; `_locked` refuses first
-            raise GuardUnavailable(
-                "this platform has no fcntl; there is no atomic guard to take")
-        deadline = time.monotonic() + self.lock_wait
-        while True:
-            try:
-                lock.flock(handle, lock.LOCK_EX | lock.LOCK_NB)
-                return
-            except OSError as exc:
-                if time.monotonic() >= deadline:
-                    raise GuardUnavailable(
-                        f"the guard file stayed locked for {self.lock_wait}s "
-                        f"({exc})") from exc
-                time.sleep(0.005)
 
     def _verdict(self, verdict: str, why: Optional[str]) -> str:
         """Record a verdict, and say it out loud once per change.

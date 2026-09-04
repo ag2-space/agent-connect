@@ -50,6 +50,44 @@ jobs:
           done
           exit $fail
 
+  relay-client-locking-windows:
+    # The first native-Windows slice is the dependency-free lock contract:
+    # shared backend, real PollerGuard/Journal process races, and packaging.
+    name: Relay Client locking contract (Windows, py${{ matrix.python }}, no deps)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the Relay Client locking contract
+        working-directory: relay-client
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          $failed = $false
+          $tests = @(
+            'tests/test_singleton.py',
+            'tests/test_journal.py',
+            'tests/test_packaging.py'
+          )
+          foreach ($test in $tests) {
+            Write-Host "::group::$test"
+            python $test
+            if ($LASTEXITCODE -ne 0) {
+              $failed = $true
+              Write-Host "::error file=relay-client/$test::suite failed"
+            }
+            Write-Host "::endgroup::"
+          }
+          if ($failed) { exit 1 }
+
   worker:
     # Both documented install paths, deliberately. They are not two spellings of
     # one thing: uv installs a python-build-standalone interpreter, which links
