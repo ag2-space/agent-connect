@@ -120,6 +120,7 @@ from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 from .. import attachments as att
+from .. import hitl_seam
 from .. import outgoing
 from ..acp.core import (
     AcpAgentGone,
@@ -927,15 +928,36 @@ class AcpAdapter:
                 # story is that the turn ran out of time.
                 return None
             decision = policy.decide(request)
-            queue.put_nowait(
-                PermissionAsked(
-                    title=decision.title,
-                    allowed=decision.allowed,
-                    reason=decision.reason,
-                    detail={"paths": list(decision.paths)},
+            hitl_ws = hitl_seam.configured()
+            if decision.allowed or hitl_ws is None:
+                queue.put_nowait(
+                    PermissionAsked(
+                        title=decision.title,
+                        allowed=decision.allowed,
+                        reason=decision.reason,
+                        detail={"paths": list(decision.paths)},
+                    )
                 )
-            )
-            return decision.option_id
+                return decision.option_id
+
+            async def ask_the_human():
+                # The Policy could not allow it; the owner decides from a chat
+                # card. The core awaits this coroutine; a timeout is the reject.
+                chosen = await hitl_seam.escalate(
+                    request, session=key, workspace=hitl_ws, timeout=hitl_seam.timeout_s()
+                )
+                allowed = chosen is not None and chosen != decision.option_id
+                queue.put_nowait(
+                    PermissionAsked(
+                        title=decision.title,
+                        allowed=allowed,
+                        reason="owner allowed via card" if allowed else f"{decision.reason}; owner did not allow",
+                        detail={"paths": list(decision.paths), "hitl": True},
+                    )
+                )
+                return chosen if chosen is not None else decision.option_id
+
+            return ask_the_human()
 
         # Which Session this Turn belongs to, decided before the ACP Agent is
         # even started: a retired or misplaced one is dropped here, and the room
