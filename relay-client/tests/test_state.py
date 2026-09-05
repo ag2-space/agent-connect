@@ -11,6 +11,7 @@ Run: python3 tests/test_state.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -87,8 +88,18 @@ with tempfile.TemporaryDirectory() as tmp:
 
     prod.ensure()
     check(Path(prod.root).is_dir(), "ensure() creates the instance root")
-    check(oct(os.stat(prod.root).st_mode & 0o777) == oct(0o700),
-          "the instance root is private (it holds a journal and a lock)")
+    if os.name == "nt":
+        # Windows privacy is an ACL property, not a POSIX mode-bit property,
+        # and this library makes no ACL claim (see test_journal.py — the same
+        # honesty, for the same reason). The POSIX 0700 assertion is
+        # inapplicable here; what IS applicable is that ensure() left a
+        # directory this client can go on using.
+        check(bool(os.stat(prod.root).st_mode & stat.S_IWRITE),
+              "the Windows instance root stays usable after ensure() — the "
+              "POSIX 0700 privacy claim is not made here (privacy is ACL-based)")
+    else:
+        check(oct(os.stat(prod.root).st_mode & 0o777) == oct(0o700),
+              "the instance root is private (it holds a journal and a lock)")
     prod.ensure()
     check(Path(prod.root).is_dir(), "ensure() is idempotent")
 
@@ -156,9 +167,35 @@ with tempfile.TemporaryDirectory() as tmp:
         state_module.os.open = _saved_open
         state_module.os.fsync = _saved_fsync
     check(target.read_text() == "one line\n", "the write lands")
-    check(("fsynced", str(target.parent)) in SYNCED,
-          "and the directory holding it is fsynced, so the rename survives a "
-          "crash and not only the bytes do (A6)")
+    if os.name == "nt":
+        # The documented Windows contract for A6 is narrower, and this asserts
+        # the contract that exists rather than the one POSIX has: `fsync_dir`
+        # is best-effort by construction, Windows cannot open a directory
+        # through `os.open` at all, and a write that already landed must not be
+        # failed because the entry pointing at it could not be flushed (D4).
+        # The *bytes* are still made durable — the temp file is fsynced before
+        # the rename on every platform. Directory-rename durability is a POSIX
+        # property this library does not claim on Windows.
+        check(any(marker == "fsynced" and path != str(target.parent)
+                  for marker, path in SYNCED
+                  if not isinstance(marker, int)),
+              "the bytes are fsynced before the rename on Windows too")
+        check(("fsynced", str(target.parent)) not in SYNCED,
+              "the directory fsync of A6 is inapplicable on Windows — it is "
+              "documented best-effort, and no fsync on the parent occurs")
+        survived = None
+        try:
+            fsync_dir(target.parent)
+            survived = True
+        except OSError:
+            survived = False
+        check(survived,
+              "and asking for it directly degrades to a no-op, never an error "
+              "that could fail a write that already landed")
+    else:
+        check(("fsynced", str(target.parent)) in SYNCED,
+              "and the directory holding it is fsynced, so the rename survives a "
+              "crash and not only the bytes do (A6)")
 
     # It is best-effort by contract: not every filesystem lets a directory be
     # opened for fsync, and a write that already landed must not be failed

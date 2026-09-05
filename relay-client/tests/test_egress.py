@@ -33,6 +33,55 @@ def check(cond, name):
         fails += 1
 
 
+def inapplicable(name, why):
+    """A case this process cannot exercise, said out loud rather than skipped
+    in silence — the line names the capability that is missing and where the
+    case IS exercised, so a green run never overclaims."""
+    print("  n/a  " + name + " — " + why)
+
+
+def _probe_symlink():
+    """Can this process create a symlink at all? On Windows that is a
+    privilege (SeCreateSymbolicLinkPrivilege — held by an elevated process or
+    under Developer Mode); everywhere else it is a given."""
+    with tempfile.TemporaryDirectory() as probe:
+        target = Path(probe) / "t"
+        target.write_text("t")
+        try:
+            os.symlink(str(target), str(Path(probe) / "l"))
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+CAN_SYMLINK = _probe_symlink()
+NEEDS_SYMLINK = ("creating a symlink needs a privilege this process does not "
+                 "hold; exercised on POSIX, and on Windows whenever symlink "
+                 "privilege is available")
+
+
+def dirlink(target, link):
+    """A link to a directory: a symlink where the process may create one, a
+    junction on Windows where it may not. A junction resolves, follows and
+    repoints exactly the way these tests need a directory symlink to, and
+    needs no privilege — so the directory-link escapes are exercised on every
+    Windows process, elevated or not."""
+    if CAN_SYMLINK:
+        os.symlink(str(target), str(link))
+    else:
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+
+
+def rm_dirlink(link):
+    """Remove a directory link without touching what it points at."""
+    try:
+        os.remove(str(link))
+    except OSError:
+        # A Windows directory symlink or junction is unlinked as a directory.
+        os.rmdir(str(link))
+
+
 def refused(allowlist, path, name, base_dir=None):
     """Assert `path` does not leave, and return the reason for inspection."""
     try:
@@ -79,15 +128,18 @@ with tempfile.TemporaryDirectory() as tmp:
     allowed(allowlist, str(good), "a path given as a string works the same way")
 
     # --- symlink pointing out of the root
-    escape = root / "escape.txt"
-    os.symlink(str(secret), str(escape))
-    why = refused(allowlist, escape, "a symlink out of the root is refused")
-    check(why == egress.OUTSIDE, "and refused for being outside, not for being odd")
+    if CAN_SYMLINK:
+        escape = root / "escape.txt"
+        os.symlink(str(secret), str(escape))
+        why = refused(allowlist, escape, "a symlink out of the root is refused")
+        check(why == egress.OUTSIDE, "and refused for being outside, not for being odd")
+    else:
+        inapplicable("a symlink out of the root is refused", NEEDS_SYMLINK)
 
-    # --- symlink *component* mid-path: the link is a directory on the way
-    os.symlink(str(outside), str(root / "elsewhere"))
+    # --- link *component* mid-path: the link is a directory on the way
+    dirlink(outside, root / "elsewhere")
     refused(allowlist, root / "elsewhere" / "id_rsa",
-            "a symlink component mid-path is refused")
+            "a directory-link component mid-path is refused")
 
     # --- `..` traversal, in both the obvious and the buried spelling
     refused(allowlist, str(root) + "/../outside/id_rsa",
@@ -113,9 +165,12 @@ with tempfile.TemporaryDirectory() as tmp:
     # --- a symlink whose target is *inside* the root: allowed, on purpose.
     # The allowlist judges where a file is, not how it was named — and a notes
     # tree that is itself a symlink is a real deployment, not a hypothetical.
-    inside_link = root / "alias.png"
-    os.symlink(str(good), str(inside_link))
-    allowed(allowlist, inside_link, "a symlink resolving inside the root is sendable")
+    if CAN_SYMLINK:
+        inside_link = root / "alias.png"
+        os.symlink(str(good), str(inside_link))
+        allowed(allowlist, inside_link, "a symlink resolving inside the root is sendable")
+    else:
+        inapplicable("a symlink resolving inside the root is sendable", NEEDS_SYMLINK)
 
     # --- the hard link: the escape realpath structurally cannot see
     hard = root / "hard.txt"
@@ -127,10 +182,26 @@ with tempfile.TemporaryDirectory() as tmp:
     hard.unlink()
 
     # --- special files: not-a-regular-file, and a FIFO that must not stall
-    fifo = root / "pipe"
-    os.mkfifo(str(fifo))
-    why = refused(allowlist, fifo, "a FIFO inside a root is refused (and does not hang)")
-    check(why == egress.NOT_REGULAR, "refused for what it is, not for where it is")
+    if hasattr(os, "mkfifo"):
+        fifo = root / "pipe"
+        os.mkfifo(str(fifo))
+        why = refused(allowlist, fifo, "a FIFO inside a root is refused (and does not hang)")
+        check(why == egress.NOT_REGULAR, "refused for what it is, not for where it is")
+    else:
+        # No FIFO exists on Windows: named pipes live in the `\\.\pipe\`
+        # namespace, not in any directory an allowlist could name, so there is
+        # no in-tree special file to create. The Windows twin is the legacy
+        # DOS device name, which is reachable *inside* a root — `outbox\NUL`
+        # opens the NUL device on Win32 — and is refused below.
+        inapplicable("a FIFO inside a root is refused (and does not hang)",
+                     "os.mkfifo does not exist on Windows; the in-root device "
+                     "case is covered by the DOS device name check instead")
+        why = refused(allowlist, root / "NUL",
+                      "a legacy DOS device name inside a root is refused "
+                      "(the Windows spelling of a device where a file belongs)")
+        check(why == egress.OUTSIDE,
+              "and refused as outside: its canonical home is the device "
+              "namespace, which no root contains")
     refused(allowlist, root, "the root directory itself is not a file to send")
     refused(allowlist, root / "sub", "a directory inside the root is refused")
 
@@ -189,29 +260,39 @@ with tempfile.TemporaryDirectory() as tmp:
     outside = top / "outside"
     outside.mkdir()
     (outside / "id_rsa").write_text("PRIVATE KEY")
-    swapped = root / "report.txt"
-    os.symlink(str(outside / "id_rsa"), str(swapped))
-
     allowlist = EgressAllowlist([root])
     real_realpath = egress.os.path.realpath
 
-    def lying_realpath(path, *args, **kwargs):
-        # As if the file had been a plain file when it was measured, and had
-        # become a symlink a microsecond later.
-        if str(path) == str(swapped):
-            return str(swapped)
-        return real_realpath(path, *args, **kwargs)
+    if CAN_SYMLINK:
+        swapped = root / "report.txt"
+        os.symlink(str(outside / "id_rsa"), str(swapped))
 
-    egress.os.path.realpath = lying_realpath
-    try:
-        why = refused(allowlist, swapped,
-                      "a path swapped for a symlink after the check is refused")
-        check(why == egress.SWAPPED,
-              "and refused by the descriptor walk, which is what actually holds")
-    finally:
-        egress.os.path.realpath = real_realpath
+        def lying_realpath(path, *args, **kwargs):
+            # As if the file had been a plain file when it was measured, and
+            # had become a symlink a microsecond later.
+            if str(path) == str(swapped):
+                return str(swapped)
+            return real_realpath(path, *args, **kwargs)
 
-    # --- the same walk refuses a symlink swapped in *mid-path*
+        egress.os.path.realpath = lying_realpath
+        try:
+            why = refused(allowlist, swapped,
+                          "a path swapped for a symlink after the check is refused")
+            check(why == egress.SWAPPED,
+                  "and refused by the descriptor walk, which is what actually holds")
+        finally:
+            egress.os.path.realpath = real_realpath
+    else:
+        # The mid-path swap below still runs — a junction needs no privilege —
+        # so the TOCTOU hold is exercised on this process too, one level up.
+        inapplicable("a path swapped for a symlink after the check is refused",
+                     NEEDS_SYMLINK)
+
+    # --- the same hold refuses a directory link swapped in *mid-path*. On
+    # POSIX that is the `openat` walk reading ELOOP; on Windows — which has
+    # neither `openat` nor `O_NOFOLLOW` — it is the opened handle being asked
+    # what it really names. A junction works where symlink creation is a
+    # privilege, so this case runs on every Windows process.
     root2 = top / "allowed2"
     (root2 / "reports").mkdir(parents=True)
     (root2 / "reports" / "q3.txt").write_text("fine")
@@ -223,7 +304,7 @@ with tempfile.TemporaryDirectory() as tmp:
     (decoy / "q3.txt").write_text("PRIVATE KEY")
     import shutil
     shutil.rmtree(str(root2 / "reports"))
-    os.symlink(str(decoy), str(root2 / "reports"))
+    dirlink(decoy, root2 / "reports")
     egress.os.path.realpath = lambda p, *a, **k: (
         str(root2 / "reports" / "q3.txt")
         if str(p) == str(root2 / "reports" / "q3.txt")
@@ -231,8 +312,10 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     try:
         why = refused(allowlist2, root2 / "reports" / "q3.txt",
-                      "a directory component swapped for a symlink is refused")
-        check(why == egress.SWAPPED, "ELOOP mid-walk, not a truncated read")
+                      "a directory component swapped for a link is refused")
+        check(why == egress.SWAPPED,
+              "refused as a swap — ELOOP on the POSIX walk, a handle that "
+              "names the wrong file on Windows — not a truncated read")
     finally:
         egress.os.path.realpath = real_realpath
 
@@ -291,43 +374,43 @@ with tempfile.TemporaryDirectory() as tmp:
     refused(allowlist, outside / "loot.txt",
             "after all that, the outside file is still refused")
 
-    # --- a root given as a symlink is resolved ONCE, at construction, and does
-    # not follow a later repointing. (Roots that are symlinks are a real
+    # --- a root given as a directory link is resolved ONCE, at construction,
+    # and does not follow a later repointing. (Roots that are links are a real
     # deployment: a notes tree living in a sync root.)
     real_root = top / "real"
     real_root.mkdir()
     (real_root / "note.md").write_text("note")
     link_root = top / "link"
-    os.symlink(str(real_root), str(link_root))
+    dirlink(real_root, link_root)
     by_link = EgressAllowlist([link_root])
     check(by_link.roots == (str(real_root),),
-          "a symlinked root is stored resolved, so it names one directory for good")
+          "a linked root is stored resolved, so it names one directory for good")
     allowed(by_link, real_root / "note.md", "a file under the resolved root is sendable")
-    os.remove(str(link_root))
-    os.symlink(str(outside), str(link_root))
+    rm_dirlink(link_root)
+    dirlink(outside, link_root)
     refused(by_link, outside / "loot.txt",
-            "repointing the root's symlink afterwards widens nothing")
+            "repointing the root's link afterwards widens nothing")
     allowed(by_link, real_root / "note.md",
             "and the original root still works, unaffected")
 
-    # --- the same attack one level up: a symlink that is an ANCESTOR of the
-    # root. The whole chain above the root is spent at construction, so there is
-    # no live link left in it to swap afterwards.
+    # --- the same attack one level up: a directory link that is an ANCESTOR of
+    # the root. The whole chain above the root is spent at construction, so
+    # there is no live link left in it to swap afterwards.
     holder = top / "holder"
     (holder / "notes").mkdir(parents=True)
     (holder / "notes" / "note.md").write_text("note")
     via = top / "via"
-    os.symlink(str(holder), str(via))
+    dirlink(holder, via)
     through = EgressAllowlist([via / "notes"])
     check(through.roots == (str(holder / "notes"),),
-          "a root reached through a symlinked ANCESTOR is stored fully resolved")
+          "a root reached through a linked ANCESTOR is stored fully resolved")
     allowed(through, holder / "notes" / "note.md",
             "and a file under it is sendable")
     decoy_holder = top / "decoy-holder"
     (decoy_holder / "notes").mkdir(parents=True)
     (decoy_holder / "notes" / "loot.txt").write_text("loot")
-    os.remove(str(via))
-    os.symlink(str(decoy_holder), str(via))
+    rm_dirlink(via)
+    dirlink(decoy_holder, via)
     refused(through, via / "notes" / "loot.txt",
             "repointing that ancestor afterwards reaches nothing")
     allowed(through, holder / "notes" / "note.md",
@@ -353,10 +436,20 @@ with tempfile.TemporaryDirectory() as tmp:
 
     (top / "outbox").mkdir()
     (top / "outbox" / "chart.png").write_bytes(b"PNG-ish")
-    check(egress.sendable_roots([top / "OUTBOX"]) == (),
-          "a root spelled in a case the filesystem does not use is dropped: on a "
-          "case-insensitive volume it resolves happily, no child's real path "
-          "starts with it, and every upload is refused without ever saying why")
+    if os.name == "nt":
+        # Windows `realpath` reads the spelling off the disk itself
+        # (GetFinalPathNameByHandle), so a wrong-case root arrives already
+        # corrected — the failure this check exists for cannot be built here.
+        # What is asserted instead is the correction: the stored root is the
+        # on-disk spelling, so every child's real path starts with it.
+        check(egress.sendable_roots([top / "OUTBOX"]) == (str(top / "outbox"),),
+              "a root spelled in a case the filesystem does not use is stored "
+              "in the on-disk spelling, so it matches its own children")
+    else:
+        check(egress.sendable_roots([top / "OUTBOX"]) == (),
+              "a root spelled in a case the filesystem does not use is dropped: on a "
+              "case-insensitive volume it resolves happily, no child's real path "
+              "starts with it, and every upload is refused without ever saying why")
     check(egress.sendable_roots([top / "outbox"]) == (str(top / "outbox"),),
           "spelled the way the directory is, it is a root like any other")
 
