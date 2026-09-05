@@ -11,6 +11,7 @@ Run: python3 tests/test_status.py
 import _bootstrap  # noqa: F401 — distribution root on sys.path
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -43,7 +44,16 @@ with tempfile.TemporaryDirectory() as tmp:
     check(snapshot["last_ok_ts"] > 0, "and stamps the last healthy round-trip")
     check(snapshot["inflight"] == 2, "carrying whatever the caller measured")
     check(json.loads(path.read_text()) == snapshot, "the file matches the snapshot")
-    check(oct(os.stat(path).st_mode & 0o777) == oct(0o600), "and is private")
+    if os.name == "nt":
+        # Windows privacy is an ACL property, not a POSIX mode-bit property;
+        # chmod(0o600) maps only to the read-only attribute there, and this
+        # library claims no ACL privacy (test_journal.py's precedent). What is
+        # applicable is that the owner can keep updating the status file.
+        check(bool(os.stat(path).st_mode & stat.S_IWRITE),
+              "and stays owner-writable on Windows — the POSIX 0600 privacy "
+              "claim is not made here (privacy is ACL-based)")
+    else:
+        check(oct(os.stat(path).st_mode & 0o777) == oct(0o600), "and is private")
     check(snapshot["gateway"] == "https://gw.example/relay",
           "the gateway is redacted before it is ever persisted (D3)")
     connected_at = snapshot["last_ok_ts"]

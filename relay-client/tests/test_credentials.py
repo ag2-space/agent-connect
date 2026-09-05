@@ -230,16 +230,21 @@ with tempfile.TemporaryDirectory() as tmp:
     home_file = Path(tmp) / "home.env"
     home_file.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay%7CSECRET\n")
     import os as _os
-    saved = _os.environ.get("HOME")
-    _os.environ["HOME"] = tmp
+    # Hermetic on every platform: `~` is whatever expanduser consults, and that
+    # is NOT the same variable everywhere — POSIX reads HOME, Windows reads
+    # USERPROFILE and ignores HOME entirely (since Python 3.8). Setting HOME
+    # alone made this test resolve the real profile directory on Windows.
+    home_var = "USERPROFILE" if _os.name == "nt" else "HOME"
+    saved = _os.environ.get(home_var)
+    _os.environ[home_var] = tmp
     try:
         tilde = TokenSource(token_file="~/home.env")
         check(tilde.secret == "SECRET", "a token file written with ~ is found")
     finally:
         if saved is None:
-            _os.environ.pop("HOME", None)
+            _os.environ.pop(home_var, None)
         else:
-            _os.environ["HOME"] = saved
+            _os.environ[home_var] = saved
 
 # --- C5: a rotation NEVER moves the gateway
 with tempfile.TemporaryDirectory() as tmp:
