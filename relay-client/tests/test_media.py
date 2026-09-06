@@ -23,6 +23,7 @@ Run: python3 tests/test_media.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -190,8 +191,17 @@ with tempfile.TemporaryDirectory() as tmp:
     check(Path(first).name.endswith(".png"),
           "the extension survives: the outbound media route guesses the mime "
           "from the filename, so it decides how a re-upload renders")
-    check(oct(Path(tmp).joinpath("media").stat().st_mode & 0o777) == oct(0o700),
-          "the media directory is private — attachments are one bearer's mail")
+    if os.name == "nt":
+        # Windows privacy is an ACL property, not a POSIX mode-bit property,
+        # and this library makes no ACL claim (test_journal.py's precedent).
+        # The 0700 assertion is a POSIX fact; the applicable Windows fact is
+        # that the directory came up usable for the bearer's mail to land in.
+        check(bool(Path(tmp).joinpath("media").stat().st_mode & stat.S_IWRITE),
+              "the Windows media directory is usable — the POSIX 0700 privacy "
+              "claim is not made here (privacy is ACL-based)")
+    else:
+        check(oct(Path(tmp).joinpath("media").stat().st_mode & 0o777) == oct(0o700),
+              "the media directory is private — attachments are one bearer's mail")
 
     # The name is a hint from a room message, and it is never the filename: a
     # traversal in it has nowhere to go, because the store names its own files.

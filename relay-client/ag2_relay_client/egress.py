@@ -338,7 +338,16 @@ class EgressAllowlist:
         (which is how macOS answers `O_NOFOLLOW|O_DIRECTORY` on a symlink) as
         the same thing: the path changed underneath us.
         """
-        relative = os.path.relpath(real, root)
+        try:
+            relative = os.path.relpath(real, root)
+        except ValueError:
+            # Windows: a legacy DOS device name inside a root — `outbox\NUL` —
+            # canonicalises to another mount (`\\.\NUL`) inside `relpath`, which
+            # raises rather than answering. The file such a path names does not
+            # live under any root, and the one-exception contract (I1) holds:
+            # this leaves as a refusal, never as a bare ValueError out of the
+            # poll thread.
+            raise EgressRefused(OUTSIDE, shown) from None
         parts = [] if relative == os.curdir else relative.split(os.sep)
         if not parts or any(part in ("", os.pardir) for part in parts):
             # `..` cannot survive a realpath, so reaching this means something
@@ -349,12 +358,21 @@ class EgressAllowlist:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         nonblock = getattr(os, "O_NONBLOCK", 0)
 
-        if os.open not in getattr(os, "supports_dir_fd", set()):  # pragma: no cover
-            # No `openat` on this platform. The walk degrades to a single
-            # `O_NOFOLLOW` open of the resolved path, which still refuses a
-            # swapped *final* component; the mid-path race is not closable
-            # without `openat`, and pretending otherwise would be worse.
-            return _open(real, os.O_RDONLY | nofollow | nonblock, shown)
+        if os.open not in getattr(os, "supports_dir_fd", set()):
+            # No `openat` on this platform. The walk degrades to a single open
+            # of the resolved path — with `O_NOFOLLOW` where it exists, which
+            # still refuses a swapped *final* component. Windows has neither
+            # `openat` nor `O_NOFOLLOW`, so the open follows any link swapped
+            # in after the check (reproduced: a directory component replaced by
+            # a junction between `realpath` and the open handed an outside file
+            # out). What Windows does have is the handle itself as authority:
+            # the kernel names the file a handle really opened, and a name that
+            # is not the judged path is refused the same way `ELOOP` is.
+            fd = _open(real, os.O_RDONLY | nofollow | nonblock, shown)
+            if os.name == "nt" and not _handle_names(fd, real):
+                _shut(fd)
+                raise EgressRefused(SWAPPED, shown)
+            return fd
 
         fd = _open(root, os.O_RDONLY | directory | nofollow, shown, traversing=True)
         try:
@@ -388,6 +406,43 @@ def _open(target: object, flags: int, shown: str, dir_fd: Optional[int] = None,
         raise EgressRefused(
             f"it could not be opened ({exc.strerror or exc})", shown
         ) from None
+
+
+def _handle_names(fd: int, real: str) -> bool:  # pragma: no cover — Windows only
+    """Does this open handle really name the path that was judged? (Windows.)
+
+    The degraded single-open walk above cannot refuse a symlink or junction on
+    Windows — there is no `O_NOFOLLOW` to open with — so the question is asked
+    the other way around: the kernel is asked what file the handle it returned
+    actually names (`GetFinalPathNameByHandle`, the same resolution `realpath`
+    uses), and an answer that is not the judged path means the path changed
+    between the check and the open. Anything that prevents the answer fails
+    closed: a handle whose identity cannot be established is a handle this
+    module will not vouch for, which is the direction it fails in on purpose.
+    """
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    size = 32768
+    buffer = ctypes.create_unicode_buffer(size)
+    try:
+        length = kernel32.GetFinalPathNameByHandleW(
+            wintypes.HANDLE(msvcrt.get_osfhandle(fd)), buffer, size, 0)
+    except OSError:
+        return False
+    if not length or length >= size:
+        return False
+    final = buffer.value
+    if final.startswith("\\\\?\\UNC\\"):
+        final = "\\\\" + final[8:]
+    elif final.startswith("\\\\?\\"):
+        final = final[4:]
+    return os.path.normcase(final) == os.path.normcase(real)
 
 
 def _shut(fd: int) -> None:
@@ -431,7 +486,12 @@ def _usable_root(real: str, given: object) -> bool:
     A component we cannot list is not a component we may condemn: an
     unreadable parent directory answers "cannot tell", and the root is kept.
     """
-    if real == os.sep:
+    if os.path.splitdrive(real)[1] == os.sep:
+        # `/` on POSIX; on Windows also what `/` resolves to — a drive root
+        # like `C:\` (or a share root), which is the same absence of an
+        # allowlist spelled with a drive letter. Left in place it would refuse
+        # every file for ever without saying why, since no child's real path
+        # starts with `C:\` + a second separator.
         log.warning(
             "egress root %r is the whole filesystem, which is not an allowlist "
             "— dropping it", str(given),

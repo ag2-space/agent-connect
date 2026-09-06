@@ -243,10 +243,23 @@ journal.accept(sys.argv[3])
 """
 
 
-def run_process_journal_race(tmp, disable_lock=False):
+def run_process_journal_race(tmp, disable_lock=False, one_at_a_time=False):
+    """Two writer processes against one journal, released by gate files.
+
+    `one_at_a_time` releases writer A, waits for it to exit, then releases
+    writer B. Both writers loaded the journal *before* either gate opened, so
+    B's view is stale either way — what the sequencing removes is only the
+    unrelated race of two `os.replace` calls landing on one destination in the
+    same instant, which Windows answers with a sharing violation in whichever
+    process loses. The lost update being demonstrated needs a stale view, not
+    simultaneity.
+    """
     path = Path(tmp) / "journal.jsonl"
-    gate = Path(tmp) / "release"
     wire_ids = ("task-process-A", "task-process-B")
+    if one_at_a_time:
+        gates = [Path(tmp) / (wire_id + ".release") for wire_id in wire_ids]
+    else:
+        gates = [Path(tmp) / "release"] * len(wire_ids)
     ready_markers = [Path(tmp) / (wire_id + ".ready") for wire_id in wire_ids]
     writers = [
         subprocess.Popen([
@@ -254,7 +267,7 @@ def run_process_journal_race(tmp, disable_lock=False):
             str(path), wire_id, str(ready), str(gate),
             "no-lock" if disable_lock else "lock"
         ])
-        for wire_id, ready in zip(wire_ids, ready_markers)
+        for wire_id, ready, gate in zip(wire_ids, ready_markers, gates)
     ]
     deadline = time.monotonic() + 10.0
     while not all(marker.exists() for marker in ready_markers):
@@ -262,14 +275,22 @@ def run_process_journal_race(tmp, disable_lock=False):
             break
         time.sleep(0.005)
     both_ready = all(marker.exists() for marker in ready_markers)
-    gate.write_text("go", encoding="utf-8")
-    codes = []
-    for writer in writers:
+
+    def finished(writer):
         try:
-            codes.append(writer.wait(timeout=30))
+            return writer.wait(timeout=30)
         except subprocess.TimeoutExpired:
             writer.terminate()
-            codes.append(writer.wait(timeout=5))
+            return writer.wait(timeout=5)
+
+    codes = []
+    if one_at_a_time:
+        for writer, gate in zip(writers, gates):
+            gate.write_text("go", encoding="utf-8")
+            codes.append(finished(writer))
+    else:
+        gates[0].write_text("go", encoding="utf-8")
+        codes = [finished(writer) for writer in writers]
     return both_ready, codes, fresh(tmp).load().inflight_ids()
 
 
@@ -279,11 +300,21 @@ with tempfile.TemporaryDirectory() as tmp:
         "task-process-A", "task-process-B"},
         f"two processes changing different Task ids preserve both facts ({result})")
 
+# The negative control: the same stale views, with the merge lock disabled.
+# Writer A lands completely before writer B is released — B's overwrite comes
+# from the stale view it loaded before A ran, so the lost update is proved
+# deterministically. Releasing both at once proved the same thing *most* runs,
+# and on the others proved only that two unlocked `os.replace` calls on one
+# Windows destination can collide (a sharing violation exits one child nonzero
+# — reproduced at ~12% per pair under load). That collision is the lock's job
+# to prevent and the locked positive control above shows it prevented; a
+# negative control that depends on it is measuring the wrong property.
 with tempfile.TemporaryDirectory() as tmp:
-    ready, codes, result = run_process_journal_race(tmp, disable_lock=True)
-    check(ready and codes == [0, 0] and len(result) == 1 and
-          set(result) < {"task-process-A", "task-process-B"},
-          f"without the merge lock, the same stale-view race loses one fact ({result})")
+    ready, codes, result = run_process_journal_race(
+        tmp, disable_lock=True, one_at_a_time=True)
+    check(ready and codes == [0, 0] and result == ["task-process-B"],
+          "without the merge lock, the second stale-view writer erases the "
+          f"first one's fact ({result})")
 
 # --- F8 on the way back in, not only on the way out ------------------------
 # The journal is this library's own file, but "our own file" is not a trust
