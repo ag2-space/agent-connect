@@ -31,12 +31,22 @@ ADR 0003; sutando's shim ignores the wire tier by local policy). A library that
 mapped the tier itself would have to pick one of them and break the other. The
 value's *shape* is bounded — a str, control characters removed, length-capped —
 which changes no legitimate value and keeps an attacker-shaped one small.
+
+**So are the addressing facts a shared room adds.** `addressed_to`,
+`reply_to_sender`, `room_members` and `room_member_count` are the broker's
+routing facts — whom the message named, whose message it replied to, who is in
+the room — and they cross the same way the tier does: bounded in shape, judged
+by nobody here. Which of them means "stand down" is the consumer's reading. The
+roster arrives in either of the two shapes the broker has been seen to send it
+in, a list of mxids or the capped `"@a:x, @b:x (+3 more)"` string, and is
+delivered as the mxids it names in both.
 """
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
+from .markers import mxids_in
 from .state import valid_wire_id
 
 #: The gateway's unsigned metadata block. The bracket body is `[^\]]*` because
@@ -68,6 +78,9 @@ DEFAULT_PRIORITY = "normal"
 MAX_TEXT = 64 * 1024
 MAX_SHORT = 256
 MAX_TIER = 64
+#: The broker caps the roster it sends at ten; this bounds what a broker that
+#: did not would make the client hold.
+MAX_MEMBERS = 64
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -165,8 +178,9 @@ class Task:
         "id", "body", "room_id", "user_id", "access_tier",
         "requested_access_tier", "collaborator", "sensitive_data_filter",
         "priority", "timestamp", "room_name", "sender_name", "reply_to_event",
-        "reply_to_me", "source_message_id", "attempt", "metadata_stripped",
-        "attachments",
+        "reply_to_me", "reply_to_sender", "addressed_to", "room_members",
+        "room_member_count", "source_message_id", "attempt",
+        "metadata_stripped", "attachments",
     )
 
     def __init__(
@@ -189,6 +203,10 @@ class Task:
         attempt: int = 0,
         metadata_stripped: bool = False,
         attachments: Tuple = (),
+        reply_to_sender: str = "",
+        addressed_to: str = "",
+        room_members: Tuple = (),
+        room_member_count: int = 0,
     ):
         self.id = id
         #: The message text, metadata blocks removed (G2).
@@ -214,6 +232,18 @@ class Task:
         self.sender_name = sender_name
         self.reply_to_event = reply_to_event
         self.reply_to_me = reply_to_me
+        #: The rest of what the broker knows about a shared room's routing,
+        #: delivered as data like the tier: whose message this one replied to,
+        #: and whom it was addressed to. Neither is judged here — what
+        #: "addressed to someone else" means is the consumer's decision.
+        self.reply_to_sender = reply_to_sender
+        self.addressed_to = addressed_to
+        #: Who is in the room, as full mxids, and how many there are. The list
+        #: is capped by the broker (and bounded here), so the count is the only
+        #: honest size of the room: a consumer reading the list as the whole
+        #: roster takes a big room for a small one.
+        self.room_members = tuple(room_members)
+        self.room_member_count = room_member_count
         self.source_message_id = source_message_id
         #: The broker's re-serve counter. Additive bookkeeping; a client that
         #: ignores it still works — it is carried because it is the one signal
@@ -277,17 +307,48 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
         sender_name=_text(raw.get("sender_name")),
         reply_to_event=_text(raw.get("reply_to_event")),
         reply_to_me=raw.get("reply_to_me") is True,
+        reply_to_sender=_text(raw.get("reply_to_sender")),
+        addressed_to=_text(raw.get("addressed_to")),
+        # Either shape the broker sends it in: a list of mxids, or the capped
+        # `"@a:x, @b:x (+3 more)"` string its bridge allowlist serialises.
+        room_members=_members(raw.get("room_members")),
+        room_member_count=_count(raw.get("room_member_count")),
         # Canonical name first, with the older spelling as the fallback the
         # protocol documents as the same value.
         source_message_id=_text(raw.get("source_message_id")
                                 or raw.get("source_event_id")),
-        attempt=_attempt(raw.get("attempt")),
+        attempt=_count(raw.get("attempt")),
         metadata_stripped=stripped,
     )
 
 
-def _attempt(value: Any) -> int:
-    """The re-serve counter as a non-negative int; anything else is 0."""
+def _count(value: Any) -> int:
+    """A wire counter — the re-serve count, the room's size — as a non-negative
+    int; anything else is 0. A bool is not a count, and neither is `"3"`."""
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
     return value if 0 <= value < 10 ** 6 else 0
+
+
+def _members(value: Any) -> Tuple[str, ...]:
+    """The roster as full mxids, from either shape the broker sends it in.
+
+    A list of mxids is the documented form. The capped string — `"@a:x, @b:x
+    (+3 more)"` — is what the bridge allowlist serialises a longer roster to.
+    Both are read by the one grammar (`markers.mxids_in`): every entry is text
+    that names some mxids, usually exactly one, and only full mxids come out
+    of it, once each — a bare name is not a member and the `(+3 more)` is
+    prose, `room_member_count` carrying the number. Any other shape is an
+    empty roster: not understood is not guessed at.
+    """
+    entries = [value] if isinstance(value, str) else value
+    if not isinstance(entries, (list, tuple)):
+        return ()
+    found: List[str] = []
+    for entry in entries:
+        for mxid in mxids_in(_text(entry, MAX_TEXT)):
+            if mxid not in found:
+                found.append(mxid)
+            if len(found) >= MAX_MEMBERS:
+                return tuple(found)
+    return tuple(found)

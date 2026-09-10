@@ -211,6 +211,53 @@ many = "keep me " + "[room-ops metadata: x] " * 1000 + "and me"
 check(strip_room_ops_meta(many)[0] == "keep me and me",
       "a thousand separate blocks still go in one pass, text intact")
 
+# --- the addressing fields a shared room adds (additive, and data) ---------
+# The broker says whom a message named, whose message it replied to, and who is
+# in the room. They cross like the tier does — bounded in shape, judged by
+# nobody here — and the roster arrives in either of the two shapes the broker
+# has been seen to send it in.
+roomful = parse_task(task_dict(
+    addressed_to="@codex.agent:ag2.space", reply_to_sender="@bob:ag2.space",
+    room_members=["@alice:ag2.space", "@codex.agent:ag2.space", "@bob:ag2.space"],
+    room_member_count=3))
+check(roomful.addressed_to == "@codex.agent:ag2.space", "addressed_to is delivered")
+check(roomful.reply_to_sender == "@bob:ag2.space", "and so is reply_to_sender")
+check(roomful.room_members == ("@alice:ag2.space", "@codex.agent:ag2.space",
+                               "@bob:ag2.space"),
+      "a roster sent as a list arrives as a tuple of full mxids, in order")
+check(roomful.room_member_count == 3, "with the broker's count beside it")
+
+capped = parse_task(task_dict(
+    room_members="@alice:ag2.space, @bob:ag2.space (+3 more)", room_member_count=5))
+check(capped.room_members == ("@alice:ag2.space", "@bob:ag2.space"),
+      "the capped string form names the members it names, and '+3 more' is prose")
+check(capped.room_member_count == 5,
+      "and the count, not the list, says how big the room is")
+
+bare = parse_task(task_dict())
+check(bare.addressed_to == "" and bare.reply_to_sender == "",
+      "absent, the two names are empty — a DM names nobody")
+check(bare.room_members == () and bare.room_member_count == 0,
+      "and an absent roster is empty with a count of zero, not a guess")
+
+check(parse_task(task_dict(room_members=["@alice:ag2.space", "alice", 7, None,
+                                          "@alice:ag2.space"])).room_members
+      == ("@alice:ag2.space",),
+      "a list is kept to full mxids, each once — a bare name or a non-string "
+      "is not a member")
+check(parse_task(task_dict(room_members={"@alice:ag2.space": True})).room_members == (),
+      "a roster in a shape this client does not understand is empty")
+check(len(parse_task(task_dict(room_members=[f"@u{n}:ag2.space" for n in range(200)]))
+          .room_members) == 64,
+      "and an unbounded roster does not become an unbounded local one")
+for bogus in ("3", 3.0, True, -1, None, [3], 10 ** 7):
+    check(parse_task(task_dict(room_member_count=bogus)).room_member_count == 0,
+          f"a count that is not a sane int is 0: {bogus!r}")
+check(parse_task(task_dict(addressed_to={"id": "x"})).addressed_to == "",
+      "an addressee that is not text is absent, not stringified")
+check(Task("task-1") != Task("task-1", room_members=("@alice:ag2.space",)),
+      "the roster is part of what makes two Tasks equal")
+
 check(Task("task-1") == Task("task-1"), "two Tasks with the same fields are equal")
 check(Task("task-1") != Task("task-2"), "and differ when they differ")
 

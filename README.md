@@ -253,6 +253,15 @@ Adapters that are not ACP get the placeholder and the final answer too, with
 nothing in between — they have no tool activity to report, and inventing some
 would put fiction in a room.
 
+**Hand-offs are addressed by mxid.** In a room shared with another agent, the
+broker delivers a message to that agent only when the agent's full mxid is on
+it — stamped as a mention, or written whole in the body — and an agent ignores
+agent-authored messages it is not named in. So the worker tells the local agent
+who is in the room and how a hand-off is delivered (the roster, the addressee
+and the reply facts the broker sends with each task reach it in the preamble),
+and a message the worker posts is stamped for the room members whose mxids it
+names.
+
 If the worker holds no relay token, or the relay refuses a room op, the answer
 travels the way it always did — as the task result the relay client posts. The
 ladder degrades; it never eats the answer.

@@ -464,6 +464,70 @@ check("the answer" in body and not body.startswith(REPLIED),
 relay.stop()
 
 
+print("\n-- a hand-off names its recipient on the wire --")
+
+# The broker delivers a message to an agent when the agent's mxid is stamped on
+# it or written whole in the body, and in a shared room the other agent ignores
+# agent-authored messages it is not named in. So a message the Ladder posts
+# that names an agent is stamped for it — deliberately, with the `mentions` the
+# library already accepted and this side used to drop.
+PEER = "@sutando-b.agent:ag2.space"
+HANDOFF = f"{PEER} — the owner's question is about your repo; over to you."
+relay, ops = relay_ops()
+body = asyncio.run(TurnReporter(ops, LadderSettings(throttle=0.0), Clock()).run(
+    Scripted(Notice(text=HANDOFF), MessageChunk(text="passed it on"),
+             Done(reason=COMPLETED, text="passed it on")),
+    TurnContext(prompt="ask B", task_id="task-1", room="!room:ag2.space",
+                access_tier="owner", cwd="/repo",
+                room_members=("@ada:ag2.space", PEER), room_member_count=2)))
+messages = relay.ops_of("message")
+check(len(messages) == 2 and "mentions" not in messages[0],
+      "the placeholder is posted for nobody in particular — no mentions on it")
+check(messages[1]["body"] == HANDOFF and messages[1].get("mentions") == [PEER],
+      "the announcement that names an agent is stamped with exactly that mxid")
+check(all("mentions" not in o for o in relay.ops_of("edit")),
+      "edits carry none — the answer still travels as an edit, and whether the "
+      "broker routes an edit to an agent named in it is not assumed here")
+check(body.startswith(REPLIED), "and the reply is complete as before")
+relay.stop()
+
+# A name the roster does not know is not stamped: the broker would stamp nothing
+# for a non-member either, and a mention nobody receives is noise on the wire.
+relay, ops = relay_ops()
+asyncio.run(TurnReporter(ops, LadderSettings(), Clock()).run(
+    Scripted(Notice(text="@stranger:elsewhere.example have a look"),
+             MessageChunk(text="hi"), Done(reason=COMPLETED, text="hi")),
+    TurnContext(prompt="x", task_id="task-2", room="!room:ag2.space",
+                access_tier="owner", cwd="/repo",
+                room_members=("@ada:ag2.space",))))
+check("mentions" not in relay.ops_of("message")[1],
+      "a notice naming someone the roster does not know is posted, unstamped")
+relay.stop()
+
+# Without a roster the Worker cannot tell a member from a stranger, and does not
+# pretend to: whatever full mxid the body names is stamped, and the library and
+# the broker judge it from there.
+relay, ops = relay_ops()
+asyncio.run(TurnReporter(ops, LadderSettings(), Clock()).run(
+    Scripted(Notice(text=f"{PEER} have a look"), MessageChunk(text="hi"),
+             Done(reason=COMPLETED, text="hi")),
+    ctx_for()))
+check(relay.ops_of("message")[1].get("mentions") == [PEER],
+      "with no roster on the Task, a named mxid is stamped as named")
+relay.stop()
+
+# And the seam itself: the Ladder's Room Ops hand the mentions to the library,
+# which is where the shape and the broker's cap are judged.
+relay, ops = relay_ops()
+event = asyncio.run(ops.message("!room:ag2.space", f"{PEER} ping", [PEER, "not-an-mxid"]))
+check(event == "$ev1" and relay.ops[-1].get("mentions") == [PEER],
+      "RoomOps.message forwards `mentions`, and the library keeps the full mxids")
+event = asyncio.run(ops.message("!room:ag2.space", "plain"))
+check(event == "$ev2" and "mentions" not in relay.ops[-1],
+      "and a message with none to give sends the payload it always sent")
+relay.stop()
+
+
 print("\n-- through the Worker's seam, end to end --")
 
 relay, ops = relay_ops()
