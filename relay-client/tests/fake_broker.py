@@ -113,14 +113,23 @@ class _Handler(BaseHTTPRequestHandler):
         if answer.delay:
             if callable(answer.delay):
                 answer.delay()
-            else:
-                time.sleep(answer.delay)
-        self.send_response(answer.status)
-        for key, value in answer.headers.items():
-            self.send_header(key, value)
-        self.send_header("Content-Length", str(len(answer.body)))
-        self.end_headers()
-        self.wfile.write(answer.body)
+            elif broker.closing.wait(answer.delay):
+                # The test is over and nobody is waiting for this answer. A
+                # plain sleep here is what outlived the broker (see `_Server`).
+                self.close_connection = True
+                return
+        try:
+            self.send_response(answer.status)
+            for key, value in answer.headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(answer.body)))
+            self.end_headers()
+            self.wfile.write(answer.body)
+        except OSError:
+            # The client gave up before the answer, which is exactly what a
+            # timeout test does. Left to `handle_error`, this is a traceback on
+            # stderr, and on Windows the write does raise.
+            self.close_connection = True
 
     def _serve_stream(self, script, recorded):
         """A response with no end in sight — `text/event-stream`, chunked.
@@ -156,6 +165,37 @@ class _Handler(BaseHTTPRequestHandler):
     do_GET = do_POST = do_PUT = do_DELETE = _serve
 
 
+class _Server(ThreadingHTTPServer):
+    """A threading server that remembers its handler threads, so they can be joined.
+
+    `ThreadingHTTPServer` makes handlers daemon threads and then never waits for
+    them: `shutdown()` stops the accept loop, and `server_close()` joins only
+    non-daemon threads. A handler still asleep in a `delay` therefore outlived
+    its broker, woke into interpreter shutdown, wrote to a socket the client had
+    already dropped, and the traceback that write raised took the stderr lock
+    during finalisation. CPython answers that with a Fatal Python error and a
+    non-zero exit after the suite has printed PASS (test_transport, Windows
+    py3.9, PR #28).
+
+    The threads stay daemon, so a stuck one can never hold up interpreter exit.
+    They are recorded here, at creation, and not through the stdlib's private
+    `_threads`, which skips daemon threads.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.handlers: List[threading.Thread] = []
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        # Called only from the serve_forever thread, and `FakeBroker.__exit__`
+        # reads the list after `shutdown()` has stopped that thread.
+        thread = threading.Thread(target=self.process_request_thread,
+                                  args=(request, client_address), daemon=True)
+        self.handlers = [t for t in self.handlers if t.is_alive()]
+        self.handlers.append(thread)
+        thread.start()
+
+
 class FakeBroker:
     """A broker that answers on 127.0.0.1 and remembers what it was asked."""
 
@@ -166,10 +206,10 @@ class FakeBroker:
         self._served: Dict[tuple, int] = {}
         self._streams: Dict[tuple, Callable] = {}
         self._lock = threading.Lock()
-        #: Set on the way out, so a stream script parked in a wait can leave
-        #: rather than hold a handler thread past the end of the test.
+        #: Set on the way out, so a handler parked in a wait (a stream script or
+        #: a numeric `delay`) can leave rather than outlive the test.
         self.closing = threading.Event()
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._server = _Server(("127.0.0.1", 0), _Handler)
         self._server.broker = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -183,6 +223,16 @@ class FakeBroker:
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(5)
+        # One deadline for all of them. `closing` has already woken every
+        # handler that was parked in a delay or a stream script.
+        deadline = time.monotonic() + 5
+        for handler in self._server.handlers:
+            handler.join(max(0.0, deadline - time.monotonic()))
+
+    @property
+    def handlers(self) -> List[threading.Thread]:
+        """The handler threads this broker started. None is alive once it has exited."""
+        return list(self._server.handlers)
 
     @property
     def url(self) -> str:
@@ -200,7 +250,8 @@ class FakeBroker:
         programs a route it has already exercised, not "after the repeats".
 
         `delay` is seconds to sleep, or a callable the handler blocks on — pass
-        `event.wait` to hold an answer open until the test releases it.
+        `event.wait` to hold an answer open until the test releases it. A sleep
+        is cut short when the broker exits; a callable is not, so bound it.
         """
         if json is not None:
             body = jsonlib.dumps(json).encode()
