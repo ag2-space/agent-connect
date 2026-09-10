@@ -132,6 +132,7 @@ from ..acp.core import (
     Update,
 )
 from ..acp.policy import WorkingDirectoryPolicy
+from ..addressing import addressing_preamble
 from ..events import (
     CANCELLED,
     COMPLETED,
@@ -574,6 +575,10 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
     The outgoing rule is stated here too, in `agent_connect.outgoing`'s own
     words: an agent that is never told how to hand a file to the room pastes it
     into a code block instead, which is the thing this framing exists to avoid.
+    So is the addressing rule, in `agent_connect.addressing`'s: in a room shared
+    with another agent, who else is there and how a hand-off is delivered — the
+    shim says the same under its sandbox line, and neither inherits the other's
+    sentence about confinement.
     """
     who = ctx.sender_name or "the owner"
     where = f" in {ctx.room_name}" if ctx.room_name else ""
@@ -582,7 +587,9 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
         "Answer in chat: prose, no more than a few short paragraphs unless asked "
         "for more. You are working in the directory this session was opened in; "
         f"file operations outside it will be refused when you ask for them.\n"
-        f"{outgoing.INSTRUCTION}\n\n"
+        f"{outgoing.INSTRUCTION}\n"
+        f"{addressing_preamble(ctx.room_members, ctx.addressed_to, ctx.room_member_count)}"
+        "\n"
     )
     if attached:
         framing += ATTACHED.format(names=", ".join(attached))

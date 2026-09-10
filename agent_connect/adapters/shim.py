@@ -119,7 +119,11 @@ class ShimAdapter:
         # `ctx.prompt` is passed exactly as the person typed it. Nothing about
         # the attachments is folded into it — not a filename, and above all not
         # a path.
-        prompt = sandbox_preamble(ctx.sandbox, ctx.access_tier) + ctx.prompt
+        prompt = sandbox_preamble(
+            ctx.sandbox, ctx.access_tier,
+            room_members=ctx.room_members, addressed_to=ctx.addressed_to,
+            room_member_count=ctx.room_member_count,
+        ) + ctx.prompt
         text = await in_daemon_thread(self.impl.run, prompt, ctx.sandbox, ctx.cwd)
         text = text if isinstance(text, str) else str(text)
         if text:

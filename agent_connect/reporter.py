@@ -35,6 +35,16 @@ about the run and not part of the answer, so it is posted as **its own message**
 and the placeholder is left alone. Editing the placeholder into an announcement
 would replace the answer with a remark about it.
 
+**A message that names an agent is stamped for it.** In a room shared with
+another agent, the broker delivers a message to that agent only when its full
+mxid is on the message — stamped in `m.mentions`, or written whole in the body
+— and the other agent ignores agent-authored messages it is not named in. So
+every message this reporter posts as its own carries `mentions` for the room
+members whose mxids it names (`mentioned_mxids`), and the placeholder carries
+none: it is for nobody in particular. The answer itself still travels as an
+edit of the placeholder, and whether the broker routes an edit to an agent
+named in it is the broker's to say, not assumed here.
+
 **Endings tell the truth, and there are two kinds of them.** A Turn that
 produced *something* and stopped short — a timeout that nearly finished, a token
 limit — keeps what it produced and carries an explicit line saying it was
@@ -55,7 +65,9 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Mapping, Optional
+from typing import List, Mapping, Optional, Sequence, Tuple
+
+from ag2_relay_client.markers import mxids_in
 
 from .events import (
     CANCELLED,
@@ -173,6 +185,29 @@ def _number(raw, fallback, cast):
     return value if value >= 0 else fallback
 
 
+def mentioned_mxids(body: str, room_members: Sequence[str] = ()) -> List[str]:
+    """The full mxids a body names — who a message about it is for.
+
+    Full mxids only, because that is the routing token: the broker delivers a
+    message to an agent when the agent's mxid is stamped on it or written whole
+    in the body, and a bare localpart or a display name is an address for a
+    person, not for the deliverer. The grammar is the library's
+    (`ag2_relay_client.markers.mxids_in`), not a second copy of it.
+
+    `room_members` is the roster the Task arrived with, when it arrived with
+    one; then only members are kept, because stamping a stranger is a mention
+    nobody receives. The roster the broker sends is capped, so a member past
+    the cap loses the stamp and not the message: the mxid is still in the body,
+    where the broker's own scan finds it. With no roster nothing is filtered —
+    the Worker does not know who is *not* there, and does not guess.
+    """
+    found = mxids_in(body)
+    if room_members:
+        roster = set(room_members)
+        found = [mxid for mxid in found if mxid in roster]
+    return found
+
+
 class TurnReporter:
     """Drives one Turn up the Ladder and returns the Task's result body.
 
@@ -195,6 +230,9 @@ class TurnReporter:
         #: The placeholder's event identifier; falsy means nothing was posted.
         self.event_id = ""
         self._room = ""
+        #: Who the Task said is in the room; what a posted message's mentions
+        #: are filtered to. Empty means unknown, and unknown filters nothing.
+        self._members: Tuple[str, ...] = ()
         self._last_edit = 0.0
         self._steps: List[str] = []      # tool titles, in the order they started
         self._failed: set = set()        # titles of tool calls that failed
@@ -218,9 +256,12 @@ class TurnReporter:
     async def start(self, ctx: TurnContext) -> None:
         """Post the placeholder. Silence is what this is here to end."""
         self._room = ctx.room
+        self._members = tuple(ctx.room_members)
         if self.ops is None or not self._room or not getattr(self.ops, "available", True):
             return
         try:
+            # For nobody in particular: the placeholder names no one, and a
+            # mention on it would page an agent about a message not yet written.
             self.event_id = await self.ops.message(self._room, PLACEHOLDER)
         except RoomOpError:
             self.event_id = ""
@@ -242,6 +283,7 @@ class TurnReporter:
         Turn is waiting must not resurface stapled to the answer.
         """
         self._room = ctx.room
+        self._members = tuple(ctx.room_members)
         others = "" if ahead <= 1 else f" ({ahead} messages are ahead of it)"
         return await self.notice(QUEUED.format(others=others), keep=False)
 
@@ -392,7 +434,11 @@ class TurnReporter:
             return False
         if self.ops is not None and self._room and getattr(self.ops, "available", True):
             try:
-                await self.ops.message(self._room, text)
+                # Stamped for whoever it names: an announcement that hands a
+                # question to another agent has to reach that agent, and in a
+                # shared room the mention is what makes it.
+                await self.ops.message(self._room, text,
+                                       mentioned_mxids(text, self._members))
                 self.notices_posted += 1
                 return True
             except RoomOpError:

@@ -25,6 +25,7 @@ from pathlib import Path
 from fake_broker import FakeBroker
 
 from ag2_relay_client import egress as egress_module
+from ag2_relay_client import markers
 from ag2_relay_client import roomops as roomops_module
 from ag2_relay_client.credentials import TokenSource
 from ag2_relay_client.egress import EgressAllowlist
@@ -134,6 +135,9 @@ with FakeBroker() as broker:
     check(len(sent.get("mentions", [])) == 10,
           "over the broker's cap of 10 the extras are dropped — a message that "
           "lands and notifies nine beats one that does not land")
+    check(roomops_module.MXID_RE is markers.MXID_RE,
+          "and a mention is judged by the library's one mxid grammar, not a "
+          "copy of it beside the room-id grammar it already shares")
 
     # --- a bad room id never becomes a request
     before = len(broker.requests)

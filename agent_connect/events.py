@@ -104,6 +104,15 @@ class TurnContext:
     *beside* `prompt` and never folded into it: an attachment becomes content of
     the prompt or it is reported as unreachable, and neither is allowed to
     rewrite a word of what the person typed.
+
+    The addressing fields are the broker's routing facts about a shared room,
+    carried verbatim: whom the message named (`addressed_to`), whether it was a
+    reply to this agent and to whose message (`reply_to_me`,
+    `reply_to_sender`), and who is in the room (`room_members`, full mxids
+    capped by the broker, with `room_member_count` as the honest size). The
+    Worker judges none of them — it never learns its own mxid, so it cannot —
+    and an Adapter puts them in front of the Local Agent
+    (`agent_connect.addressing`), which is the only party that can act on them.
     """
 
     prompt: str
@@ -114,6 +123,11 @@ class TurnContext:
     sender_name: str = ""
     user_id: str = ""
     source_message_id: str = ""
+    addressed_to: str = ""
+    reply_to_me: bool = False
+    reply_to_sender: str = ""
+    room_members: Tuple[str, ...] = ()
+    room_member_count: int = 0
     sandbox: str = "read-only"
     cwd: str = ""
     attachments: Tuple[Attachment, ...] = ()
