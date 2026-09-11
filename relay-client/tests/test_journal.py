@@ -393,7 +393,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check(counts_match,
           "twenty writes made while another process holds the lock leak no "
           "descriptors — the give-up path closes the file it opened")
-    check(elapsed < 1.0,
+    # What this bounds is the wait, not the disk. With `LOCK_WAIT_S` at 10 ms,
+    # twenty contended writes spend 0.2 s waiting; had the override been
+    # ignored they would spend 20 s. Each give-up is followed by the fallback
+    # write, an fsync each, and on a CI disk that made a 1.0 s bound measure
+    # the runner instead (1.095 s on ubuntu, py3.10). Half the ignored case
+    # is wide enough to be a fact about the wait and narrow enough to fail it.
+    check(elapsed < 20 * was / 2,
           f"journal contention stays bounded ({elapsed:.3f}s for twenty writes)")
     check(listener.warned("stayed held"),
           "a journal lock timeout makes the write-without-merge fallback visible")
