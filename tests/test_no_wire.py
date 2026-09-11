@@ -59,10 +59,20 @@ PACKAGE = _bootstrap.ROOT / "agent_connect"
 #: Modules that are, or open, a socket. `email`/`json`/`base64` are not here:
 #: parsing is not speaking.
 WIRE_MODULES = {
-    "urllib", "urllib.request", "urllib.error", "urllib.parse",
+    "urllib", "urllib.request", "urllib.error",
     "http", "http.client", "http.server", "socket", "ssl", "requests",
     "httpx", "aiohttp",
 }
+
+#: Named back out of the set above, on the set's own rule: parsing is not
+#: speaking. `urllib.parse` opens nothing — it is `json` with a different
+#: grammar — and the ACP Adapter needs it for one job that a hand-rolled split
+#: got wrong: deciding which host a `ws://` URL will actually be dialled at.
+#: That decision is what the loopback rule rests on, and `ws://x?@127.0.0.1`
+#: reads as loopback to a private parser while the WebSocket library dials `x`.
+#: The rest of `urllib` — `request`, `error`, and the bare package that reaches
+#: them — stays refused everywhere, this file included.
+PARSE_ONLY = {"urllib.parse"}
 
 #: The library's own raw-request surface — refused everywhere, Adapters
 #: included. It is not a socket module, and it is the same thing by a shorter
@@ -79,6 +89,20 @@ RELAY_INTERNALS = ("ag2_relay_client.transport",)
 #: The Adapters that may open a socket, and what for. A local model server is
 #: not the relay; a new name here is a decision somebody made on purpose.
 LOCAL_AGENT_SOCKETS = {"ollama.py": "the Ollama server on this machine"}
+
+#: The credential words above belong to the relay and to nothing else — except
+#: where a *Local Agent's own* door asks for one. Same shape as the socket
+#: allowance: by file, with a reason, so the next one is a decision somebody
+#: made rather than a directory-wide excuse. The ACP core dials a listener that
+#: authenticates its WebSocket upgrade; that bearer is the Agent's, is read from
+#: its own setting, and never touches the relay credential.
+LOCAL_AGENT_AUTH = {
+    "core.py": "the ACP Agent's own listener token, on its own handshake",
+}
+
+#: The two needles `LOCAL_AGENT_AUTH` excuses. The rest of `FORBIDDEN_TEXT` —
+#: the relay's host, its endpoint paths, the token grammar — is excused nowhere.
+AUTH_NEEDLES = ("Bearer ", "Authorization")
 
 #: Substrings that have no business in a string this package evaluates —
 #: anywhere, Adapters included.
@@ -173,6 +197,10 @@ for path, tree in sources():
         head = name.split(".")[0]
         internal = any(name == refused or name.startswith(refused + ".")
                        for refused in RELAY_INTERNALS)
+        # Matched as a prefix: `from urllib.parse import urlsplit` arrives here
+        # as `urllib.parse.urlsplit`.
+        if any(name == ok or name.startswith(ok + ".") for ok in PARSE_ONLY):
+            continue
         if not (internal or name in WIRE_MODULES or head in WIRE_MODULES):
             continue
         if (not internal and path.parent.name == "adapters"
@@ -193,13 +221,24 @@ check(excused == set(LOCAL_AGENT_SOCKETS),
 # --- no credential handling, and no gateway --------------------------------
 
 offenders = []
+auth_excused = set()
 for path, tree in sources():
     for node, text in code_strings(tree):
         for needle, why in FORBIDDEN_TEXT.items():
-            if needle in text:
-                offenders.append(f"{path.name}:{node.lineno} {why}")
+            if needle not in text:
+                continue
+            if (needle in AUTH_NEEDLES
+                    and path.parent.name == "acp"
+                    and path.name in LOCAL_AGENT_AUTH):
+                auth_excused.add(path.name)
+                continue
+            offenders.append(f"{path.name}:{node.lineno} {why}")
 check(not offenders, f"no bearer, no relay host, no relay path, no token "
                      f"grammar in code ({offenders or 'none'})")
+check(auth_excused == set(LOCAL_AGENT_AUTH),
+      "and the one file allowed a credential of its own is still the ACP core, "
+      "still using it: an entry that stopped being needed is an entry that goes "
+      f"(excused: {sorted(auth_excused)}, listed: {sorted(LOCAL_AGENT_AUTH)})")
 
 offenders = []
 url_excused = set()
