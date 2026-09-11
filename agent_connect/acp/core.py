@@ -324,7 +324,14 @@ class _SocketLink:
 
     @property
     def alive(self) -> bool:
-        return not self._closed
+        # Two ways for this link to be dead, and only one of them is ours.
+        # `_closed` is our own `aclose()`; the peer's close lands on the
+        # connection object as a close code, in the same place `detail()`
+        # reads it from — so a link that can already *say* "close 1006" must
+        # not also say it is alive. Read the same defensive way: a renamed
+        # attribute costs "alive", never a raise.
+        ws = getattr(self._transport, "_ws", None)
+        return not self._closed and getattr(ws, "close_code", None) is None
 
     def death(self) -> Optional[Awaitable]:
         return None

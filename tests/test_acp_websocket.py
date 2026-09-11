@@ -171,6 +171,7 @@ class Door:
         self.token = token
         self.dials = 0
         self.rejected = 0
+        self.connections = []   # the server side of every dial, for a hang-up
         self._server = None
         self.port = 0
 
@@ -199,6 +200,7 @@ class Door:
 
     async def _session(self, ws):
         self.dials += 1
+        self.connections.append(ws)
         agent = FakeAcpAgent(dict(self.script), None)
 
         async def send(message):
@@ -286,7 +288,7 @@ check(door.dials == 2, "two Turns, two dials — the shape the Adapter uses")
 check(turn.text == "PONG", "and the second dial runs its Turn on the first's Session id")
 
 
-async def _door_vanishes():
+async def _we_hang_up():
     async with Door(SCRIPT) as door:
         client_box = {}
         async with AcpClient.dial(door.url, token=door.token) as client:
@@ -296,8 +298,37 @@ async def _door_vanishes():
             return client_box["c"].alive
 
 
-check(run(_door_vanishes()) is False,
-      "a closed link reports itself dead without a process to look at")
+check(run(_we_hang_up()) is False,
+      "a link we closed reports itself dead without a process to look at")
+
+
+async def _door_hangs_up():
+    """The remote closes under us — the case a socket cannot race a death for.
+
+    `_ProcessLink.alive` turns False when the process dies, with no local call
+    needed; a socket has to say the same when the *peer* closes, or `alive`
+    means two different things depending on the link (review of #25).
+    """
+    async with Door(SCRIPT) as door:
+        async with AcpClient.dial(door.url, token=door.token) as client:
+            await client.initialize()
+            before = client.alive
+            for ws in door.connections:
+                await ws.close(code=1012, reason="restarting")
+            # The close frame has to travel and the SDK's receive loop has to
+            # see it; bounded, not raced against the clock.
+            for _ in range(500):
+                if not client.alive:
+                    break
+                await asyncio.sleep(0.01)
+            return before, client.alive, client.stderr_tail()
+
+
+before, after, detail = run(_door_hangs_up())
+check(before is True and after is False,
+      "and a link the door closed reports itself dead too — no local call needed")
+check("1012" in detail,
+      "with the close code where the stderr tail would have been")
 
 # --- the Adapter over a dialled door ----------------------------------------
 
