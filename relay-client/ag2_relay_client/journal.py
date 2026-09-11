@@ -55,14 +55,15 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from .locking import (
+    LockBackendError,
+    LockTimeout,
+    acquire_exclusive,
+    release_exclusive,
+)
 from .state import valid_wire_id, write_private_atomic
 
 log = logging.getLogger(__name__)
-
-try:  # POSIX advisory locking; see `_across_processes`.
-    import fcntl
-except ImportError:  # pragma: no cover — non-POSIX
-    fcntl = None  # type: ignore[assignment]
 
 #: How long to wait for the journal's cross-process lock before writing without
 #: it. Bounded because this runs inside the poll iteration and nothing in there
@@ -411,11 +412,11 @@ def _across_processes(path: Path) -> Iterator[bool]:
 
     Whether, and not an exception, because the merge is a correctness
     improvement and not a precondition: a state dir on a filesystem with no
-    locking, or a platform with no `fcntl`, must still be able to write its
-    journal. Failing the write there would trade a rare cross-process clobber
-    for a guaranteed local one (D4).
+    locking, or a platform with no usable lock backend, must still be able to
+    write its journal. Failing the write there would trade a rare cross-process
+    clobber for a guaranteed local one (D4).
 
-    `LOCK_NB` and a short spin rather than a blocking `flock`, for the reason
+    Each backend makes non-blocking attempts with a short spin, for the reason
     every wait in this library is bounded: the poll loop is what keeps leases
     alive, and a call in it that can wait forever is how a client stops
     delivering without ever looking broken (F1).
@@ -430,54 +431,44 @@ def _across_processes(path: Path) -> Iterator[bool]:
     client that can no longer open a socket. `singleton.py`'s `_locked` had it
     right — its `os.close` is in a `finally` — and this is the same shape.
     """
-    if fcntl is None:  # pragma: no cover — non-POSIX
-        yield False
-        return
     handle = None
     locked = False
     try:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             handle = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
-            locked = _flock_within(handle, path)
+            locked = _lock_within(handle, path)
         except OSError as exc:
-            log.debug("no cross-process journal lock at %s (%s)", path, exc)
+            log.warning("no cross-process journal lock at %s (%s) — writing "
+                        "without it; a concurrent writer's change to another "
+                        "Task id may be lost", path, exc)
             locked = False
         yield locked
     finally:
         if handle is not None:
             if locked:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_UN)
-                except OSError:  # pragma: no cover — closing releases it anyway
-                    pass
+                release_exclusive(handle)
             os.close(handle)
 
 
-def _flock_within(handle: int, path: Path) -> bool:
+def _lock_within(handle: int, path: Path) -> bool:
     """Take the exclusive lock inside `LOCK_WAIT_S`, or say it could not be.
 
-    `lock` is bound locally so the platform check reads as one to a type
-    checker as well as to a human: `fcntl` is `None` on a platform that has no
-    such module, and a caller's guard three frames up is not something a reader
-    of this function can see.
+    Contention and backend failure are distinct in the shared primitive, but
+    both retain this caller's established write-without-merge fallback.
     """
-    lock = fcntl
-    if lock is None:  # pragma: no cover — non-POSIX; the caller guards too
-        return False
-    deadline = time.monotonic() + LOCK_WAIT_S
-    while True:
-        try:
-            lock.flock(handle, lock.LOCK_EX | lock.LOCK_NB)
-            return True
-        except OSError:
-            if time.monotonic() >= deadline:
-                log.warning("the journal lock at %s stayed held for %ss — "
-                            "writing without it; a concurrent writer's "
-                            "change to another id may be lost", path,
-                            LOCK_WAIT_S)
-                return False
-            time.sleep(0.005)
+    try:
+        acquire_exclusive(handle, time.monotonic() + max(0.0, LOCK_WAIT_S))
+        return True
+    except LockTimeout:
+        log.warning("the journal lock at %s stayed held for %ss — writing "
+                    "without it; a concurrent writer's change to another Task "
+                    "id may be lost", path, LOCK_WAIT_S)
+    except LockBackendError as exc:
+        log.warning("the journal lock backend failed at %s (%s) — writing "
+                    "without it; a concurrent writer's change to another Task "
+                    "id may be lost", path, exc)
+    return False
 
 
 class Reconciler:

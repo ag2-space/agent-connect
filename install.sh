@@ -18,8 +18,9 @@
 #   --token   AGENT_CONNECT_TOKEN    your agent's relay token from the Agent Portal [required]
 #   --adapter AGENT_CONNECT_ADAPTER  codex | omnigent | ollama | cline | acp  [default: codex]
 #   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini
-#             [default: claude]  Any other ACP agent: set AGENT_CONNECT_ACP_COMMAND
-#             yourself — it overrides the preset.
+#             [default: claude, or `custom` when --acp-command is given]
+#   --acp-command AGENT_CONNECT_ACP_COMMAND  the ACP agent's command line, run as
+#             typed. Overrides any preset. Omitted on a re-run, the stored one is kept.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
 #   --no-start                       install only; print the run command, don't launch
 #
@@ -59,7 +60,10 @@ START=1
 # resolves: without it an installer run can settle on a pre-transport worker
 # that still expects task files.
 AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.2.0}"
-ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-claude}"
+ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-}"
+# Empty means "not asked for". The default is settled after arg parsing,
+# because it depends on whether a command was supplied.
+ACP_COMMAND="${AGENT_CONNECT_ACP_COMMAND:-}"
 # The ACP bridge that makes Claude Code an ACP Agent, PINNED to an exact
 # version. It renamed itself once already (the older name is dead — do not
 # reintroduce it) and moved through many major versions inside six months; an
@@ -101,12 +105,14 @@ while [ $# -gt 0 ]; do
     --token)   TOKEN="$2"; shift 2 ;;
     --adapter) ADAPTER="$2"; shift 2 ;;
     --acp-agent) ACP_AGENT="$2"; shift 2 ;;
+    --acp-command) ACP_COMMAND="$2"; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --sutando-workspace|--sutando-workspace=*) sutando_gone ;;
     --no-start) START=0; shift ;;
     --token=*)   TOKEN="${1#*=}"; shift ;;
     --adapter=*) ADAPTER="${1#*=}"; shift ;;
     --acp-agent=*) ACP_AGENT="${1#*=}"; shift ;;
+    --acp-command=*) ACP_COMMAND="${1#*=}"; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
     *) echo "install.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -117,7 +123,38 @@ if [ -z "$TOKEN" ]; then
   exit 2
 fi
 
+# Captured before any default fills the variable in; the defaults are settled
+# later, once the existing config has been read.
+ACP_AGENT_GIVEN=0
+[ -z "$ACP_AGENT" ] || ACP_AGENT_GIVEN=1
+
+# A flag that silently does nothing is the bug class this file keeps fixing.
+if [ -n "$ACP_COMMAND" ] && [ "$ADAPTER" != "acp" ]; then
+  echo "install.sh: WARNING — --acp-command applies only to --adapter acp; ignoring it for adapter '$ADAPTER'." >&2
+  ACP_COMMAND=""
+fi
+
 say() { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
+
+# One setting per line is the file's whole grammar: no quoting saves a value
+# with a newline in it, so refuse it up front.
+# `$(printf '\n')` is the wrong spelling: command substitution strips trailing
+# newlines, so the pattern would match every value.
+NL='
+'
+CR="$(printf '\r')"
+reject_multiline() {  # <flag> <value>
+  case "$2" in
+    *"$NL"*|*"$CR"*)
+      echo "install.sh: $1 contains a newline, which a config file of KEY=value lines cannot carry. Remove it." >&2
+      exit 2 ;;
+  esac
+}
+reject_multiline --token "$TOKEN"
+reject_multiline --repo "$REPO"
+reject_multiline --adapter "$ADAPTER"
+[ -z "$ACP_COMMAND" ] || reject_multiline --acp-command "$ACP_COMMAND"
+[ -z "$ACP_AGENT" ] || reject_multiline --acp-agent "$ACP_AGENT"
 
 # Working directory: state it loudly (invisible defaults are how agents end up
 # in the wrong folder), create it if it's the default, and warn on macOS
@@ -138,6 +175,40 @@ $PIP --version >/dev/null 2>&1 || {
 
 APP_DIR="$HOME/.agent-connect"
 mkdir -p "$APP_DIR"
+# Named here rather than at 1c: the ACP decisions below need to read it.
+CONFIG="$APP_DIR/config.env"
+
+# Read, never executed. Last occurrence wins, as the worker's own parser does.
+stored() {  # <KEY>
+  [ -f "$CONFIG" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -n 1 \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+ACP_COMMAND_STORED="$(stored AGENT_CONNECT_ACP_COMMAND)"
+ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
+
+# A stored command outranks any preset at runtime, so each way of arriving has
+# to say what happens to one that is already there:
+#   named an agent, no command  → preset decides, so the command is CLEARED
+#   gave a command              → it runs; the name is bookkeeping
+#   neither                     → change nothing, name included
+# Scoped to --adapter acp: otherwise `--adapter codex --acp-agent claude` hits
+# the first case and deletes a working command on its way past.
+ACP_CMD_CLEAR=0
+if [ "$ADAPTER" != "acp" ]; then
+  if [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
+    echo "install.sh: WARNING — --acp-agent applies only to --adapter acp; ignoring it for adapter '$ADAPTER'. Your stored ACP settings are left alone." >&2
+  fi
+  ACP_AGENT=""
+elif [ "$ACP_AGENT_GIVEN" -eq 1 ]; then
+  [ -n "$ACP_COMMAND" ] || ACP_CMD_CLEAR=1
+elif [ -n "$ACP_COMMAND" ]; then
+  ACP_AGENT="custom"
+elif [ -n "$ACP_COMMAND_STORED" ]; then
+  ACP_AGENT="${ACP_AGENT_STORED:-custom}"
+else
+  ACP_AGENT="${ACP_AGENT_STORED:-claude}"
+fi
 
 # ── 1) install the worker ───────────────────────────────────────────────────
 # One package: the wire is a library inside it, not a second console script to
@@ -168,8 +239,15 @@ export PATH
 # ── 1b) the ACP bridge, pinned ──────────────────────────────────────────────
 # Only for --adapter acp. The pin is the point: see ACP_BRIDGE_SPEC above.
 ACP_KV=""
+ACP_CMD_KV=""
 if [ "$ADAPTER" = "acp" ]; then
   ACP_KV="AGENT_CONNECT_ACP_AGENT=$ACP_AGENT"
+  [ -z "$ACP_COMMAND" ] || ACP_CMD_KV="AGENT_CONNECT_ACP_COMMAND=$ACP_COMMAND"
+  if [ "$ACP_CMD_CLEAR" -eq 1 ] && [ -n "$ACP_COMMAND_STORED" ]; then
+    say "--acp-agent '$ACP_AGENT' replaces the AGENT_CONNECT_ACP_COMMAND already in your config"
+    say "  (was: $ACP_COMMAND_STORED) — a command overrides every preset, so keeping it would have"
+    say "  gone on running that agent while this install reported '$ACP_AGENT'. Previous file: $CONFIG.bak"
+  fi
   case "$ACP_AGENT" in
     claude)
       if command -v npm >/dev/null 2>&1; then
@@ -193,7 +271,6 @@ fi
 # this file, so the bearer token stops living in plaintext in a launchd plist
 # (world-readable by default) or a systemd unit. Same keys as README's Settings
 # table; environment variables still win over the file.
-CONFIG="$APP_DIR/config.env"
 # This installer is the documented `curl … | sh` path and people re-run it.
 # A re-run must not silently eat a setting somebody added by hand, so the old
 # file is kept beside the new one and every key this script does not manage is
@@ -203,7 +280,14 @@ if [ -f "$CONFIG" ]; then
   BACKUP="$CONFIG.bak"
   cp "$CONFIG" "$BACKUP" && chmod 600 "$BACKUP"
   say "existing config kept as $BACKUP"
-  KEPT="$(grep -v -E '^[[:space:]]*(AGENT_CONNECT_TOKEN|AGENT_CONNECT_ADAPTER|AGENT_CONNECT_REPO|AGENT_CONNECT_ACP_AGENT)[[:space:]]*=' "$CONFIG" \
+  # Managed keys are rewritten; everything else carried across verbatim.
+  # ACP_COMMAND joins the set only when this run set or cleared one — otherwise
+  # a re-run would wipe it and the adapter would fall back to the claude preset.
+  MANAGED='AGENT_CONNECT_TOKEN|AGENT_CONNECT_ADAPTER|AGENT_CONNECT_REPO|AGENT_CONNECT_ACP_AGENT'
+  if [ -n "$ACP_CMD_KV" ] || [ "$ACP_CMD_CLEAR" -eq 1 ]; then
+    MANAGED="$MANAGED|AGENT_CONNECT_ACP_COMMAND"
+  fi
+  KEPT="$(grep -v -E "^[[:space:]]*($MANAGED)[[:space:]]*=" "$CONFIG" \
           | grep -v -E '^[[:space:]]*(#|$)' || true)"
 fi
 say "writing config $CONFIG (mode 0600 — it holds your token)"
@@ -216,13 +300,18 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     # Values are quoted on the way out so that a token with edge whitespace
     # or quotes of its own survives the round trip: the reader strips one
     # matching pair and nothing else.
-    echo "AGENT_CONNECT_TOKEN=\"$TOKEN\""
-    echo "AGENT_CONNECT_ADAPTER=\"$ADAPTER\""
-    echo "AGENT_CONNECT_REPO=\"$REPO\""
-    [ -z "$ACP_KV" ] || echo "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
+    #
+    # printf, never echo: echo's backslash handling is implementation-defined,
+    # and under dash a \t or \n in any value is rewritten (a newline splits one
+    # setting into two lines).
+    printf '%s\n' "AGENT_CONNECT_TOKEN=\"$TOKEN\""
+    printf '%s\n' "AGENT_CONNECT_ADAPTER=\"$ADAPTER\""
+    printf '%s\n' "AGENT_CONNECT_REPO=\"$REPO\""
+    [ -z "$ACP_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
+    [ -z "$ACP_CMD_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_COMMAND=\"$ACP_COMMAND\""
     if [ -n "$KEPT" ]; then
-      echo ""
-      echo "# kept from your previous config.env:"
+      printf '\n'
+      printf '%s\n' "# kept from your previous config.env:"
       printf '%s\n' "$KEPT"
     fi
   } > "$CONFIG"

@@ -40,7 +40,7 @@ already on its way through `complete` regardless.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 from .offthread import in_daemon_thread
 
@@ -71,13 +71,20 @@ class RoomOps:
         """False while the cooldown from the last failure is still running."""
         return bool(getattr(self.ops, "available", True))
 
-    async def message(self, room: str, body: str) -> str:
+    async def message(
+        self, room: str, body: str, mentions: Optional[Sequence[str]] = None,
+    ) -> str:
         """Post a message as the Agent Identity; return its event identifier.
 
         The identifier is the whole point: without it there is nothing to edit,
         and the Ladder collapses into a stream of separate messages.
+
+        `mentions` are the full mxids the message is for, handed to the library
+        as they are — it judges the shape and applies the broker's cap. This
+        side used to drop the parameter on the floor, so the one caller that
+        could name a recipient had no way to say so on the wire.
         """
-        event_id = await in_daemon_thread(self.ops.message, room, body)
+        event_id = await in_daemon_thread(self.ops.message, room, body, mentions)
         if not event_id:
             raise RoomOpError("the relay did not post the message, or named no "
                               "event id for it")

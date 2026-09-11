@@ -176,6 +176,12 @@ with FakeBroker() as broker:
     check(timed_out is not None, "a slow answer raises rather than hanging")
     check(time.monotonic() - started < 1.0, "and raises on the timeout, not on the answer")
 
+# The broker's handler was still asleep in that delay when the client gave up.
+# Before this was checked, it woke into interpreter shutdown, and on Windows
+# py3.9 that turned a green suite into a Fatal Python error (PR #28).
+check(not [t for t in broker.handlers if t.is_alive()],
+      "no handler outlives its broker: an abandoned delay does not wake into shutdown")
+
 with FakeBroker() as broker, FakeBroker() as elsewhere:
     # --- a credentialed request never follows a redirect: urllib re-sends the
     # Authorization header on the hop, which would hand this bearer to whatever

@@ -23,7 +23,9 @@ Run: python3 tests/test_media.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
 import os
+import stat
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -189,8 +191,17 @@ with tempfile.TemporaryDirectory() as tmp:
     check(Path(first).name.endswith(".png"),
           "the extension survives: the outbound media route guesses the mime "
           "from the filename, so it decides how a re-upload renders")
-    check(oct(Path(tmp).joinpath("media").stat().st_mode & 0o777) == oct(0o700),
-          "the media directory is private — attachments are one bearer's mail")
+    if os.name == "nt":
+        # Windows privacy is an ACL property, not a POSIX mode-bit property,
+        # and this library makes no ACL claim (test_journal.py's precedent).
+        # The 0700 assertion is a POSIX fact; the applicable Windows fact is
+        # that the directory came up usable for the bearer's mail to land in.
+        check(bool(Path(tmp).joinpath("media").stat().st_mode & stat.S_IWRITE),
+              "the Windows media directory is usable — the POSIX 0700 privacy "
+              "claim is not made here (privacy is ACL-based)")
+    else:
+        check(oct(Path(tmp).joinpath("media").stat().st_mode & 0o777) == oct(0o700),
+              "the media directory is private — attachments are one bearer's mail")
 
     # The name is a hint from a room message, and it is never the filename: a
     # traversal in it has nowhere to go, because the store names its own files.
@@ -415,8 +426,13 @@ with FakeBroker() as broker, FakeBroker(base_path="") as elsewhere, \
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     client = client_for(broker, tmp)
     broker.on("POST", "/v1/results", json={"ok": True})
+    # Gated, not timed: the fetch is held open until this test releases it, so
+    # "the poll did not wait for the download" is a fact rather than a race
+    # against a 0.6s sleep on a loaded runner.
+    holding = threading.Event()
     broker.on("GET", "/v1/media/slow", body=PNG,
-              headers={"Content-Type": "image/png"}, delay=0.6)
+              headers={"Content-Type": "image/png"},
+              delay=lambda: holding.wait(30))
     broker.on("GET", "/v1/tasks", json={"tasks": [
         wire_task("task-media", body=marker(f"{broker.url}/v1/media/slow",
                                             name="cat.png", kind="m.image")),
@@ -426,7 +442,10 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     started = time.monotonic()
     client.poll_once()
     polled_in = time.monotonic() - started
-    check(polled_in < 0.3,
+    # The fetch cannot finish before `holding` is set, so a poll that returns
+    # at all did not wait for it. The bound is only to catch the broken case,
+    # where the poll blocks on the gate for its full 30s.
+    check(polled_in < 5,
           "the poll returns without waiting for the download (F1: cadence is "
           "correctness — a stalled loop is duplicate delivery)")
 
@@ -441,6 +460,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(len(broker.took("GET", "/v1/tasks")) == polls + 1,
           "and the next poll happens while the download is still in flight")
 
+    holding.set()
     second = client.next_task(timeout=5)
     check(second is not None and second.id == "task-media",
           "the media task is delivered when its bytes are")

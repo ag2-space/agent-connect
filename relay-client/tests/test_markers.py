@@ -256,5 +256,36 @@ check(markers.parse(fenced).body == fenced,
 r = markers.parse("[file: /tmp/only")
 check(r.body == "", "a body that is only an unterminated marker degrades to empty")
 
+# --- the user-id grammar: one definition, checked whole or found in prose
+# `roomops` stamps a mention only if it is a full mxid and `envelope` keeps a
+# roster entry only if it is one; both ask this pattern, so the two cannot
+# disagree about what an address is. The prose form is what a consumer stamps
+# out of an answer and what the broker's capped roster string actually names.
+for good in ("@alice:ag2.space", "@bassil-s-sutando.agent:ag2.space",
+             "@a=b/c+d:example.org", "@x:localhost"):
+    check(markers.MXID_RE.match(good) is not None, f"{good} is a full mxid")
+for bad in ("@alice", "alice:ag2.space", "@alice:ag2.space/extra", "@:x", "@x:",
+            "@alice: ag2.space", "@al ice:ag2.space", "@alice:ag2:space", ""):
+    check(markers.MXID_RE.match(bad) is None, f"{bad!r} is not")
+
+check(markers.mxids_in("ask @bob:ag2.space, then @ann:ag2.space.")
+      == ["@bob:ag2.space", "@ann:ag2.space"],
+      "mxids are found in prose, in order, without the punctuation around them")
+check(markers.mxids_in("(@bob:ag2.space) and <@ann:ag2.space> and `@cat:ag2.space`")
+      == ["@bob:ag2.space", "@ann:ag2.space", "@cat:ag2.space"],
+      "brackets and code ticks around an mxid are prose too")
+check(markers.mxids_in("@bob:ag2.space's turn; @bob:ag2.space... go")
+      == ["@bob:ag2.space"],
+      "a possessive or an ellipsis after the server name is not part of it, and "
+      "each mxid is named once however often it is written")
+check(markers.mxids_in("mail bob@example.com:8080 or ping @bob and @bob:") == [],
+      "an email address is not a mention, and a bare localpart is not an address")
+check(markers.mxids_in("@a:x, @b:x (+3 more)") == ["@a:x", "@b:x"],
+      "the broker's capped roster string names two, and '+3 more' is prose")
+check(markers.mxids_in("line one @a:x\nline two @b:x") == ["@a:x", "@b:x"],
+      "across lines, in document order")
+check(markers.mxids_in("") == [] and markers.mxids_in(None) == [],
+      "nothing in nothing")
+
 print("\n" + ("PASS — markers green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

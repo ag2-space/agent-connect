@@ -31,15 +31,33 @@ ADR 0003; sutando's shim honors it too but caps it against the host owner's
 per-sender map, which can re-tier a sender downward and never upward). A library
 that mapped the tier itself would have to pick one of them and break the other,
 and the same reasoning applies to every enrichment field `Task` carries: they
-cross this seam as data. The
-value's *shape* is bounded — a str, control characters removed, length-capped —
-which changes no legitimate value and keeps an attacker-shaped one small.
+cross this seam as data. The value's *shape* is bounded — a str, control
+characters removed, length-capped — which changes no legitimate value and keeps
+an attacker-shaped one small.
+
+**So are the addressing facts a shared room adds.** `addressed_to`,
+`reply_to_sender`, `room_members` and `room_member_count` are the broker's
+routing facts — whom the message named, whose message it replied to, who is in
+the room — and they cross the same way the tier does: bounded in shape, judged
+by nobody here. Which of them means "stand down" is the consumer's reading. The
+roster arrives in either of the two shapes the broker has been seen to send it
+in, a list of mxids or the capped `"@a:x, @b:x (+3 more)"` string, and is
+delivered as the mxids it names in both.
+
+**And so is the rest of what the broker enriches a task with.** `session_scope`,
+`source`, `interaction_type`, `platform_card`, `thread_root` and
+`source_room_id` are fields a consumer (sutando's task files) has serialized
+since before this package existed; a library that dropped them would make
+migrating onto it a quiet loss of context that no test on either side would
+catch. Carried, never interpreted: no vocabulary is enforced, no default is
+substituted, nothing is gated on them.
 """
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
+from .markers import mxids_in
 from .state import valid_wire_id
 
 #: The gateway's unsigned metadata block. The bracket body is `[^\]]*` because
@@ -71,11 +89,13 @@ DEFAULT_PRIORITY = "normal"
 MAX_TEXT = 64 * 1024
 MAX_SHORT = 256
 MAX_TIER = 64
-#: Room membership arrives as one preformatted line the broker has already
-#: capped. It is longer than a name and shorter than a body, and it gets its own
-#: bound rather than borrowing `MAX_TEXT`: a field that is a *list* in spirit
-#: should not be able to arrive the size of a message.
-MAX_LIST = 4 * 1024
+#: The broker caps the roster it sends at ten; this bounds what a broker that
+#: did not would make the client hold.
+MAX_MEMBERS = 64
+#: A wire counter's ceiling — the re-serve count, the room's size. The digit
+#: width of `_COUNT_RE` and this bound say the same number on purpose, so there
+#: is no value one accepts and the other refuses.
+MAX_COUNT = 10 ** 6
 
 #: The five keys a platform card is made of. All five or it is not a card — a
 #: partial one is a pointer with a missing signature, and the consumer that
@@ -89,7 +109,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 #: around them. Not `str.isdigit()`, which is True for `"\u00b2"` and raises
 #: inside `int()`; and no stripping, because the writer pads nothing and a
 #: padded value is a shape this client does not know.
-_COUNT_RE = re.compile(r"[0-9]{1,9}")
+_COUNT_RE = re.compile(r"[0-9]{1,6}")
 
 
 def _text(value: Any, limit: int = MAX_SHORT, keep_newlines: bool = False) -> str:
@@ -185,12 +205,12 @@ class Task:
         "id", "body", "room_id", "user_id", "access_tier",
         "requested_access_tier", "collaborator", "sensitive_data_filter",
         "priority", "timestamp", "room_name", "sender_name", "reply_to_event",
-        "reply_to_me", "source_message_id", "attempt", "metadata_stripped",
-        "attachments",
+        "reply_to_me", "reply_to_sender", "addressed_to", "room_members",
+        "room_member_count", "source_message_id", "attempt",
+        "metadata_stripped", "attachments",
         # Context the broker enriches a task with. Carried, never interpreted:
         # see the block comment in `__init__` below.
-        "session_scope", "source", "interaction_type", "reply_to_sender",
-        "addressed_to", "room_members", "room_member_count", "platform_card",
+        "session_scope", "source", "interaction_type", "platform_card",
         "thread_root", "source_room_id",
     )
 
@@ -214,13 +234,13 @@ class Task:
         attempt: int = 0,
         metadata_stripped: bool = False,
         attachments: Tuple = (),
+        reply_to_sender: str = "",
+        addressed_to: str = "",
+        room_members: Tuple = (),
+        room_member_count: int = 0,
         session_scope: str = "",
         source: str = "",
         interaction_type: str = "",
-        reply_to_sender: str = "",
-        addressed_to: str = "",
-        room_members: str = "",
-        room_member_count: Optional[int] = None,
         platform_card: Optional[Mapping[str, str]] = None,
         thread_root: str = "",
         source_room_id: str = "",
@@ -249,6 +269,18 @@ class Task:
         self.sender_name = sender_name
         self.reply_to_event = reply_to_event
         self.reply_to_me = reply_to_me
+        #: The rest of what the broker knows about a shared room's routing,
+        #: delivered as data like the tier: whose message this one replied to,
+        #: and whom it was addressed to. Neither is judged here — what
+        #: "addressed to someone else" means is the consumer's decision.
+        self.reply_to_sender = reply_to_sender
+        self.addressed_to = addressed_to
+        #: Who is in the room, as full mxids, and how many there are. The list
+        #: is capped by the broker (and bounded here), so the count is the only
+        #: honest size of the room: a consumer reading the list as the whole
+        #: roster takes a big room for a small one.
+        self.room_members = tuple(room_members)
+        self.room_member_count = room_member_count
         self.source_message_id = source_message_id
         #: The broker's re-serve counter. Additive bookkeeping; a client that
         #: ignores it still works — it is carried because it is the one signal
@@ -265,8 +297,8 @@ class Task:
 
         # --- context the broker enriches a task with ----------------------
         #
-        # Ten fields this library carries and has no opinion about. They are
-        # here because a consumer already serializes all ten into local state
+        # Fields this library carries and has no opinion about. They are here
+        # because a consumer already serializes them into local state
         # (sutando's task files, since long before this package existed), and a
         # library that dropped them would make migrating onto it a quiet loss of
         # context that no test on either side would catch.
@@ -278,9 +310,8 @@ class Task:
         #
         # `""` means "the broker did not send it", which is exactly the test a
         # consumer applies before writing a header, so absence survives the trip
-        # rather than turning into an empty header. The two non-strings say the
-        # same thing with `None`, because `0` is a real member count and `{}` is
-        # a real (if useless) mapping.
+        # rather than turning into an empty header. `platform_card` says the
+        # same with `None`, because `{}` is a real (if useless) mapping.
 
         #: `"room"` scopes the task to a room session; anything else is the
         #: main-session path. The value, not the decision.
@@ -290,16 +321,6 @@ class Task:
         self.source = source
         #: `message`, `realtime_audio`, … — the broker's word for what this is.
         self.interaction_type = interaction_type
-        #: Who wrote the message this one replies to.
-        self.reply_to_sender = reply_to_sender
-        #: The peer the broker resolved this reply's target to. Addressing
-        #: context; it grants and withholds nothing by itself.
-        self.addressed_to = addressed_to
-        #: A one-line, broker-capped mxid list.
-        self.room_members = room_members
-        #: The true joined total, which the capped list above does not imply.
-        #: `None` is "not sent" and `0` is a room the broker says is empty.
-        self.room_member_count = room_member_count
         #: The signed platform-metadata pointer: all five of
         #: `PLATFORM_CARD_KEYS`, or `None`. Never partial — see the constant.
         self.platform_card = platform_card
@@ -363,51 +384,44 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
         sender_name=_text(raw.get("sender_name")),
         reply_to_event=_text(raw.get("reply_to_event")),
         reply_to_me=raw.get("reply_to_me") is True,
+        reply_to_sender=_text(raw.get("reply_to_sender")),
+        addressed_to=_text(raw.get("addressed_to")),
+        # Either shape the broker sends it in: a list of mxids, or the capped
+        # `"@a:x, @b:x (+3 more)"` string its bridge allowlist serialises.
+        room_members=_members(raw.get("room_members")),
+        room_member_count=_count(raw.get("room_member_count")),
         # Canonical name first, with the older spelling as the fallback the
         # protocol documents as the same value.
         source_message_id=_text(raw.get("source_message_id")
                                 or raw.get("source_event_id")),
-        attempt=_attempt(raw.get("attempt")),
+        attempt=_count(raw.get("attempt")),
         metadata_stripped=stripped,
         session_scope=_text(raw.get("session_scope")),
         source=_text(raw.get("source")),
         interaction_type=_text(raw.get("interaction_type")),
-        reply_to_sender=_text(raw.get("reply_to_sender")),
-        addressed_to=_text(raw.get("addressed_to")),
-        room_members=_text(raw.get("room_members"), MAX_LIST),
-        room_member_count=_count(raw.get("room_member_count")),
         platform_card=_platform_card(raw.get("platform_card")),
         thread_root=_text(raw.get("thread_root")),
         source_room_id=_text(raw.get("source_room_id")),
     )
 
 
-def _attempt(value: Any) -> int:
-    """The re-serve counter as a non-negative int; anything else is 0."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return 0
-    return value if 0 <= value < 10 ** 6 else 0
-
-
-def _count(value: Any) -> Optional[int]:
-    """A non-negative member count, or `None` for "the broker did not say".
-
-    `None` rather than `0`, because a consumer writes this field only when the
-    broker sent it and `0` is a thing the broker can send. A bool is not a
-    count: `True` is `1` to Python and nothing to a room.
+def _count(value: Any) -> int:
+    """A wire counter — the re-serve count, the room's size — as a non-negative
+    int; anything else is 0. A bool is not a count: `True` is `1` to Python and
+    nothing to a room.
 
     A plain decimal string is a count. The intake that enriches a task writes
-    this one as `str(len(members))` — every live task carries the total as
-    text — so int-only reading dropped the field for all of them, silently,
-    which is the loss carrying it here exists to prevent. Only that shape:
-    a sign, a fraction, an exponent or surrounding whitespace is refused, the
+    the room's size as `str(len(members))` — every live task carries the total
+    as text — so int-only reading dropped the field for all of them, silently,
+    which is the loss carrying it here exists to prevent. Only that shape: a
+    sign, a fraction, an exponent or surrounding whitespace is refused, the
     same as any other value the broker did not send.
     """
     if isinstance(value, str) and _COUNT_RE.fullmatch(value):
         value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value if 0 <= value < 10 ** 9 else None
+        return 0
+    return value if 0 <= value < MAX_COUNT else 0
 
 
 def _platform_card(value: Any) -> Optional[Mapping[str, str]]:
@@ -430,3 +444,27 @@ def _platform_card(value: Any) -> Optional[Mapping[str, str]]:
             return None
         card[key] = _text(held)
     return card
+
+
+def _members(value: Any) -> Tuple[str, ...]:
+    """The roster as full mxids, from either shape the broker sends it in.
+
+    A list of mxids is the documented form. The capped string — `"@a:x, @b:x
+    (+3 more)"` — is what the bridge allowlist serialises a longer roster to.
+    Both are read by the one grammar (`markers.mxids_in`): every entry is text
+    that names some mxids, usually exactly one, and only full mxids come out
+    of it, once each — a bare name is not a member and the `(+3 more)` is
+    prose, `room_member_count` carrying the number. Any other shape is an
+    empty roster: not understood is not guessed at.
+    """
+    entries = [value] if isinstance(value, str) else value
+    if not isinstance(entries, (list, tuple)):
+        return ()
+    found: List[str] = []
+    for entry in entries:
+        for mxid in mxids_in(_text(entry, MAX_TEXT)):
+            if mxid not in found:
+                found.append(mxid)
+            if len(found) >= MAX_MEMBERS:
+                return tuple(found)
+    return tuple(found)

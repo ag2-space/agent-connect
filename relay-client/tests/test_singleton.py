@@ -38,9 +38,16 @@ from pathlib import Path
 
 from fake_broker import FakeBroker
 
-from ag2_relay_client import singleton
+from ag2_relay_client import locking
 from ag2_relay_client.client import NO_SEND, RelayClient
 from ag2_relay_client.credentials import TokenSource
+from ag2_relay_client.locking import (
+    LockBackendError,
+    LockTimeout,
+    acquire_exclusive,
+    backend_name,
+    release_exclusive,
+)
 from ag2_relay_client.singleton import DEGRADED, HELD, IDLE, LOST, PollerGuard
 from ag2_relay_client.status import DISPLACED, STANDBY
 
@@ -96,6 +103,73 @@ def rewrite(path, **fields):
     record = record_of(path)
     record.update(fields)
     Path(path).write_text(json.dumps(record), encoding="utf-8")
+
+
+# --- the shared primitive: empty files, explicit offsets, bounded outcomes --
+with tempfile.TemporaryDirectory() as tmp:
+    lock = Path(tmp) / "empty.lock"
+    handle = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.lseek(handle, 7, os.SEEK_SET)
+        acquire_exclusive(handle, time.monotonic() + 1.0)
+        check(os.lseek(handle, 0, os.SEEK_CUR) == 7,
+              "the shared lock leaves the descriptor position unchanged")
+        check(lock.stat().st_size == 0,
+              f"the {backend_name()} backend locks an initially empty file")
+        check(release_exclusive(handle), "the shared lock releases explicitly")
+        check(os.lseek(handle, 0, os.SEEK_CUR) == 7,
+              "release leaves the descriptor position unchanged too")
+    finally:
+        os.close(handle)
+
+    holder = os.open(str(lock), os.O_RDWR)
+    contender = os.open(str(lock), os.O_RDWR)
+    try:
+        acquire_exclusive(holder, time.monotonic() + 1.0)
+        started = time.monotonic()
+        timed_out = False
+        try:
+            acquire_exclusive(contender, started + 0.05)
+        except LockTimeout:
+            timed_out = True
+        elapsed = time.monotonic() - started
+        check(timed_out and 0.04 <= elapsed < 0.5,
+              f"contention has a bounded timeout ({elapsed:.3f}s)")
+    finally:
+        release_exclusive(holder)
+        os.close(contender)
+        os.close(holder)
+
+    saved_backend = locking._BACKEND
+    saved_error = locking._BACKEND_LOAD_ERROR
+    locking._BACKEND = None
+    locking._BACKEND_LOAD_ERROR = RuntimeError("deliberately unavailable")
+    unavailable = False
+    handle = os.open(str(lock), os.O_RDWR)
+    try:
+        try:
+            acquire_exclusive(handle, time.monotonic())
+        except LockBackendError:
+            unavailable = True
+    finally:
+        os.close(handle)
+        locking._BACKEND = saved_backend
+        locking._BACKEND_LOAD_ERROR = saved_error
+    check(unavailable,
+          "backend failure is distinct from ordinary lock contention")
+
+    class BrokenRelease:
+        name = "deliberately broken release"
+
+        def release(self, unused_handle):
+            raise OSError("release failed")
+
+    locking._BACKEND = BrokenRelease()
+    try:
+        check(release_exclusive(-1) is False,
+              "unlock is best effort because descriptor close is authoritative")
+    finally:
+        locking._BACKEND = saved_backend
 
 
 # --- the guard, alone: one winner, and the loser knows it ------------------
@@ -272,6 +346,8 @@ with tempfile.TemporaryDirectory() as tmp:
     check(said.count(HELD) == 1,
           f"eight separate processes racing on one wall clock produce exactly "
           f"one winner too ({said})")
+    check(said.count(DEGRADED) == 0,
+          "and the process race contains no degraded verdicts")
     check(record_of(lock)["pid"] != os.getpid(),
           "and the record belongs to the process that won, not to this one")
 
@@ -294,14 +370,19 @@ with tempfile.TemporaryDirectory() as tmp:
           "and it says so out loud: a lock that silently stopped working is "
           "indistinguishable from a lock that is working")
 
-    # A platform without POSIX locking is the same answer for the same reason.
-    saved, singleton.fcntl = singleton.fcntl, None
+    # An explicitly unavailable platform backend is the same answer for the
+    # same reason, whichever backend this test is currently running on.
+    saved_backend = locking._BACKEND
+    saved_error = locking._BACKEND_LOAD_ERROR
+    locking._BACKEND = None
+    locking._BACKEND_LOAD_ERROR = RuntimeError("deliberately unavailable")
     try:
         check(PollerGuard(Path(tmp) / "elsewhere.lock").claim() == DEGRADED,
-              "a platform with no fcntl has no atomic guard — so it polls, "
+              "a platform with no lock backend has no atomic guard — so it polls, "
               "rather than pretending to a guarantee it cannot make")
     finally:
-        singleton.fcntl = saved
+        locking._BACKEND = saved_backend
+        locking._BACKEND_LOAD_ERROR = saved_error
 
     # An unreadable record is not evidence that anybody is polling.
     torn = Path(tmp) / "torn.lock"

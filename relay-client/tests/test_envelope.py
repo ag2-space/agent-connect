@@ -211,38 +211,90 @@ many = "keep me " + "[room-ops metadata: x] " * 1000 + "and me"
 check(strip_room_ops_meta(many)[0] == "keep me and me",
       "a thousand separate blocks still go in one pass, text intact")
 
+# --- the addressing fields a shared room adds (additive, and data) ---------
+# The broker says whom a message named, whose message it replied to, and who is
+# in the room. They cross like the tier does — bounded in shape, judged by
+# nobody here — and the roster arrives in either of the two shapes the broker
+# has been seen to send it in.
+roomful = parse_task(task_dict(
+    addressed_to="@codex.agent:ag2.space", reply_to_sender="@bob:ag2.space",
+    room_members=["@alice:ag2.space", "@codex.agent:ag2.space", "@bob:ag2.space"],
+    room_member_count=3))
+check(roomful.addressed_to == "@codex.agent:ag2.space", "addressed_to is delivered")
+check(roomful.reply_to_sender == "@bob:ag2.space", "and so is reply_to_sender")
+check(roomful.room_members == ("@alice:ag2.space", "@codex.agent:ag2.space",
+                               "@bob:ag2.space"),
+      "a roster sent as a list arrives as a tuple of full mxids, in order")
+check(roomful.room_member_count == 3, "with the broker's count beside it")
+
+capped = parse_task(task_dict(
+    room_members="@alice:ag2.space, @bob:ag2.space (+3 more)", room_member_count=5))
+check(capped.room_members == ("@alice:ag2.space", "@bob:ag2.space"),
+      "the capped string form names the members it names, and '+3 more' is prose")
+check(capped.room_member_count == 5,
+      "and the count, not the list, says how big the room is")
+
+bare = parse_task(task_dict())
+check(bare.addressed_to == "" and bare.reply_to_sender == "",
+      "absent, the two names are empty — a DM names nobody")
+check(bare.room_members == () and bare.room_member_count == 0,
+      "and an absent roster is empty with a count of zero, not a guess")
+
+check(parse_task(task_dict(room_members=["@alice:ag2.space", "alice", 7, None,
+                                          "@alice:ag2.space"])).room_members
+      == ("@alice:ag2.space",),
+      "a list is kept to full mxids, each once — a bare name or a non-string "
+      "is not a member")
+check(parse_task(task_dict(room_members={"@alice:ag2.space": True})).room_members == (),
+      "a roster in a shape this client does not understand is empty")
+check(len(parse_task(task_dict(room_members=[f"@u{n}:ag2.space" for n in range(200)]))
+          .room_members) == 64,
+      "and an unbounded roster does not become an unbounded local one")
+for bogus in (3.0, True, -1, None, [3], 10 ** 7):
+    check(parse_task(task_dict(room_member_count=bogus)).room_member_count == 0,
+          f"a count that is not a sane int is 0: {bogus!r}")
+check(parse_task(task_dict(room_member_count="14")).room_member_count == 14,
+      "and the count as the wire actually spells it — the intake writes "
+      "str(len(members)), so int-only reading dropped it for every live task")
+check(all(parse_task(task_dict(room_member_count=v)).room_member_count == 0
+          for v in ("", " 14", "14 ", "+14", "-1", "7.0", "1e3", "\u00b2",
+                    "\u0661\u0662", "\uff11\uff12", "14\n", "12abc", "0x1f",
+                    "9" * 40)),
+      "but only a plain bounded decimal: a sign, padding, a fraction, an "
+      "exponent or a digit that is not ASCII is still absent, fail-closed")
+check(parse_task(task_dict(room_member_count="999999")).room_member_count == 999999
+      and parse_task(task_dict(room_member_count="1000000")).room_member_count == 0
+      and parse_task(task_dict(room_member_count=1000000)).room_member_count == 0,
+      "the digit width and the numeric bound agree, as text and as an int")
+check(parse_task(task_dict(addressed_to={"id": "x"})).addressed_to == "",
+      "an addressee that is not text is absent, not stringified")
+check(Task("task-1") != Task("task-1", room_members=("@alice:ag2.space",)),
+      "the roster is part of what makes two Tasks equal")
+
 # --- the enrichment fields: carried across, never interpreted --------------
 #
-# Eight fields sutando has serialized into its task files since before this
-# library existed. They are here so that migrating a consumer onto this package
-# is not a silent loss of context — the failure mode a test on neither side
-# would have caught.
+# Fields sutando has serialized into its task files since before this library
+# existed. They are here so that migrating a consumer onto this package is not
+# a silent loss of context — the failure mode a test on neither side would
+# have caught.
 
 plain = parse_task(task_dict())
 check(all(getattr(plain, f) == "" for f in
-          ("session_scope", "interaction_type", "reply_to_sender",
-           "addressed_to", "room_members", "thread_root", "source_room_id")),
+          ("session_scope", "interaction_type", "thread_root", "source_room_id")),
       "a wire payload that carries none of them reads them all as absent")
 check(plain.source == "ag2space", "the one the base payload does carry comes through")
-check(plain.room_member_count is None and plain.platform_card is None,
-      "and the two non-strings say absent with None — 0 is a real count and "
-      "{} is a real mapping, so neither can double as 'not sent'")
+check(plain.platform_card is None,
+      "and the card says absent with None — {} is a real mapping, so it "
+      "cannot double as 'not sent'")
 
 rich = parse_task(task_dict(
     session_scope="room",
     interaction_type="realtime_audio",
-    reply_to_sender="@bob:ag2.space",
-    addressed_to="@carol:ag2.space",
-    room_members="@alice:ag2.space, @bob:ag2.space",
-    room_member_count=7,
+    source="voice",
 ))
-check(rich.session_scope == "room" and rich.interaction_type == "realtime_audio",
+check(rich.session_scope == "room" and rich.interaction_type == "realtime_audio"
+      and rich.source == "voice",
       "each enrichment field arrives verbatim")
-check(rich.reply_to_sender == "@bob:ag2.space"
-      and rich.addressed_to == "@carol:ag2.space"
-      and rich.room_members == "@alice:ag2.space, @bob:ag2.space",
-      "including the three that name people")
-check(rich.room_member_count == 7, "and the count is an int, not its text")
 
 # Thread membership is its own fact, beside the reply fact. The intake writes
 # the root's id and the root's room together, because an event id cannot
@@ -273,30 +325,12 @@ check(parse_task(task_dict(interaction_type="telepathy")).interaction_type
       "an interaction type this library has never heard of is still carried — "
       "the whitelist is the consumer's, and enforcing one here would break on "
       "the next additive deploy")
-
-check(parse_task(task_dict(room_member_count=True)).room_member_count is None,
-      "a bool is not a count, however much Python says True is 1")
-check(parse_task(task_dict(room_member_count=-1)).room_member_count is None,
-      "nor is a negative one")
-check(parse_task(task_dict(room_member_count=0)).room_member_count == 0,
-      "but a room the broker says is empty is a fact, and survives as one")
-check(parse_task(task_dict(room_member_count="14")).room_member_count == 14,
-      "and the count as the wire actually spells it — the intake writes "
-      "str(len(members)), so int-only reading dropped it for every live task")
-check(all(parse_task(task_dict(room_member_count=v)).room_member_count is None
-          for v in ("", " 14", "14 ", "+14", "-1", "7.0", "1e3", "\u00b2",
-                    "12abc", "0x1f", "9" * 40)),
-      "but only a plain bounded decimal: a sign, padding, a fraction, an "
-      "exponent or a digit that is not ASCII is still absent, fail-closed")
 check(parse_task(task_dict(session_scope={"nested": "dict"})).session_scope == "",
       "a non-string where a string belongs reads as absent, never as its repr")
 check("\n" not in parse_task(task_dict(
-          room_members="@a:x\nfake_header: yes")).room_members,
+          session_scope="room\nfake_header: yes")).session_scope,
       "and a newline cannot ride in — a consumer writes these into a "
       "line-oriented file where one would forge a second header")
-check(len(parse_task(task_dict(room_members="@a:x " * 4000)).room_members) <= 4096,
-      "the member list is bounded: a field that is a list in spirit must not "
-      "arrive the size of a message")
 
 CARD = {"card_url": "https://x/card.json", "card_sha256": "abc",
         "sig": "sig", "key_id": "k1", "alg": "ed25519"}
@@ -317,10 +351,12 @@ check(parse_task(task_dict(platform_card={**CARD, "sig": 42})).platform_card is 
 check(parse_task(task_dict(platform_card="a string")).platform_card is None,
       "and so does a card that is not a mapping")
 
-# G3 still holds with eight more fields in the envelope: additive-only, no
-# version field, unknown fields ignored.
+# G3 still holds with more fields in the envelope: additive-only, no version
+# field, unknown fields ignored.
 check(parse_task(task_dict(lease_id="l-9", some_future_field={"x": 1})) is not None,
       "an unknown field still does not break a running client (G3)")
+check(Task("task-1") != Task("task-1", thread_root="$root:ag2.space"),
+      "the enrichment fields are part of what makes two Tasks equal")
 
 
 check(Task("task-1") == Task("task-1"), "two Tasks with the same fields are equal")

@@ -34,6 +34,7 @@ answers every prompt with one message and stops with `end_turn`.
       "agentCapabilities": {...},     # merged over the default capabilities
       "authMethods": [...],           # advertised by initialize
       "newSessionError": {"code": -32000, "message": "..."},
+      "promptError":     {"code": -32000, "message": "..."},
       "loadSessionError": {...},      # refuse Session resumption
       "loadSessionReplay": [ <update>, ... ],   # replayed history on resume
       "sessionPrefix": "roomA",       # how session ids are named (default
@@ -277,7 +278,9 @@ class FakeAcpAgent:
     def _new_session(self, params: dict) -> dict:
         error = self.script.get("newSessionError")
         if error:
-            raise _JsonRpcError(error.get("code", -32000), error.get("message", ""))
+            raise _JsonRpcError(
+                error.get("code", -32000), error.get("message", ""), error.get("data")
+            )
         self._session_seq += 1
         # The prefix is scriptable so that a test running several Sessions —
         # each in its own process, each counting from one — can still tell them
@@ -308,7 +311,9 @@ class FakeAcpAgent:
                     "refused": True,
                 }
             )
-            raise _JsonRpcError(error.get("code", -32000), error.get("message", ""))
+            raise _JsonRpcError(
+                error.get("code", -32000), error.get("message", ""), error.get("data")
+            )
         session_id = params.get("sessionId")
         self.report["sessions"].append(
             {
@@ -336,6 +341,13 @@ class FakeAcpAgent:
 
     async def _prompt(self, params: dict) -> dict:
         session_id = params.get("sessionId")
+        # Refuses only when real work arrives, as the Claude bridge does with
+        # a fresh config dir. -32000 is the auth-required code.
+        error = self.script.get("promptError")
+        if error:
+            raise _JsonRpcError(
+                error.get("code", -32000), error.get("message", ""), error.get("data")
+            )
         self._cancel_event(session_id).clear()
         self.report["prompts"].append(
             {"sessionId": session_id, "prompt": params.get("prompt")}
@@ -461,9 +473,11 @@ class FakeAcpAgent:
 
 
 class _JsonRpcError(Exception):
-    def __init__(self, code: int, message: str):
+    def __init__(self, code: int, message: str, data=None):
         super().__init__(message)
         self.payload = {"code": code, "message": message}
+        if data is not None:
+            self.payload["data"] = data
 
 
 def load_script(argv: list) -> dict:

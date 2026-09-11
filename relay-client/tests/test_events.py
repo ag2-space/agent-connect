@@ -463,6 +463,10 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     creds = TokenSource(token_file=token_file)
     bearers = []
     lock = threading.Lock()
+    # The first connection is held until the test has rotated the token. Without
+    # it the client is free to reconnect on the old bearer first, and the second
+    # connection is another FIRST rather than the SECOND being asserted.
+    rotated = threading.Event()
 
     def script(request, write):
         with lock:
@@ -470,6 +474,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
             bearers.append(request.header("Authorization"))
         write(event_frame(turn + 1, kind="tick"))
         if turn == 0:
+            rotated.wait(10)
             return  # the broker drops the stream, as it does on a lapsed bearer
         broker.closing.wait(5)
 
@@ -480,6 +485,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
         check(until(lambda: len(bearers) >= 1), "the stream is up on the first bearer")
         token_file.write_text(f"REMOTE_TASK_TOKEN={broker.url}%7CSECOND\n")
         creds.reload()
+        rotated.set()
         check(until(lambda: len(bearers) >= 2), "and reconnects after the drop")
         check(bearers[0] == "Bearer FIRST" and bearers[1] == "Bearer SECOND",
               "the rotation reached the stream without restarting the channel")

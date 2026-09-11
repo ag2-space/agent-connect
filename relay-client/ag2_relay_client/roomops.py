@@ -57,7 +57,7 @@ from collections import OrderedDict
 from typing import Callable, Dict, NamedTuple, Optional, Sequence
 
 from .egress import ApprovedFile, EgressAllowlist, EgressRefused
-from .markers import ROOM_ID_RE
+from .markers import MXID_RE, ROOM_ID_RE
 from .transport import AuthRejected, RelayHTTP
 
 log = logging.getLogger(__name__)
@@ -78,9 +78,6 @@ EDIT_MAX_CHARS = 4000
 
 #: The broker stamps at most this many mxids into `m.mentions.user_ids`.
 MAX_MENTIONS = 10
-
-#: A hand-typed mxid in body text does not notify anyone; only this field does.
-_MXID_RE = re.compile(r"^@[^\s:@]+:[^\s:@/]+$")
 
 # A room id is broker-supplied, but it is also about to be a URL path segment
 # and a JSON value, so it is checked rather than trusted — against
@@ -465,6 +462,12 @@ def _valid_room(room_id: object) -> bool:
 def _mentions(mentions: Optional[Sequence[str]]) -> list:
     """The mxids to notify: full ones only, at most `MAX_MENTIONS`.
 
+    Judged by `markers.MXID_RE`, the one definition. The broker stamps
+    `m.mentions` from this field and also for any *room member* whose mxid it
+    finds written in the body, so the field is what makes a mention deliberate
+    rather than incidental — it never puts an mxid in the body, and a body that
+    names nobody is delivered to no agent whatever this says.
+
     Over the cap the extras are dropped rather than the op refused. A message
     that lands and notifies nine of ten people is a better outcome than one that
     does not land at all — and the drop is logged so it is not a silence.
@@ -477,7 +480,7 @@ def _mentions(mentions: Optional[Sequence[str]]) -> list:
     named = list(mentions or ())
     if not named:
         return []
-    good = [m for m in named if isinstance(m, str) and _MXID_RE.match(m)]
+    good = [m for m in named if isinstance(m, str) and MXID_RE.match(m)]
     if len(good) != len(named):
         log.info("room op: dropped %d mention(s) that were not full mxids",
                  len(named) - len(good))

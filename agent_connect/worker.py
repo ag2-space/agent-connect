@@ -215,6 +215,15 @@ def turn_context(task, repo: str) -> TurnContext:
     arrives with an empty body and a file, and `uncaptioned_prompt` is what it
     asks. Nothing is ever folded into a body someone typed — this is the case
     where nobody typed one.
+
+    **The addressing facts cross verbatim.** Whom the message named, whether it
+    replied to this agent and to whose message, and who is in the room are the
+    broker's routing facts about a shared room; the Worker judges none of them
+    — it never learns its own mxid, so it cannot — and the Adapters put them in
+    front of the Local Agent (`agent_connect.addressing`), which is the only
+    party that can act on them. `reply_to_me` used to be dropped on this line,
+    which left a Task the broker delivered *because* it was a reply looking
+    exactly like one it delivered because the agent was named.
     """
     tier = attested_tier(task.access_tier)
     attachments = task_attachments(task)
@@ -227,6 +236,11 @@ def turn_context(task, repo: str) -> TurnContext:
         sender_name=task.sender_name,
         user_id=task.user_id,
         source_message_id=task.source_message_id,
+        addressed_to=task.addressed_to,
+        reply_to_me=task.reply_to_me,
+        reply_to_sender=task.reply_to_sender,
+        room_members=task.room_members,
+        room_member_count=task.room_member_count,
         sandbox=tier_to_sandbox(tier),
         cwd=repo,
         attachments=attachments,

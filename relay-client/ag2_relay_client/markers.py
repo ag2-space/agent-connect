@@ -87,6 +87,22 @@ _SKIP_PATTERNS = (
 #: the drift this module exists to have stopped.
 ROOM_ID_RE = re.compile(r"^[!#][^\s/\x00-\x1f\x7f]{1,254}$")
 
+#: What a user id may look like — the one definition, for the same reason.
+#: `roomops` judges a mention by it before stamping it into `m.mentions`, and
+#: `envelope` reads a roster through `mxids_in` below, which judges by it too;
+#: two spellings would let the client refuse to stamp a mention for a member it
+#: happily names, or the reverse.
+MXID_RE = re.compile(r"^@[^\s:@]+:[^\s:@/]+$")
+
+#: The same shape *found in prose* rather than checked whole. The lookbehind is
+#: the broker's own boundary rule: an `@` glued to a word is an email address,
+#: not a mention. The server name is the DNS shape and has to end in a letter
+#: or digit, which is what keeps the full stop closing a sentence out of the
+#: match — `.` is legal inside a server name, so it cannot simply be excluded.
+_MXID_IN_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9._-])@[^\s:@]+:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
+)
+
 #: The redirect marker, on the first non-empty line. `.match()` anchors at the
 #: string start on its own, so no MULTILINE flag is wanted here.
 #:
@@ -323,6 +339,24 @@ def restitch(body: str, redirect: str) -> str:
 def is_skip(text: Optional[str]) -> bool:
     """Would this body complete the lease without a user-visible post? (H1)"""
     return bool(parse(text).skip)
+
+
+def mxids_in(text: Optional[str]) -> List[str]:
+    """Every full user id written in `text`, once each, in document order.
+
+    Full ids only. The broker routes a message to an agent on the agent's full
+    id — stamped in `m.mentions`, or written whole in the body — and a bare
+    localpart or a display name is an address for a person reading the room,
+    not for the deliverer. So this is what a consumer may stamp, and it is what
+    the broker's capped roster string (`"@a:x, @b:x (+3 more)"`) actually
+    names: the `(+3 more)` is prose, and stays out.
+    """
+    found: List[str] = []
+    for match in _MXID_IN_TEXT_RE.finditer(text or ""):
+        mxid = match.group(0)
+        if MXID_RE.match(mxid) and mxid not in found:
+            found.append(mxid)
+    return found
 
 
 def _mask(text: str):

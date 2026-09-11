@@ -141,8 +141,14 @@ different from every other adapter's, and weaker. Read this before enabling it.*
   the file is not stopped, because nothing is there to stop it. It is a
   convention, not a guarantee; it is not a substitute for a sandbox.
 - **Owner-tier under ACP is therefore MORE permissive than owner-tier under
-  codex.** Same tier, weaker confinement: no OS sandbox, and network access is
-  always on (`codex exec --sandbox workspace-write` gives neither).
+  codex.** Same tier, weaker confinement: codex runs owner-tier tasks under
+  `codex exec --sandbox workspace-write`, where the OS refuses writes outside
+  the workspace whatever the agent tries; ACP has no such boundary, only the
+  cooperative policy above. Network is *not* the difference — agent-connect
+  turns network access on for owner-tier codex tasks too
+  (`sandbox_workspace_write.network_access=true`, see
+  `agent_connect/adapters/codex.py`); it is off only for guest/read-only tasks,
+  which never reach ACP at all.
 - **Guest tasks are refused outright** and never reach ACP — the ACP agent is
   not even started. Shipping a read-only *tier* on top of a cooperative *policy*
   would be offering a limit that only looks like one. The refusal is **said in
@@ -175,6 +181,31 @@ yourself — it overrides every preset:
 ```bash
 export AGENT_CONNECT_ACP_COMMAND="my-agent --acp"
 ```
+
+The installer takes the same thing as a flag, so an agent no preset describes is
+still a one-liner:
+
+```bash
+curl -fsSL <installer-url>/install.sh | sh -s -- --token <TOKEN> \
+     --adapter acp --acp-command "my-agent --acp"
+```
+
+`--acp-command` implies `--acp-agent custom`: a supplied command overrides every
+preset anyway, so naming a preset would only npm-install a bridge you are not
+using and make a login failure name an agent you are not running. Pass
+`--acp-agent` as well if you want a different name recorded.
+
+Re-running the installer **without** `--acp-command` keeps whatever command is
+already in `config.env`, and keeps the agent name beside it — a plain re-run to
+upgrade the worker does not quietly re-point your agent.
+
+Naming a preset is how you switch back. `--adapter acp --acp-agent claude` on a
+later run **clears** a stored `AGENT_CONNECT_ACP_COMMAND`, because a command
+overrides every preset: keeping it would leave the old agent running while the
+installer reported the preset you asked for. The installer says so when it
+happens, and the previous file is at `config.env.bak`. An install for a
+different adapter never touches these two keys — `--acp-agent` is ignored there,
+out loud, and your ACP settings are left as they are.
 
 **Startup checks, not surprises in a room.** Before the worker serves its first
 task it starts the ACP agent, runs `initialize`, and stops with a sentence you
@@ -221,6 +252,15 @@ and the answer arrives in full as its own message.
 Adapters that are not ACP get the placeholder and the final answer too, with
 nothing in between — they have no tool activity to report, and inventing some
 would put fiction in a room.
+
+**Hand-offs are addressed by mxid.** In a room shared with another agent, the
+broker delivers a message to that agent only when the agent's full mxid is on
+it — stamped as a mention, or written whole in the body — and an agent ignores
+agent-authored messages it is not named in. So the worker tells the local agent
+who is in the room and how a hand-off is delivered (the roster, the addressee
+and the reply facts the broker sends with each task reach it in the preamble),
+and a message the worker posts is stamped for the room members whose mxids it
+names.
 
 If the worker holds no relay token, or the relay refuses a room op, the answer
 travels the way it always did — as the task result the relay client posts. The
@@ -670,7 +710,7 @@ ACP adapter (see the section above):
 | Setting | What it does | Default |
 | --- | --- | --- |
 | `AGENT_CONNECT_ACP_AGENT` | preset naming the ACP agent to run: `claude`, `gemini` | *(unset)* |
-| `AGENT_CONNECT_ACP_COMMAND` | the ACP agent's command line, split as a shell would. **Overrides any preset** | *(unset)* |
+| `AGENT_CONNECT_ACP_COMMAND` | the ACP agent's command line, split as a shell would. **Overrides any preset**. `install.sh --acp-command` writes it; a re-run without that flag keeps it | *(unset)* |
 | `AGENT_CONNECT_ACP_MODE` | session mode id to request. Left alone by default: every bridge's own default already routes permission requests to the worker, and mode ids are the agent's to name | *(unset)* |
 | `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK` | `1` to start even when the agent advertises authentication methods. The escape hatch for an agent whose `authMethods` mean something else | *(unset)* |
 | `AGENT_CONNECT_TURN_TIMEOUT` | seconds one turn may run before it is cancelled **through the protocol**, keeping whatever it produced. `0` waits forever | `600` |

@@ -344,6 +344,145 @@ grep -q "claude-agent-acp" "$NPM_LOG" \
   && bad "the Claude bridge was installed for a non-Claude preset" \
   || ok "no bridge installed for a preset that does not use one"
 
+# 9b) --acp-command: written through, preset name defaults to a non-preset so
+#     no bridge is fetched, and a re-run without the flag keeps the command.
+: > "$NPM_LOG"
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
+  || bad "acp --acp-command dry-run failed"
+ACPCFG="$TMP/.agent-connect/config.env"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="my-agent --acp"$' "$ACPCFG" \
+  && ok "--acp-command is written to config.env" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--acp-command not written"; }
+grep -q '^AGENT_CONNECT_ACP_AGENT="custom"$' "$ACPCFG" \
+  && ok "and the preset name defaults to a non-preset, so no bridge is implied" \
+  || bad "--acp-command did not default AGENT_CONNECT_ACP_AGENT to custom"
+grep -q "claude-agent-acp" "$NPM_LOG" \
+  && { sed 's/^/    /' "$NPM_LOG"; bad "the Claude bridge was installed despite an explicit command"; } \
+  || ok "and no bridge is downloaded for a command-supplied agent"
+
+# The regression this flag must not introduce: a re-run without it wiping the
+# command, leaving the adapter on the claude preset.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T2 --adapter acp --no-start 2>&1) \
+  || bad "acp re-run without --acp-command failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="my-agent --acp"$' "$ACPCFG" \
+  && ok "a re-run WITHOUT --acp-command keeps the existing command" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a re-run without --acp-command wiped the command"; }
+grep -q '^AGENT_CONNECT_TOKEN="T2"$' "$ACPCFG" \
+  && ok "while the managed settings still update around it" \
+  || bad "re-run did not update the token"
+
+# A run that DOES supply one rewrites it, exactly once.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T3 --adapter acp --acp-command "other-agent --acp" --no-start 2>&1) \
+  || bad "acp re-run with a new --acp-command failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="other-agent --acp"$' "$ACPCFG" \
+  && ok "a re-run WITH --acp-command replaces it" || bad "--acp-command did not replace the old value"
+n_cmd="$(grep -c '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" || true)"
+[ "${n_cmd:-0}" -eq 1 ] \
+  && ok "and leaves exactly one of it (no duplicate for the reader to disagree over)" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "config.env has $n_cmd AGENT_CONNECT_ACP_COMMAND lines"; }
+
+# An explicit --acp-agent still wins over the implied `custom`.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "x --acp" --acp-agent gemini --no-start 2>&1) \
+  || bad "acp --acp-command with explicit --acp-agent failed"
+grep -q '^AGENT_CONNECT_ACP_AGENT="gemini"$' "$ACPCFG" \
+  && ok "an explicit --acp-agent still wins over the implied 'custom'" \
+  || bad "explicit --acp-agent was overridden by the implied default"
+
+# A stored command outranks any preset at runtime, so naming one has to clear
+# it — otherwise the install reports `claude` and runs the custom agent.
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
+  || bad "seed run for the preset-transition case failed"
+: > "$NPM_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-agent claude --no-start 2>&1) \
+  || bad "switching from a custom command back to a preset failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" \
+  && { sed 's/^/    /' "$ACPCFG"; bad "an explicit --acp-agent left the stored command in place — the preset is silently overridden"; } \
+  || ok "an explicit --acp-agent clears a stored command, so the preset actually decides"
+grep -q '^AGENT_CONNECT_ACP_AGENT="claude"$' "$ACPCFG" \
+  && ok "and the named preset is what the config records" || bad "the named preset was not recorded"
+grep -q "install -g $SPEC" "$NPM_LOG" \
+  && ok "and the bridge that preset needs is installed" || bad "no bridge installed for the newly named preset"
+printf '%s\n' "$out" | grep -q "replaces the AGENT_CONNECT_ACP_COMMAND" \
+  && ok "and the operator is told the command was dropped, not left to find out" \
+  || { printf '%s\n' "$out" | sed 's/^/    /'; bad "clearing the command was silent"; }
+
+# ...while a plain re-run changes nothing.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
+  || bad "re-seed failed"
+: > "$NPM_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T4 --adapter acp --no-start 2>&1) || bad "plain re-run failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="my-agent --acp"$' "$ACPCFG" \
+  && ok "a re-run naming neither flag keeps the command" || bad "a plain re-run dropped the command"
+grep -q '^AGENT_CONNECT_ACP_AGENT="custom"$' "$ACPCFG" \
+  && ok "and keeps the agent name with it, rather than reverting it to the claude preset" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a plain re-run re-pointed AGENT_CONNECT_ACP_AGENT"; }
+grep -q "claude-agent-acp" "$NPM_LOG" \
+  && { sed 's/^/    /' "$NPM_LOG"; bad "a plain re-run downloaded the Claude bridge for a custom-command install"; } \
+  || ok "and downloads no bridge it will not use"
+
+# An install for another adapter must not rewrite ACP settings on its way past.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" --no-start 2>&1) \
+  || bad "seed run for the non-acp-adapter case failed"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter codex --acp-agent claude --no-start 2>&1) \
+  || bad "codex re-run with --acp-agent failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND="my-agent --acp"$' "$ACPCFG" \
+  && ok "a non-acp adapter leaves a stored ACP command alone" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--adapter codex --acp-agent deleted the stored ACP command"; }
+printf '%s\n' "$out" | grep -q -- "--acp-agent applies only to --adapter acp" \
+  && ok "and says the flag was ignored rather than dropping it silently" \
+  || { printf '%s\n' "$out" | sed 's/^/    /'; bad "--acp-agent on a non-acp adapter was silently ignored"; }
+
+# 9c) values reach config.env byte for byte. echo is implementation-defined for
+#     backslashes; under dash \t and \n become a real tab and newline, and a
+#     newline splits one setting into two. Run under each shell we can find.
+BS_CMD='my-agent --re \n --tab \t --trunc \c --path C:\\tools\\a'
+for SHBIN in sh dash bash; do
+  command -v "$SHBIN" >/dev/null 2>&1 || continue
+  rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+  out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+        "$SHBIN" "$SCRIPT" --token "tok\tone" --adapter acp --acp-command "$BS_CMD" --no-start 2>&1) \
+    || bad "[$SHBIN] backslash round-trip run failed"
+  grep -Fqx "AGENT_CONNECT_ACP_COMMAND=\"$BS_CMD\"" "$ACPCFG" \
+    && ok "[$SHBIN] a command containing backslashes reaches config.env unchanged" \
+    || { sed 's/^/    /' "$ACPCFG"; bad "[$SHBIN] backslashes in --acp-command were rewritten"; }
+  grep -Fqx 'AGENT_CONNECT_TOKEN="tok\tone"' "$ACPCFG" \
+    && ok "[$SHBIN] and so does a token — every value takes the same path, not just the ACP one" \
+    || { sed 's/^/    /' "$ACPCFG"; bad "[$SHBIN] backslashes in the token were rewritten"; }
+  n="$(grep -c '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" || true)"
+  [ "${n:-0}" -eq 1 ] \
+    && ok "[$SHBIN] and it is still one line, not split into two settings" \
+    || { sed 's/^/    /' "$ACPCFG"; bad "[$SHBIN] the command became $n lines"; }
+done
+
+# A value carrying a real newline is refused rather than written and misread.
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token "$(printf 'a\nb')" --no-start >/dev/null 2>&1; then
+  bad "a token containing a newline should be refused"
+else
+  rc=$?
+  [ "$rc" -eq 2 ] && ok "a value containing a newline is refused, with exit 2" \
+                  || bad "newline token → exit $rc (want 2)"
+fi
+
+# The flag is meaningless without --adapter acp, and says so rather than vanishing.
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter codex --acp-command "x --acp" --no-start 2>&1) \
+  || bad "codex + --acp-command dry-run failed"
+printf '%s\n' "$out" | grep -q "applies only to --adapter acp" \
+  && ok "--acp-command with a non-acp adapter warns instead of silently doing nothing" \
+  || { printf '%s\n' "$out" | sed 's/^/    /'; bad "no warning for --acp-command on a non-acp adapter"; }
+
 # 10) the sparse-fetch path is gone for good (PyPI is the single source)
 if grep -q "raw.githubusercontent.com" "$SCRIPT"; then
   bad "install.sh still sparse-fetches from raw.githubusercontent.com"

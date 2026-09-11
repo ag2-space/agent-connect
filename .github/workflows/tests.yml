@@ -50,6 +50,46 @@ jobs:
           done
           exit $fail
 
+  relay-client-windows:
+    # The same contract as the Ubuntu job above — every suite, bare
+    # interpreter, no install step — on native Windows. This grew out of the
+    # locking-only slice: the rest of the suite is now platform-aware (POSIX
+    # mode bits and directory fsync assert their honest Windows counterparts,
+    # egress capability-detects symlink privilege), so the whole Relay Client
+    # is the Windows contract, and a narrower job would only hide which suites
+    # still hold. Same enumeration as the Ubuntu job on purpose: a suite added
+    # there is a suite added here, with no list to forget to update.
+    name: relay-client (Windows, py${{ matrix.python }}, no deps)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the suite
+        working-directory: relay-client
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          $failed = $false
+          foreach ($test in (Get-ChildItem tests/test_*.py | Sort-Object Name)) {
+            $rel = "tests/$($test.Name)"
+            Write-Host "::group::$rel"
+            python $rel
+            if ($LASTEXITCODE -ne 0) {
+              $failed = $true
+              Write-Host "::error file=relay-client/$rel::suite failed"
+            }
+            Write-Host "::endgroup::"
+          }
+          if ($failed) { exit 1 }
+
   worker:
     # Both documented install paths, deliberately. They are not two spellings of
     # one thing: uv installs a python-build-standalone interpreter, which links

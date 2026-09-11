@@ -138,6 +138,26 @@ check("session/set_mode" not in report["methods"],
       "no session mode is imposed by default — the agent's own default routes "
       "permission requests to the Worker")
 
+# --- a shared room's roster reaches the Local Agent, with the rule ---------
+
+bench = Bench({"turns": [{"actions": [{"type": "message", "text": "on it"}],
+                          "stopReason": "end_turn"}]})
+bench.handle("a2", "hand this to the other agent", channel_id="!room:ag2.space",
+             sender_name="Ada",
+             room_members=["@ada:ag2.space", "@sutando-b.agent:ag2.space"],
+             room_member_count=2, addressed_to="@sutando-b.agent:ag2.space")
+roomful = bench.report()["prompts"][0]["prompt"][0]["text"]
+check("Others in this room: @ada:ag2.space, @sutando-b.agent:ag2.space." in roomful,
+      "the ACP framing names who else is in the room, by full mxid")
+check("write its full mxid in your answer" in roomful,
+      "and says how a hand-off is delivered — the mxid is the address")
+check("addressed to @sutando-b.agent:ag2.space" in roomful,
+      "and whom the message was addressed to, for the agent to read")
+check(roomful.endswith("hand this to the other agent"),
+      "with the person's words last and untouched")
+check("Others in this room" not in prompt_text,
+      "a Task with no roster says nothing about one")
+
 # --- a Task at any other Tier is refused, and never reaches ACP ------------
 
 for tier in ("other", "collaborator", "guest", ""):
@@ -274,6 +294,46 @@ bench.adapter = AcpAdapter(command=None)
 out = bench.handle("c1", "hello")
 check("AGENT_CONNECT_ACP_COMMAND" in out,
       "an unconfigured Worker says so in the room instead of failing silently")
+
+# Advertises no auth method (so preflight passes), then refuses the first
+# prompt. The room must get the thing to do, not a bare protocol error.
+bench = Bench({"promptError": {"code": -32000, "message": "Authentication required"}})
+out = bench.handle("auth1", "hello")
+check("not authenticated" in out,
+      "an auth refusal at the first Turn is reported as an authentication problem")
+check("advertised no login method" in out,
+      "and says why the startup check did not catch it")
+check("will not log in for you" in out,
+      "and repeats that the Worker never opens a terminal to do it")
+check("Authentication required" not in out or "not authenticated" in out,
+      "rather than surfacing the raw protocol error alone")
+
+# A non-auth protocol error is untouched by that path.
+bench = Bench({"promptError": {"code": -32603, "message": "Internal error"}})
+out = bench.handle("auth2", "hello")
+check("not authenticated" not in out,
+      "an unrelated protocol error is not dressed up as a login problem")
+
+# --- an Agent's reason reaches the room, and never reads as a missing bridge -
+
+bench = Bench({"promptError": {
+    "code": -32603, "message": "Internal error",
+    "data": {"reason": "API key not valid. Please pass a valid API key."},
+}})
+out = bench.handle("data1", "hello")
+check("API key not valid" in out,
+      "the Agent's own explanation reaches the room, not just 'Internal error'")
+
+# The bridge is present and answering; only the Turn failed. Install advice here
+# would send the operator to fix a bridge that is running.
+bench = Bench({"promptError": {
+    "code": -32603, "message": "Internal error",
+    "data": {"reason": "config file not found at ~/.config/agent.toml"},
+}})
+out = bench.handle("data2", "hello")
+check("not installed" not in out and "npm install -g" not in out,
+      "a wire error mentioning 'not found' is not mistaken for a missing bridge")
+check("config file not found" in out, "and its reason is reported as written")
 
 check("acp" in NATIVE, "the ACP Adapter is registered under the name 'acp'")
 selected = get_adapter("acp")

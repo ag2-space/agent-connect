@@ -123,13 +123,16 @@ from .. import attachments as att
 from .. import outgoing
 from ..acp.core import (
     AcpAgentGone,
+    AcpAuthRequired,
     AcpClient,
+    AcpCommandMissing,
     AcpError,
     SessionResumeRefused,
     TurnResult,
     Update,
 )
 from ..acp.policy import WorkingDirectoryPolicy
+from ..addressing import addressing_preamble
 from ..events import (
     CANCELLED,
     COMPLETED,
@@ -517,6 +520,37 @@ def login_advice(agent, env: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def auth_failed_advice(agent, env: Optional[dict] = None) -> str:
+    """What to say when the ACP Agent refuses a Turn as unauthenticated.
+
+    Not `login_advice`: that one opens by saying the Agent advertised a login
+    method, and here it advertised none — `preflight` passed and the refusal
+    only came at `session/prompt`. `preflight` cannot catch it without sending
+    a prompt, which would spend tokens on every Worker start.
+    """
+    env = os.environ if env is None else env
+    name = (env.get(AGENT_ENV) or "").strip().lower()
+    preset = PRESETS.get(name) if not (env.get(COMMAND_ENV) or "").strip() else None
+    lines = [
+        "the Local Agent refused this turn because it is not authenticated. It "
+        "advertised no login method when the Worker started, so the startup "
+        "check had nothing to catch — it only said so when the first real work "
+        "arrived."
+    ]
+    if preset is not None:
+        lines.append(f"Log in with:\n    {preset.login}")
+    else:
+        lines.append(
+            "Log in to the agent yourself, in your own shell, then start the "
+            "Worker again."
+        )
+    lines.append(
+        "agent-connect will not log in for you: it never opens an interactive "
+        "terminal on your machine on behalf of a room."
+    )
+    return "\n".join(lines)
+
+
 def _truthy(value: Optional[str]) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -541,6 +575,10 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
     The outgoing rule is stated here too, in `agent_connect.outgoing`'s own
     words: an agent that is never told how to hand a file to the room pastes it
     into a code block instead, which is the thing this framing exists to avoid.
+    So is the addressing rule, in `agent_connect.addressing`'s: in a room shared
+    with another agent, who else is there and how a hand-off is delivered — the
+    shim says the same under its sandbox line, and neither inherits the other's
+    sentence about confinement.
     """
     who = ctx.sender_name or "the owner"
     where = f" in {ctx.room_name}" if ctx.room_name else ""
@@ -549,7 +587,9 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
         "Answer in chat: prose, no more than a few short paragraphs unless asked "
         "for more. You are working in the directory this session was opened in; "
         f"file operations outside it will be refused when you ask for them.\n"
-        f"{outgoing.INSTRUCTION}\n\n"
+        f"{outgoing.INSTRUCTION}\n"
+        f"{addressing_preamble(ctx.room_members, ctx.addressed_to, ctx.room_member_count)}"
+        "\n"
     )
     if attached:
         framing += ATTACHED.format(names=", ".join(attached))
@@ -820,7 +860,7 @@ class AcpAdapter:
             async with AcpClient.spawn(command, cwd=os.getcwd()) as client:
                 agent = await client.initialize()
         except AcpError as exc:
-            if "not found" in str(exc):
+            if isinstance(exc, AcpCommandMissing):
                 return install_advice(command)
             return f"the ACP Agent would not start: {exc}"
         except Exception as exc:  # noqa: BLE001 — a startup check reports, never raises
@@ -829,6 +869,10 @@ class AcpAdapter:
         if agent.auth_methods and not _truthy(os.environ.get(SKIP_AUTH_ENV)):
             return login_advice(agent)
         return None
+
+    def agent_description_or_none(self):
+        """What `preflight` learned about the Agent, if it ran at all."""
+        return getattr(self, "agent_description", None)
 
     def describe(self) -> str:
         """One line about what preflight found, for the Worker's startup log."""
@@ -997,10 +1041,15 @@ class AcpAdapter:
             yield Done(reason=FAILED, text="".join(chunks),
                        note=_gone_note(exc, store, key))
             return
+        except AcpAuthRequired:
+            yield Done(reason=FAILED, text="".join(chunks),
+                       note=f"agent-connect: {auth_failed_advice(self.agent_description_or_none())}")
+            return
         except AcpError as exc:
             # A missing bridge mid-Turn gets the same install advice the startup
             # check gives, rather than a bare "command not found".
-            note = (install_advice(command) if "not found" in str(exc) else str(exc))
+            note = (install_advice(command)
+                    if isinstance(exc, AcpCommandMissing) else str(exc))
             yield Done(reason=FAILED, text="".join(chunks),
                        note=f"agent-connect: {note}")
             return
