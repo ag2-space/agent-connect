@@ -8,10 +8,12 @@ rewritten and are not scheduled to be: migrating them is later work and
 explicitly not urgent.
 
 An Adapter that speaks the contract natively (the ACP one) registers the object
-itself; anything exposing `turn` is passed through untouched. Those live in
-`NATIVE` and are built on selection rather than imported here, because the ACP
-one carries the `agent-client-protocol` dependency (`docs/adr/0001`) and a
-Worker driving codex should not have to have it installed.
+itself. Those live in `NATIVE` and are built on selection rather than imported
+here, because the ACP one carries the `agent-client-protocol` dependency
+(`docs/adr/0001`) and a Worker driving codex should not have to have it
+installed. The object is passed through `NativeAdapterContract`, which enforces
+the same closed event vocabulary and terminal `Done` that `ShimAdapter`
+provides for the original Adapters.
 """
 import importlib
 
@@ -20,6 +22,7 @@ from . import ollama  # noqa: F401
 from . import omnigent  # noqa: F401
 from . import cline  # noqa: F401
 from . import kilo  # noqa: F401
+from .contract import NativeAdapterContract  # noqa: F401
 from .shim import ShimAdapter  # noqa: F401
 
 ADAPTERS = {
@@ -49,7 +52,8 @@ def get(name):
     if name in NATIVE and name not in ADAPTERS:
         if name not in _native_instances:
             module, _, attr = NATIVE[name].partition(":")
-            _native_instances[name] = getattr(importlib.import_module(module), attr)()
+            native = getattr(importlib.import_module(module), attr)()
+            _native_instances[name] = NativeAdapterContract(name, native)
         return _native_instances[name]
     a = ADAPTERS.get(name)
     if a is None:
