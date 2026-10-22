@@ -28,6 +28,7 @@ when it ended this repository's `dependencies = []` policy.
 from __future__ import annotations
 
 import asyncio
+import sys
 import contextlib
 import os
 import warnings
@@ -187,8 +188,20 @@ class TurnResult:
     updates: list = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class Notification:
+    """Something the ACP Agent said on its own, outside any Turn: an extension
+    notification (`_<method>`), carried as the method without its underscore and
+    the params as sent. The agent decides what they mean; this module only
+    delivers them."""
+
+    method: str
+    params: dict
+
+
 PermissionHandler = Callable[[PermissionRequest], Any]
 UpdateHandler = Callable[[Update], Any]
+NotificationHandler = Callable[[Notification], Any]
 
 
 def reject_all(request: PermissionRequest) -> None:
@@ -247,6 +260,11 @@ class _ClientCallbacks(acp.Client):
                 text=_extract_text(raw),
                 raw=raw,
             )
+        )
+
+    async def ext_notification(self, method: str, params: Any) -> None:
+        await self._owner._on_notification_received(
+            Notification(method=method, params=_as_dict(params))
         )
 
     async def request_permission(
@@ -371,11 +389,13 @@ class AcpClient:
         *,
         on_update: Optional[UpdateHandler] = None,
         permission_handler: Optional[PermissionHandler] = None,
+        on_notification: Optional[NotificationHandler] = None,
     ):
         self._link = link
         self._connection = connection
         self._on_update = on_update
         self._permission_handler = permission_handler or reject_all
+        self._on_notification = on_notification
         self._turn_updates: Optional[list] = None
         self.agent: Optional[AgentDescription] = None
 
@@ -391,6 +411,7 @@ class AcpClient:
         env: Optional[dict] = None,
         on_update: Optional[UpdateHandler] = None,
         permission_handler: Optional[PermissionHandler] = None,
+        on_notification: Optional[NotificationHandler] = None,
     ):
         """Start an ACP Agent and hold a connection to it for the block.
 
@@ -423,6 +444,7 @@ class AcpClient:
             None,
             on_update=on_update,
             permission_handler=permission_handler,
+            on_notification=on_notification,
         )
         client._connection = acp.connect_to_agent(
             _ClientCallbacks(client), process.stdin, process.stdout
@@ -443,6 +465,7 @@ class AcpClient:
         cookie_store: Any = None,
         on_update: Optional[UpdateHandler] = None,
         permission_handler: Optional[PermissionHandler] = None,
+        on_notification: Optional[NotificationHandler] = None,
     ):
         """Connect to an ACP Agent already running behind `url`.
 
@@ -462,6 +485,7 @@ class AcpClient:
             None,
             on_update=on_update,
             permission_handler=permission_handler,
+            on_notification=on_notification,
         )
         client._connection = acp.connect_to_agent(_ClientCallbacks(client), transport)
         try:
@@ -505,15 +529,19 @@ class AcpClient:
         return self.agent
 
     async def new_session(
-        self, cwd: str, mcp_servers: Optional[list] = None
+        self, cwd: str, mcp_servers: Optional[list] = None, meta: Optional[dict] = None
     ) -> str:
         """Open a Session rooted at `cwd`, and return its identifier.
 
         The working directory is fixed here because that is where the protocol
-        puts it — there is no per-prompt working directory to be had.
+        puts it — there is no per-prompt working directory to be had. `meta` is
+        the request's `_meta`: the protocol's extension slot, where an
+        application says things like where this Session's messages belong.
         """
         response = await self._guard(
-            self._connection.new_session(cwd=cwd, mcp_servers=mcp_servers or [])
+            self._connection.new_session(
+                cwd=cwd, mcp_servers=mcp_servers or [], **(meta or {})
+            )
         )
         return response.sessionId
 
@@ -619,6 +647,19 @@ class AcpClient:
     async def _gone(self) -> AcpAgentGone:
         """Describe the end of the ACP Agent, in whatever terms its link has."""
         return AcpAgentGone(await self._link.gone())
+
+    async def _on_notification_received(self, notification: Notification) -> None:
+        """An extension notification from the agent. A handler that raises must
+        not take the connection down with it: the wire is the agent's, the
+        failure is ours, and it is reported rather than propagated."""
+        if self._on_notification is None:
+            return
+        try:
+            result = self._on_notification(notification)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 — reported, never fatal
+            print(f"agent-connect: notification handler failed: {exc}", file=sys.stderr)
 
     async def _on_update_received(self, update: Update) -> None:
         if self._turn_updates is not None:

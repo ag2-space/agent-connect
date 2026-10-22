@@ -137,6 +137,7 @@ from ..acp.core import (
     new_cookie_store,
 )
 from ..acp.policy import WorkingDirectoryPolicy
+from ..link import room_message
 from ..addressing import addressing_preamble
 from ..events import (
     CANCELLED,
@@ -554,6 +555,25 @@ def _unconfigured() -> str:
     )
 
 
+#: The `_meta` key a Session is opened with to say where its unsolicited messages
+#: belong — the room, which outlives any one Session (an AG2 Assistant listener keeps
+#: it on the Session's Peer and delivers task-run outcomes to it).
+DESTINATION_META_KEY = "ag2/destination"
+
+
+def destination_meta(ctx: TurnContext) -> dict:
+    """The `session/new` metadata for this Turn's room, or `{}` for a roomless Task."""
+    if not ctx.room:
+        return {}
+    return {
+        DESTINATION_META_KEY: {
+            "chat_id": ctx.room,
+            "room_name": ctx.room_name,
+            "access_tier": ctx.access_tier,
+        }
+    }
+
+
 @dataclass(frozen=True)
 class Endpoint:
     """Where this Worker's ACP Agent is: a URL to dial, or a command to run."""
@@ -963,6 +983,21 @@ class AcpAdapter:
         self._session_settings = session_settings
         #: What `preflight` learned about the ACP Agent, if it has run.
         self.agent_description = None
+        #: Posts a room message the agent asked for on its own (`set_notifier`);
+        #: None drops such notifications, which is what a Worker without Room
+        #: Ops can honestly do.
+        self._notifier = None
+
+    def set_notifier(self, post) -> None:
+        """Where a message the ACP Agent sends unasked goes: `post(destination, text)`."""
+        self._notifier = post
+
+    async def _on_notification(self, notification) -> None:
+        if self._notifier is None:
+            return
+        message = room_message(notification)
+        if message is not None:
+            await self._notifier(*message)
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<AcpAdapter {self._url or self._command or 'from ' + COMMAND_ENV}>"
@@ -1237,7 +1272,11 @@ class AcpAdapter:
 
         async def run():
             async with self._connect(
-                endpoint, cwd=cwd, on_update=on_update, permission_handler=on_permission
+                endpoint,
+                cwd=cwd,
+                on_update=on_update,
+                permission_handler=on_permission,
+                on_notification=self._on_notification,
             ) as client:
                 agent = await client.initialize()
                 live.client = client
@@ -1264,7 +1303,9 @@ class AcpAdapter:
                                     why=WHY_REFUSED.format(detail=exc)))
                             )
                     if not session_id:
-                        session_id = await client.new_session(cwd=session_cwd)
+                        session_id = await client.new_session(
+                            cwd=session_cwd, meta=destination_meta(ctx)
+                        )
                         turns = 0
                     mode = self.mode()
                     if mode:

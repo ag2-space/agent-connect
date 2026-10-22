@@ -483,6 +483,34 @@ def relay_stopped_for_good(client) -> Optional[RelayStopped]:
     )
 
 
+def start_listener_link(adapter, ops) -> Optional[asyncio.Task]:
+    """Give the Adapter somewhere to post what its agent says unasked, and hold a
+    standing dial to a dialled agent so it can say it between Turns. None when the
+    Adapter is not an ACP one, has no Room Ops to post with, or spawns its agent."""
+    if ops is None or not hasattr(adapter, "set_notifier"):
+        return None
+
+    async def post(destination: str, text: str) -> None:
+        try:
+            await ops.message(destination, text)
+        except Exception as exc:  # noqa: BLE001 — a room that cannot be spoken to is logged
+            print(f"agent-connect: could not post to {destination}: {exc}", file=sys.stderr)
+
+    adapter.set_notifier(post)
+    try:
+        endpoint = adapter.endpoint()
+    except Exception:  # noqa: BLE001 — a misconfigured endpoint is the Turn's to report
+        return None
+    if not getattr(endpoint, "dialled", False):
+        return None
+    from .link import keep_link
+
+    return asyncio.ensure_future(
+        keep_link(endpoint.url, post, token=endpoint.token,
+                  cookie_store=getattr(adapter, "_cookies", None))
+    )
+
+
 async def serve(
     adapter,
     repo: str,
@@ -593,6 +621,10 @@ async def serve(
                 hand_over(exc)
 
     threading.Thread(target=pump, name="agent-connect-queue", daemon=True).start()
+    # What the agent says unasked (a scheduled task's outcome) is posted to the room
+    # it names, through the same Room Ops as everything else; a dialled Agent gets a
+    # standing link so that can arrive between Turns too.
+    link = start_listener_link(adapter, ops)
     try:
         while True:
             task = await inbound.get()
@@ -613,6 +645,8 @@ async def serve(
             fut.add_done_callback(started.pop)
     finally:
         stop.set()
+        if link is not None:
+            link.cancel()
         if heartbeat is not None:
             heartbeat.cancel()
 

@@ -314,6 +314,22 @@ If the worker holds no relay token, or the relay refuses a room op, the answer
 travels the way it always did — as the task result the relay client posts. The
 ladder degrades; it never eats the answer.
 
+## What the agent says unasked comes back to the room (ACP)
+
+A dialled agent can speak first. AG2 Assistant runs scheduled tasks; one created from a room
+finishes hours later, and its outcome arrives as an ACP extension notification,
+`_ag2/notify`, which agent-connect posts to the room it names. Two things make that work and
+neither needs a setting:
+
+- every Session is opened with the room as its destination (`_meta["ag2/destination"]` on
+  `session/new`), so the agent knows where a Task created in it belongs;
+- a dialled agent gets a **listener link** — one standing dial the Worker keeps open, re-dialled
+  after a pause when it drops — so there is a client to deliver to between Turns. The agent
+  queues while there is none, so a Worker that was down gets what it missed on its next dial.
+
+A spawned agent needs no link: it only exists during a Turn, whose own dial listens too.
+See `docs/adr/0005`.
+
 ## The agent remembers the conversation (ACP)
 
 Ask for something, then say "now the same for the other module", and it works:
