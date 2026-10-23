@@ -69,14 +69,12 @@ if repo is None:
 sys.path.insert(0, str(repo / "src"))
 sys.path.insert(1, str(repo))
 try:
-    from ag2 import Agent as Ag2Agent
-    from ag2.testing import TestConfig
     from assistant.acp.auth import KEY_ENV
     from assistant.profiles import ProfileRegistry
     from tests.support.apps import make_manager, make_paths  # the Assistant's own helpers
-    from tests.support.fakes import fake_agent_factory
+    from tests.support.fakes import ScriptedModels, fake_summary_factory
 except ImportError as exc:
-    _skip(f"the Assistant is not importable here, run with its interpreter: {exc}")
+    raise RuntimeError("run the cross-repository check with the Assistant's interpreter") from exc
 
 from _taskqueue import FakeClient  # noqa: E402
 
@@ -130,6 +128,18 @@ async def _until(cond, timeout: float = 10.0) -> bool:
     return True
 
 
+async def finish_task(manager, profile, connection, name):
+    """Run a persisted task through the profile's actual notifier wiring."""
+    tasks = manager.get(profile).tasks
+    task = await tasks.create_task(
+        name=name, prompt="report", origin_channel=connection, origin_chat=ROOM
+    )
+    run = await tasks.start_run(task["id"])
+    assert run is not None
+    await asyncio.wait_for(tasks._jobs_done(), 5)
+    assert (await tasks.get_run(run.id))["status"] == "completed"
+
+
 def _worker_startup(adapter, relay, ops, preflighted, go, done, outcome) -> None:
     """The Worker's startup as `main` runs it: `preflight` first, `serve` after.
 
@@ -162,14 +172,14 @@ async def scenario() -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         paths = make_paths(Path(tmp))
         pid = ProfileRegistry(paths).create_profile("Work", "#109e91").id
-        pong = fake_agent_factory(
-            agent=lambda config, **kwargs: Ag2Agent(name="cross-repo", config=TestConfig("pong"))
-        )
         # A credentialed profile (a key for whichever provider the default profile
         # resolves to), so the listener advertises no auth methods and the Worker's
         # preflight passes the way it does against a configured install.
         keys = {name: "sk-test" for name in set(KEY_ENV.values())}
-        manager = make_manager(paths, agent_factory=pong, env=keys)
+        manager = make_manager(
+            paths, model_factory=ScriptedModels(), env=keys,
+            summary_factory=fake_summary_factory(summary="done"),
+        )
         await manager.start()
         try:
             port, token = _free_port(), "listener-token"
@@ -181,7 +191,7 @@ async def scenario() -> dict:
             out = manager.acp_outbound[cid]
 
             # The Worker is down; a scheduled task finishes. Queued, durably.
-            await manager.notify_channel(cid, ROOM, QUEUED)
+            await finish_task(manager, pid, cid, "nightly")
             results["queued_before"] = [p["text"] for p in out.pending()]
 
             adapter = AcpAdapter(
@@ -211,11 +221,12 @@ async def scenario() -> dict:
             results["receivers_while_serving"] = out.connected
 
             # Idle between Turns: another task finishes.
-            await manager.notify_channel(cid, ROOM, LIVE)
+            await finish_task(manager, pid, cid, "weekly")
             results["live"] = await _until(lambda: len(ops.sent) >= 2)
             results["posted_live"] = list(ops.sent)
             done.set()
-            thread.join(15)
+            await asyncio.to_thread(thread.join, 15)
+            assert not thread.is_alive(), "worker did not shut down"
         finally:
             await manager.close()
     return results
