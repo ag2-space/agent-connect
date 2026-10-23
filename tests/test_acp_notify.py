@@ -51,7 +51,13 @@ from agent_connect.adapters.acp import (  # noqa: E402
     destination_meta,
 )
 from agent_connect.events import TurnContext  # noqa: E402
-from agent_connect.link import NOTIFY_METHOD, keep_link, room_message  # noqa: E402
+from agent_connect.link import (  # noqa: E402
+    NOTIFY_METHOD,
+    RECEIVE_META_KEY,
+    keep_link,
+    receiver_meta,
+    room_message,
+)
 from agent_connect.sessions import SessionStore  # noqa: E402
 
 ROOM = "!room:example"
@@ -59,12 +65,15 @@ ROOM = "!room:example"
 
 class TalkativeAgent(FakeAcpAgent):
     """The fake agent, which also speaks first: every entry under `notify` in its
-    script goes out as an extension notification once `initialize` is answered."""
+    script goes out as an extension notification once `initialize` is answered —
+    to a Client that declared itself a receiver on that initialize, and to no
+    other, which is the real listener's rule (AG2 Assistant ADR 0049)."""
 
     def _initialize(self, params):
         result = super()._initialize(params)
-        for entry in self.script.get("notify") or []:
-            asyncio.ensure_future(self._notify("_" + NOTIFY_METHOD, dict(entry)))
+        if (params.get("_meta") or {}).get(RECEIVE_META_KEY) is True:
+            for entry in self.script.get("notify") or []:
+                asyncio.ensure_future(self._notify("_" + NOTIFY_METHOD, dict(entry)))
         return result
 
 
@@ -157,7 +166,7 @@ async def _dial_and_listen():
     async with Door(SCRIPT) as door:
         heard = []
         async with AcpClient.dial(door.url, token=door.token, on_notification=heard.append) as client:
-            await client.initialize()
+            await client.initialize(meta=receiver_meta())
             sid = await client.new_session(
                 cwd="/repo", meta={DESTINATION_META_KEY: {"chat_id": ROOM}}
             )
@@ -261,6 +270,56 @@ check(is_task and delivered and sent_by_worker[0] == (ROOM, "✅ nightly: done")
       "the Worker holds a standing link to a dialled agent and posts through Room Ops")
 check(none_without_ops is None, "a Worker without Room Ops holds no link")
 check(spawned is None, "and a spawned agent gets none: it is only there during a Turn")
+
+
+
+def _declared(agent) -> bool:
+    """Whether that dial's `initialize` asked for the queue."""
+    return ((agent.report["initialize"] or {}).get("_meta") or {}).get(RECEIVE_META_KEY) is True
+
+
+async def _startup_is_a_probe_and_then_a_receiver():
+    """The Worker's own order: `preflight` first, a Turn with no notifier yet, then the
+    link once Room Ops exist. Only the last may be handed what the agent queued."""
+    with tempfile.TemporaryDirectory() as tmp:
+        async with Door(SCRIPT) as door:
+            adapter = AcpAdapter(url=door.url, token=door.token,
+                                 store=SessionStore(Path(tmp) / "sessions.json"))
+            problem = await adapter.preflight()
+            await asyncio.sleep(0.05)
+            text = await worker.run_turn(adapter, ctx)
+            await asyncio.sleep(0.05)
+            ops = FakeOps()
+            link = worker.start_listener_link(adapter, ops)
+            delivered = await until(lambda: len(ops.sent) >= 1)
+            link.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await link
+            probe, turn, standing = door.agents[:3]
+            return problem, text, [_declared(a) for a in (probe, turn, standing)], delivered, ops.sent
+
+
+problem, text, declared, delivered, sent = run(_startup_is_a_probe_and_then_a_receiver())
+check(problem is None and "PONG" in text, "preflight passes and the Turn answers (so the dials below are real)")
+check(declared[0] is False, "preflight's dial does not ask for the queue: it is a probe")
+check(declared[1] is False, "nor does a Turn's dial before the Worker has a notifier to post with")
+check(declared[2] is True, "the listener link does, and is the first connection the agent speaks to")
+check(delivered and sent == [(ROOM, "✅ nightly: done")],
+      "so what the agent queued reaches Room Ops once, through the link, not the probe")
+
+
+async def _a_turn_with_a_notifier_is_a_receiver():
+    with tempfile.TemporaryDirectory() as tmp:
+        async with Door(SCRIPT) as door:
+            adapter = AcpAdapter(url=door.url, token=door.token,
+                                 store=SessionStore(Path(tmp) / "sessions.json"))
+            adapter.set_notifier(FakeOps().message)
+            await worker.run_turn(adapter, ctx)
+            return _declared(door.agents[0])
+
+
+check(run(_a_turn_with_a_notifier_is_a_receiver()) is True,
+      "and a Turn's dial asks for the queue once the notifier is installed")
 
 print()
 if fails:

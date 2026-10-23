@@ -510,12 +510,21 @@ class AcpClient:
 
     # -- protocol ---------------------------------------------------------
 
-    async def initialize(self) -> AgentDescription:
-        """Negotiate the protocol and learn what this ACP Agent can do."""
+    async def initialize(self, meta: Optional[dict] = None) -> AgentDescription:
+        """Negotiate the protocol and learn what this ACP Agent can do.
+
+        `meta` is the request's `_meta`, the protocol's extension slot: where a
+        Client says what the protocol has no field for — that it is ready to
+        receive what the agent sends unasked, for one (`link.receiver_meta`).
+        A Client that says nothing is, to the agent, a probe: it is told nothing
+        it would have to deliver, and that is the right outcome for a connection
+        that has nowhere to deliver it.
+        """
         response = await self._guard(
             self._connection.initialize(
                 protocol_version=PROTOCOL_VERSION,
                 client_capabilities=CLIENT_CAPABILITIES,
+                **(meta or {}),
             )
         )
         info = _as_dict(getattr(response, "agentInfo", None))
@@ -653,6 +662,10 @@ class AcpClient:
         not take the connection down with it: the wire is the agent's, the
         failure is ours, and it is reported rather than propagated."""
         if self._on_notification is None:
+            # Said, not swallowed: a notification reaching a connection with no
+            # handler is a message lost, and the one way to notice is this line.
+            print(f"agent-connect: dropped a notification nobody was listening for: "
+                  f"{notification.method}", file=sys.stderr)
             return
         try:
             result = self._on_notification(notification)

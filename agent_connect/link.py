@@ -9,7 +9,8 @@ message until a client is connected; this module is the client that is.
 One coroutine, `keep_link`, dials, waits while the link lives, and dials again after a
 pause when it dies. Notifications arriving on it go to `post`, the same way a Turn's
 own dial hands them on. It never sends a prompt and never opens a Session: it is a
-listener on the client side of the socket, nothing more.
+listener on the client side of the socket, nothing more — and it says so on
+`initialize` (`receiver_meta`), which is what makes the agent hand it the queue.
 """
 from __future__ import annotations
 
@@ -22,6 +23,20 @@ from .acp import AcpClient, Notification
 #: The notification an AG2 Assistant listener sends for a task-run outcome:
 #: `{"destination": <chat id>, "text": <message>, ...}`.
 NOTIFY_METHOD = "ag2/notify"
+
+#: The `_meta` key a Client sets to `true` on `initialize` to say it takes
+#: `_ag2/notify` and delivers it. The agent flushes what it has queued to such a
+#: Client and to no other (AG2 Assistant, ADR 0049). A connection that says
+#: nothing — the Worker's startup preflight, which dials, initializes and hangs up
+#: before there is any Room Ops to post with — is a probe, and is handed nothing:
+#: that is how what was queued while the Worker was down survives the Worker's
+#: own restart instead of vanishing into its first connection.
+RECEIVE_META_KEY = "ag2/receive"
+
+
+def receiver_meta() -> dict:
+    """What a Client that can deliver notifications says on `initialize`."""
+    return {RECEIVE_META_KEY: True}
 
 #: How long to wait before dialling again after the link died, growing to a cap.
 BACKOFF_S = (5.0, 10.0, 20.0, 60.0)
@@ -75,7 +90,7 @@ async def keep_link(
             async with AcpClient.dial(
                 url, token=token, cookie_store=cookie_store, on_notification=handle
             ) as client:
-                await client.initialize()
+                await client.initialize(meta=receiver_meta())
                 attempt = 0
                 while client.alive and not stop.is_set():
                     await sleep(heartbeat_s)

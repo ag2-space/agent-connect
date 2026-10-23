@@ -327,8 +327,10 @@ neither needs a setting:
   after a pause when it drops — so there is a client to deliver to between Turns. The agent
   queues while there is none, so a Worker that was down gets what it missed on its next dial.
 
-A spawned agent needs no link: it only exists during a Turn, whose own dial listens too.
-See `docs/adr/0005`.
+Only a connection that can deliver asks for the queue: the link and a Turn's dial say so on
+`initialize` (`_meta["ag2/receive"] = true`), the startup preflight does not, and the agent
+flushes to the ones that asked. A spawned agent needs no link: it only exists during a Turn,
+whose own dial listens too. See `docs/adr/0005`.
 
 ## The agent remembers the conversation (ACP)
 

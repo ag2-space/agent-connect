@@ -27,6 +27,21 @@ deliver to between Turns; the agent queues until then, so a Worker that was down
 what it missed on its next dial. A spawned agent gets no link — it only exists during a Turn,
 and a Turn's own dial listens.
 
+**A connection that can deliver says so; the rest are probes.** Not every dial this Worker
+makes can post anything. `preflight` dials, initializes and hangs up before the Worker has
+Room Ops at all, and it carries no notification handler. The first cut of the agent's side
+flushed its queue to every newly bound client, so the probe took everything queued while the
+Worker was down, `_on_notification_received` dropped it for want of a handler, and the link
+that followed found the queue empty — the restart the queue exists for was the one case it
+lost. Now the Client says on `initialize` whether it is a receiver: the link and a Turn's dial
+send `_meta["ag2/receive"] = true` (the Turn's only once the notifier is installed), the
+preflight sends nothing, and the agent flushes to, and sends live to, a Client that said so and
+no other (AG2 Assistant ADR 0049). The declaration is explicit because the protocol's
+capability negotiation has no field for extension notifications, and inferring it from "has a
+handler" would be wrong in exactly the preflight case: a handler with nowhere to post is still
+a drop. A connection with no handler that is sent a notification anyway now says so on stderr
+rather than swallowing it.
+
 ## Considered options
 
 - **Treat the Turn's `session/update` stream as the delivery** — rejected: a run that ends
@@ -42,7 +57,12 @@ and a Turn's own dial listens.
   dialers by design (`docs/adr/0004`); the link is idle but for the notifications it carries.
 - Delivery is the agent's promise, not this Worker's: the Worker posts what it is handed and
   logs a room it cannot speak to. A failed post is not retried here, because the agent's
-  queue is drained the moment the notification is accepted on the wire.
+  queue is drained the moment the notification is accepted on the wire — which is why the
+  Worker asks for the queue only on a connection whose notifier is already installed.
+- The sequence the queue exists for — outcome queued, Worker restarts, outcome posted — is
+  pinned against the real Assistant listener in `tests/test_cross_assistant_startup.py`,
+  which runs the Worker's own `preflight` and `serve` and skips where no Assistant checkout is
+  reachable; the Assistant's suite runs the same file from its side.
 - Posting is unconditional on Tier: the agent is only ever reached at owner tier (ADR 0001),
   so everything it says unasked is the owner's. The `access_tier` in the destination is
   context for the agent, never an instruction to this Worker.

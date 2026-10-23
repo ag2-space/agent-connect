@@ -137,7 +137,7 @@ from ..acp.core import (
     new_cookie_store,
 )
 from ..acp.policy import WorkingDirectoryPolicy
-from ..link import room_message
+from ..link import receiver_meta, room_message
 from ..addressing import addressing_preamble
 from ..events import (
     CANCELLED,
@@ -992,6 +992,13 @@ class AcpAdapter:
         """Where a message the ACP Agent sends unasked goes: `post(destination, text)`."""
         self._notifier = post
 
+    def _receiver_meta(self) -> Optional[dict]:
+        """What a Turn's dial says on `initialize`: that it can deliver notifications
+        — but only once there is a notifier to deliver them to. A dial made before
+        that (a Worker driven by hand, a test) is a probe like `preflight`'s, and
+        must not be handed what the agent queued for a Client that can post it."""
+        return receiver_meta() if self._notifier is not None else None
+
     async def _on_notification(self, notification) -> None:
         if self._notifier is None:
             return
@@ -1120,6 +1127,11 @@ class AcpAdapter:
         if not endpoint.dialled and shutil.which(endpoint.command[0]) is None:
             return install_advice(list(endpoint.command))
         async def contact():
+            # A probe, and declared as one: no `on_notification`, and no
+            # `receiver_meta` on the initialize. The Worker has no Room Ops
+            # yet when this runs, so a Client that invited the agent's queued
+            # outcomes here would only drop them — and the agent flushes its
+            # queue to a Client that asked, never to one that merely connected.
             async with self._connect(endpoint, cwd=os.getcwd()) as client:
                 return await client.initialize()
 
@@ -1278,7 +1290,7 @@ class AcpAdapter:
                 permission_handler=on_permission,
                 on_notification=self._on_notification,
             ) as client:
-                agent = await client.initialize()
+                agent = await client.initialize(meta=self._receiver_meta())
                 live.client = client
                 # Muted from before the Session is touched until the prompt is
                 # sent. Not merely "during `load_session`": the boundary that
