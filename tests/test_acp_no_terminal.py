@@ -149,10 +149,12 @@ for method in TERMINAL_METHODS:
 
 # The library's `Client` protocol declares the terminal methods with empty
 # bodies, so `dir()` finds them whatever we do. What matters is what *we*
-# implement: only the two callbacks a Session actually needs.
+# implement: the two callbacks a Session actually needs, and the receiver for
+# what the agent says unasked (`docs/adr/0005`) — which offers the agent nothing.
 ours = sorted(a for a in vars(_ClientCallbacks) if not a.startswith("_"))
-check(ours == ["request_permission", "session_update"],
-      f"the callbacks object implements only the two Session callbacks ({ours})")
+check(ours == ["ext_notification", "request_permission", "session_update"],
+      f"the callbacks object implements the two Session callbacks and the "
+      f"notification receiver, nothing more ({ours})")
 check(not [a for a in vars(_ClientCallbacks) if "terminal" in a.lower()],
       "and nothing terminal-shaped of its own")
 

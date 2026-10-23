@@ -368,6 +368,15 @@ with tempfile.TemporaryDirectory() as tmp:
     listener = Listening()
     logging.getLogger("ag2_relay_client").addHandler(listener)
     journal = fresh(tmp)
+    # The same twenty fsynced writes with nobody holding the lock: what this
+    # disk costs. A CI runner's disk is not a constant (a Windows runner took
+    # 1.9 s for the contended twenty, nearly all of it in fsync), so the bound
+    # below is on what contention *adds*, not on the wall clock.
+    baseline_journal = fresh(tmp, name="baseline.jsonl")
+    started = time.monotonic()
+    for index in range(20):
+        baseline_journal.accept("warm-%d" % index, room="!room:ag2.space")
+    baseline = time.monotonic() - started
     rival = os.open(str(Path(tmp) / "journal.jsonl.lock"),
                     os.O_RDWR | os.O_CREAT, 0o600)
     acquire_exclusive(rival, time.monotonic() + 1.0)
@@ -393,8 +402,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check(counts_match,
           "twenty writes made while another process holds the lock leak no "
           "descriptors — the give-up path closes the file it opened")
-    check(elapsed < 1.0,
-          f"journal contention stays bounded ({elapsed:.3f}s for twenty writes)")
+    # Each contended write may wait LOCK_WAIT_S (0.01 s here) plus one or two
+    # ticks of the sleep clock — 15.6 ms on Windows before 3.11 — and nothing
+    # like the 1 s production wait, which would put twenty writes at 20 s.
+    added = elapsed - baseline
+    check(added < 20 * (0.01 + 0.05),
+          f"journal contention stays bounded ({elapsed:.3f}s for twenty "
+          f"writes, {added:+.3f}s over the {baseline:.3f}s uncontended baseline)")
     check(listener.warned("stayed held"),
           "a journal lock timeout makes the write-without-merge fallback visible")
     check(fresh(tmp).load().inflight() == 20,
