@@ -246,7 +246,7 @@ class RelayClient:
         "credentials", "layout", "_http", "journal", "status", "backoff",
         "poll_wait", "socket_margin", "heartbeat_interval", "ack_cooldown",
         "auth_recheck_interval", "guard", "standby_recheck", "idle_gap",
-        "result_budget", "intake_budget", "tier", "client_name",
+        "result_budget", "intake_budget", "tier", "client_name", "provider",
         "capabilities", "tasks", "media", "_room_ops", "outbound",
         "_reconciler", "_live", "_presence",
         "_ack_disabled_until", "_ack_owed", "_intake_deadline",
@@ -293,6 +293,7 @@ class RelayClient:
         idle_gap: float = 0.0,
         tier: str = "owner",
         client_name: str = "ag2-relay-client",
+        provider: str = "",
         capabilities: Sequence[str] = CAPABILITIES,
     ):
         self.credentials = credentials
@@ -329,6 +330,11 @@ class RelayClient:
         #: input — the broker attests each task's sender itself.
         self.tier = tier
         self.client_name = client_name
+        #: Which surface this node answers for, said on the heartbeat and
+        #: nowhere else. Empty means the field is omitted rather than sent
+        #: blank, for the reason presence is omitted: a node that says nothing
+        #: must not overwrite what the broker last knew about it.
+        self.provider = str(provider or "")
         self.capabilities = tuple(capabilities)
 
         #: Where Tasks come out. Unbounded on purpose: a bounded queue would
@@ -820,7 +826,8 @@ class RelayClient:
             # nothing — and never hand the task to the consumer again. Silently
             # dropping it instead would leave the lease to expire and the task
             # to come back for a third time.
-            self.journal.record_result(wire_id, {"id": wire_id, "body": NO_SEND})
+            self.journal.record_result(
+                wire_id, {"id": wire_id, "body": NO_SEND, "no_send": True})
             log.info("task %s was already answered — re-completing the lease, "
                      "not re-executing (attempt %s)", wire_id, task.attempt)
             return 0
@@ -1085,8 +1092,17 @@ class RelayClient:
         # is H5's failure at one remove: an empty message in the room. The lease
         # still has to be completed, so it is completed the way a deliberate
         # silence is — recorded, delivered to nobody.
-        self._record_result(
-            wire_id, {"id": wire_id, "body": prepared.body or NO_SEND})
+        payload: Dict[str, Any] = {"id": wire_id, "body": prepared.body or NO_SEND}
+        if prepared.skip or not prepared.body:
+            # The flag *and* the marker in the body. Two clients have been
+            # completing skipped leases against this broker for a year: sutando
+            # sends `no_send: true` and trusts the flag, this one sent the
+            # marker and trusted the broker to read it, and neither belief has
+            # ever been tested against the other. Sending both is the only
+            # variant that is correct whichever one the broker actually honors,
+            # and it costs a boolean.
+            payload["no_send"] = True
+        self._record_result(wire_id, payload)
         return prepared
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:
@@ -1274,6 +1290,8 @@ class RelayClient:
             "inflight": self.journal.inflight(),
             "capabilities": list(self.capabilities),
         }
+        if self.provider:
+            payload["provider"] = self.provider
         presence_status, presence_step = self._presence
         if presence_status is not None:
             payload["status"] = presence_status

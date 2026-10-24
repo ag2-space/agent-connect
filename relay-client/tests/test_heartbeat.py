@@ -79,6 +79,9 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check("status" not in beat and "step" not in beat,
           "presence fields a status-less client does not know are OMITTED — a "
           "null would clobber the broker's last-known presence (E1)")
+    check("provider" not in beat,
+          "and so is `provider`, for the same reason: a client that answers "
+          "for no named surface must not overwrite the one the broker recorded")
 
     # --- E2: inflight is the journal, not a counter
     broker.on("GET", "/v1/tasks", json={"tasks": [wire_task("task-1"), wire_task("task-2")]})
@@ -256,6 +259,19 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     except ValueError as exc:
         refused = exc
     check(refused is not None, "an id that is not a wire slug is refused (F8)")
+
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    named = client_for(broker, tmp, provider="ag2space",
+                       client_name="sutando-gateway-client")
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    named.heartbeat()
+    beat = broker.took("POST", "/v1/heartbeat")[0].json
+    check(beat["provider"] == "ag2space",
+          "a client that names its surface says so on the heartbeat — sutando "
+          "has sent this field since before this library existed, and a "
+          "migration that dropped it would be a silent telemetry regression")
+    check(beat["client"] == "sutando-gateway-client",
+          "under its own client name, not this package's")
 
 print("\n" + ("PASS — heartbeat green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

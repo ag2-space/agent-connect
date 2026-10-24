@@ -27,10 +27,13 @@ this is where a wire dict becomes a `Task`:
 broker's attestation and this library passes them across the seam unchanged —
 the trust *mapping* is the consumer's, and the two consumers of this package
 answer it differently on purpose (agent-connect honors the attestation per its
-ADR 0003; sutando's shim ignores the wire tier by local policy). A library that
-mapped the tier itself would have to pick one of them and break the other. The
-value's *shape* is bounded — a str, control characters removed, length-capped —
-which changes no legitimate value and keeps an attacker-shaped one small.
+ADR 0003; sutando's shim honors it too but caps it against the host owner's
+per-sender map, which can re-tier a sender downward and never upward). A library
+that mapped the tier itself would have to pick one of them and break the other,
+and the same reasoning applies to every enrichment field `Task` carries: they
+cross this seam as data. The value's *shape* is bounded — a str, control
+characters removed, length-capped — which changes no legitimate value and keeps
+an attacker-shaped one small.
 
 **So are the addressing facts a shared room adds.** `addressed_to`,
 `reply_to_sender`, `room_members` and `room_member_count` are the broker's
@@ -40,6 +43,14 @@ by nobody here. Which of them means "stand down" is the consumer's reading. The
 roster arrives in either of the two shapes the broker has been seen to send it
 in, a list of mxids or the capped `"@a:x, @b:x (+3 more)"` string, and is
 delivered as the mxids it names in both.
+
+**And so is the rest of what the broker enriches a task with.** `session_scope`,
+`source`, `interaction_type`, `platform_card`, `thread_root` and
+`source_room_id` are fields a consumer (sutando's task files) has serialized
+since before this package existed; a library that dropped them would make
+migrating onto it a quiet loss of context that no test on either side would
+catch. Carried, never interpreted: no vocabulary is enforced, no default is
+substituted, nothing is gated on them.
 """
 from __future__ import annotations
 
@@ -81,8 +92,24 @@ MAX_TIER = 64
 #: The broker caps the roster it sends at ten; this bounds what a broker that
 #: did not would make the client hold.
 MAX_MEMBERS = 64
+#: A wire counter's ceiling — the re-serve count, the room's size. The digit
+#: width of `_COUNT_RE` and this bound say the same number on purpose, so there
+#: is no value one accepts and the other refuses.
+MAX_COUNT = 10 ** 6
+
+#: The five keys a platform card is made of. All five or it is not a card — a
+#: partial one is a pointer with a missing signature, and the consumer that
+#: re-serializes it (sutando writes it as a one-line JSON header) would be
+#: publishing an unverifiable claim in a field that exists to be verifiable.
+PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+#: A count exactly as the wire spells it: ASCII digits, bounded, nothing
+#: around them. Not `str.isdigit()`, which is True for `"\u00b2"` and raises
+#: inside `int()`; and no stripping, because the writer pads nothing and a
+#: padded value is a shape this client does not know.
+_COUNT_RE = re.compile(r"[0-9]{1,6}")
 
 
 def _text(value: Any, limit: int = MAX_SHORT, keep_newlines: bool = False) -> str:
@@ -181,6 +208,10 @@ class Task:
         "reply_to_me", "reply_to_sender", "addressed_to", "room_members",
         "room_member_count", "source_message_id", "attempt",
         "metadata_stripped", "attachments",
+        # Context the broker enriches a task with. Carried, never interpreted:
+        # see the block comment in `__init__` below.
+        "session_scope", "source", "interaction_type", "platform_card",
+        "thread_root", "source_room_id",
     )
 
     def __init__(
@@ -207,6 +238,12 @@ class Task:
         addressed_to: str = "",
         room_members: Tuple = (),
         room_member_count: int = 0,
+        session_scope: str = "",
+        source: str = "",
+        interaction_type: str = "",
+        platform_card: Optional[Mapping[str, str]] = None,
+        thread_root: str = "",
+        source_room_id: str = "",
     ):
         self.id = id
         #: The message text, metadata blocks removed (G2).
@@ -257,6 +294,46 @@ class Task:
         #: `parse_task` reads the wire, and the wire has no attachment field at
         #: all. See `media.py`.
         self.attachments = tuple(attachments)
+
+        # --- context the broker enriches a task with ----------------------
+        #
+        # Fields this library carries and has no opinion about. They are here
+        # because a consumer already serializes them into local state
+        # (sutando's task files, since long before this package existed), and a
+        # library that dropped them would make migrating onto it a quiet loss of
+        # context that no test on either side would catch.
+        #
+        # Carried, never interpreted: no vocabulary is enforced, no default is
+        # substituted, no field gates anything. `interaction_type` in particular
+        # has a whitelist — in the *consumer*, where the policy belongs, for the
+        # same reason `access_tier` is passed across verbatim.
+        #
+        # `""` means "the broker did not send it", which is exactly the test a
+        # consumer applies before writing a header, so absence survives the trip
+        # rather than turning into an empty header. `platform_card` says the
+        # same with `None`, because `{}` is a real (if useless) mapping.
+
+        #: `"room"` scopes the task to a room session; anything else is the
+        #: main-session path. The value, not the decision.
+        self.session_scope = session_scope
+        #: Which surface the task came from. A consumer with its own default
+        #: applies it; this library has none to apply.
+        self.source = source
+        #: `message`, `realtime_audio`, … — the broker's word for what this is.
+        self.interaction_type = interaction_type
+        #: The signed platform-metadata pointer: all five of
+        #: `PLATFORM_CARD_KEYS`, or `None`. Never partial — see the constant.
+        self.platform_card = platform_card
+        #: The thread the message was posted in, as the root event's id, and
+        #: the room that root lives in. Membership, distinct from the reply
+        #: fact: without it a consumer cannot tell an in-thread ask from a
+        #: top-level one, and every answer it writes leaves the thread. The
+        #: room travels beside the root because an event id cannot prove its
+        #: own room. Ingress only — the broker inherits the route by task id,
+        #: so a consumer that echoed these back could name a thread it was not
+        #: asked in.
+        self.thread_root = thread_root
+        self.source_room_id = source_room_id
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<Task {self.id} room={self.room_id} tier={self.access_tier!r}>"
@@ -319,15 +396,54 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
                                 or raw.get("source_event_id")),
         attempt=_count(raw.get("attempt")),
         metadata_stripped=stripped,
+        session_scope=_text(raw.get("session_scope")),
+        source=_text(raw.get("source")),
+        interaction_type=_text(raw.get("interaction_type")),
+        platform_card=_platform_card(raw.get("platform_card")),
+        thread_root=_text(raw.get("thread_root")),
+        source_room_id=_text(raw.get("source_room_id")),
     )
 
 
 def _count(value: Any) -> int:
     """A wire counter — the re-serve count, the room's size — as a non-negative
-    int; anything else is 0. A bool is not a count, and neither is `"3"`."""
+    int; anything else is 0. A bool is not a count: `True` is `1` to Python and
+    nothing to a room.
+
+    A plain decimal string is a count. The intake that enriches a task writes
+    the room's size as `str(len(members))` — every live task carries the total
+    as text — so int-only reading dropped the field for all of them, silently,
+    which is the loss carrying it here exists to prevent. Only that shape: a
+    sign, a fraction, an exponent or surrounding whitespace is refused, the
+    same as any other value the broker did not send.
+    """
+    if isinstance(value, str) and _COUNT_RE.fullmatch(value):
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
-    return value if 0 <= value < 10 ** 6 else 0
+    return value if 0 <= value < MAX_COUNT else 0
+
+
+def _platform_card(value: Any) -> Optional[Mapping[str, str]]:
+    """The signed metadata pointer, all five keys or `None`.
+
+    Every value is taken as a bounded string and any extra key is dropped, so
+    what comes out is the shape a consumer can re-serialize without deciding
+    anything: a partial card, a card with a non-string `sig`, or a card with a
+    sixth field somebody hoped would be passed through, all read as absent or
+    are trimmed back to the five. The card is *not* verified here — this library
+    has no key material and inventing a verdict would be worse than carrying the
+    claim across for something that does.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    card = {}
+    for key in PLATFORM_CARD_KEYS:
+        held = value.get(key)
+        if not isinstance(held, str) or not held.strip():
+            return None
+        card[key] = _text(held)
+    return card
 
 
 def _members(value: Any) -> Tuple[str, ...]:
