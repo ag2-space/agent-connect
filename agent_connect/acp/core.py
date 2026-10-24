@@ -28,6 +28,8 @@ when it ended this repository's `dependencies = []` policy.
 from __future__ import annotations
 
 import asyncio
+import sys
+import contextlib
 import os
 import warnings
 from collections import deque
@@ -73,6 +75,15 @@ class SessionResumeRefused(AcpError):
 
     A Session that cannot be resumed costs context, not an error: the caller is
     expected to open a fresh one and say so.
+    """
+
+
+class AcpDialFailed(AcpError):
+    """The ACP Agent behind a URL could not be reached, or refused the bearer.
+
+    Its own class for the same reason `AcpCommandMissing` is: the caller answers
+    it with connection advice, and it must never be mistaken for a Turn that ran
+    and failed. Nothing is ever spawned in its place.
     """
 
 
@@ -177,8 +188,20 @@ class TurnResult:
     updates: list = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class Notification:
+    """Something the ACP Agent said on its own, outside any Turn: an extension
+    notification (`_<method>`), carried as the method without its underscore and
+    the params as sent. The agent decides what they mean; this module only
+    delivers them."""
+
+    method: str
+    params: dict
+
+
 PermissionHandler = Callable[[PermissionRequest], Any]
 UpdateHandler = Callable[[Update], Any]
+NotificationHandler = Callable[[Notification], Any]
 
 
 def reject_all(request: PermissionRequest) -> None:
@@ -239,6 +262,11 @@ class _ClientCallbacks(acp.Client):
             )
         )
 
+    async def ext_notification(self, method: str, params: Any) -> None:
+        await self._owner._on_notification_received(
+            Notification(method=method, params=_as_dict(params))
+        )
+
     async def request_permission(
         self, session_id: str, tool_call: Any, options: Any, **kwargs: Any
     ) -> dict:
@@ -253,27 +281,121 @@ class _ClientCallbacks(acp.Client):
         return {"outcome": {"outcome": "selected", "optionId": option_id}}
 
 
-class AcpClient:
-    """A live connection to one ACP Agent process.
+class _ProcessLink:
+    """A spawned ACP Agent: the Client's original and only transport.
 
-    One instance owns one child process and the Sessions opened on it. Methods
-    map onto the protocol; the shapes crossing the boundary are ours.
+    Death is observable directly — the process object resolves when it exits —
+    so `death()` returns something to race the call against.
+    """
+
+    def __init__(self, process: Any, stderr: deque):
+        self._process = process
+        self._stderr = stderr
+
+    @property
+    def alive(self) -> bool:
+        return self._process.returncode is None
+
+    def death(self) -> Optional[Awaitable]:
+        return asyncio.ensure_future(self._process.wait())
+
+    def detail(self) -> str:
+        return "".join(self._stderr)
+
+    async def gone(self) -> str:
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+        return (
+            "the ACP Agent exited "
+            f"(code {self._process.returncode}){_suffix(self.detail())}"
+        )
+
+    async def aclose(self) -> None:
+        if self._process.returncode is None:
+            self._process.terminate()
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self._process.kill()
+                await self._process.wait()
+
+
+class _SocketLink:
+    """A dialled ACP Agent, reached over a WebSocket.
+
+    No death to race: the SDK's receive loop rejects every pending request with
+    `ConnectionError` when the transport reaches EOF, so a dead socket arrives
+    as a failed call rather than as a separate event. `death()` says so by
+    returning `None`.
+
+    The close code and reason are this transport's answer to the stderr tail,
+    and they live on the library's connection object rather than on the
+    `Transport` the SDK hands back. Read defensively: a renamed attribute must
+    cost a vaguer sentence, never an exception on the failure path.
+    """
+
+    def __init__(self, transport: Any):
+        self._transport = transport
+        self._closed = False
+
+    @property
+    def alive(self) -> bool:
+        # Two ways for this link to be dead, and only one of them is ours.
+        # `_closed` is our own `aclose()`; the peer's close lands on the
+        # connection object as a close code, in the same place `detail()`
+        # reads it from — so a link that can already *say* "close 1006" must
+        # not also say it is alive. Read the same defensive way: a renamed
+        # attribute costs "alive", never a raise.
+        ws = getattr(self._transport, "_ws", None)
+        return not self._closed and getattr(ws, "close_code", None) is None
+
+    def death(self) -> Optional[Awaitable]:
+        return None
+
+    def detail(self) -> str:
+        ws = getattr(self._transport, "_ws", None)
+        code = getattr(ws, "close_code", None)
+        reason = (getattr(ws, "close_reason", None) or "").strip()
+        if code is None and not reason:
+            return ""
+        return f"close {code}{': ' + reason if reason else ''}"
+
+    async def gone(self) -> str:
+        detail = self.detail()
+        return "the connection to the ACP Agent closed" + (
+            f" ({detail})" if detail else ""
+        )
+
+    async def aclose(self) -> None:
+        self._closed = True
+        with contextlib.suppress(Exception):
+            await self._transport.close()
+
+
+class AcpClient:
+    """A live connection to one ACP Agent.
+
+    One instance owns one link — a spawned process or a dialled socket — and the
+    Sessions opened over it. Methods map onto the protocol; the shapes crossing
+    the boundary are ours.
     """
 
     def __init__(
         self,
-        process: asyncio.subprocess.Process,
+        link: Any,
         connection: Any,
         *,
         on_update: Optional[UpdateHandler] = None,
         permission_handler: Optional[PermissionHandler] = None,
-        stderr_tail: Optional[deque] = None,
+        on_notification: Optional[NotificationHandler] = None,
     ):
-        self._process = process
+        self._link = link
         self._connection = connection
         self._on_update = on_update
         self._permission_handler = permission_handler or reject_all
-        self._stderr = stderr_tail if stderr_tail is not None else deque(maxlen=200)
+        self._on_notification = on_notification
         self._turn_updates: Optional[list] = None
         self.agent: Optional[AgentDescription] = None
 
@@ -289,6 +411,7 @@ class AcpClient:
         env: Optional[dict] = None,
         on_update: Optional[UpdateHandler] = None,
         permission_handler: Optional[PermissionHandler] = None,
+        on_notification: Optional[NotificationHandler] = None,
     ):
         """Start an ACP Agent and hold a connection to it for the block.
 
@@ -317,11 +440,11 @@ class AcpClient:
         stderr_tail: deque = deque(maxlen=200)
         drain = asyncio.ensure_future(_drain(process.stderr, stderr_tail))
         client = cls(
-            process,
+            _ProcessLink(process, stderr_tail),
             None,
             on_update=on_update,
             permission_handler=permission_handler,
-            stderr_tail=stderr_tail,
+            on_notification=on_notification,
         )
         client._connection = acp.connect_to_agent(
             _ClientCallbacks(client), process.stdin, process.stdout
@@ -332,31 +455,76 @@ class AcpClient:
             drain.cancel()
             await client.close()
 
+    @classmethod
+    @asynccontextmanager
+    async def dial(
+        cls,
+        url: str,
+        *,
+        token: Optional[str] = None,
+        cookie_store: Any = None,
+        on_update: Optional[UpdateHandler] = None,
+        permission_handler: Optional[PermissionHandler] = None,
+        on_notification: Optional[NotificationHandler] = None,
+    ):
+        """Connect to an ACP Agent already running behind `url`.
+
+        The bearer travels as an `Authorization` header on the WebSocket
+        handshake, which is where a door that authenticates can refuse it before
+        any ACP frame exists. It is passed per dial rather than held, so a
+        rotated token is on the next dial without rebuilding anything.
+
+        `cookie_store` is the caller's, reused across dials on purpose: the
+        remote-transport RFD has servers set affinity cookies on the upgrade,
+        and a fresh store each time silently loses that affinity behind a load
+        balancer.
+        """
+        transport = await _websocket_transport(url, token=token, cookie_store=cookie_store)
+        client = cls(
+            _SocketLink(transport),
+            None,
+            on_update=on_update,
+            permission_handler=permission_handler,
+            on_notification=on_notification,
+        )
+        client._connection = acp.connect_to_agent(_ClientCallbacks(client), transport)
+        try:
+            yield client
+        finally:
+            await client.close()
+
     async def close(self) -> None:
-        if self._process.returncode is None:
-            self._process.terminate()
-            try:
-                await asyncio.wait_for(self._process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                self._process.kill()
-                await self._process.wait()
+        await self._link.aclose()
 
     @property
     def alive(self) -> bool:
-        return self._process.returncode is None
+        return self._link.alive
 
     def stderr_tail(self) -> str:
-        """The ACP Agent's last lines of stderr — the only clue when it dies."""
-        return "".join(self._stderr)
+        """What this link can say about a failure — a stderr tail, or a close.
+
+        Named for the stdio case it was born in. A socket has no stderr, so it
+        answers with its close code and reason instead.
+        """
+        return self._link.detail()
 
     # -- protocol ---------------------------------------------------------
 
-    async def initialize(self) -> AgentDescription:
-        """Negotiate the protocol and learn what this ACP Agent can do."""
+    async def initialize(self, meta: Optional[dict] = None) -> AgentDescription:
+        """Negotiate the protocol and learn what this ACP Agent can do.
+
+        `meta` is the request's `_meta`, the protocol's extension slot: where a
+        Client says what the protocol has no field for — that it is ready to
+        receive what the agent sends unasked, for one (`link.receiver_meta`).
+        A Client that says nothing is, to the agent, a probe: it is told nothing
+        it would have to deliver, and that is the right outcome for a connection
+        that has nowhere to deliver it.
+        """
         response = await self._guard(
             self._connection.initialize(
                 protocol_version=PROTOCOL_VERSION,
                 client_capabilities=CLIENT_CAPABILITIES,
+                **(meta or {}),
             )
         )
         info = _as_dict(getattr(response, "agentInfo", None))
@@ -370,15 +538,19 @@ class AcpClient:
         return self.agent
 
     async def new_session(
-        self, cwd: str, mcp_servers: Optional[list] = None
+        self, cwd: str, mcp_servers: Optional[list] = None, meta: Optional[dict] = None
     ) -> str:
         """Open a Session rooted at `cwd`, and return its identifier.
 
         The working directory is fixed here because that is where the protocol
-        puts it — there is no per-prompt working directory to be had.
+        puts it — there is no per-prompt working directory to be had. `meta` is
+        the request's `_meta`: the protocol's extension slot, where an
+        application says things like where this Session's messages belong.
         """
         response = await self._guard(
-            self._connection.new_session(cwd=cwd, mcp_servers=mcp_servers or [])
+            self._connection.new_session(
+                cwd=cwd, mcp_servers=mcp_servers or [], **(meta or {})
+            )
         )
         return response.sessionId
 
@@ -454,10 +626,14 @@ class AcpClient:
         on a response that will never come.
         """
         call = asyncio.ensure_future(_await(awaitable))
-        death = asyncio.ensure_future(self._process.wait())
+        # `None` from a link that cannot observe its own death separately: the
+        # SDK rejects every pending request with `ConnectionError` at EOF, so
+        # the socket case arrives through `call` and needs nothing to race.
+        death = self._link.death()
         try:
             done, _ = await asyncio.wait(
-                {call, death}, return_when=asyncio.FIRST_COMPLETED
+                {call} if death is None else {call, death},
+                return_when=asyncio.FIRST_COMPLETED,
             )
             if call in done:
                 try:
@@ -474,19 +650,29 @@ class AcpClient:
             raise await self._gone()
         finally:
             for pending in (call, death):
-                if not pending.done():
+                if pending is not None and not pending.done():
                     pending.cancel()
 
     async def _gone(self) -> AcpAgentGone:
-        """Describe the death of the ACP Agent, exit code and stderr included."""
+        """Describe the end of the ACP Agent, in whatever terms its link has."""
+        return AcpAgentGone(await self._link.gone())
+
+    async def _on_notification_received(self, notification: Notification) -> None:
+        """An extension notification from the agent. A handler that raises must
+        not take the connection down with it: the wire is the agent's, the
+        failure is ours, and it is reported rather than propagated."""
+        if self._on_notification is None:
+            # Said, not swallowed: a notification reaching a connection with no
+            # handler is a message lost, and the one way to notice is this line.
+            print(f"agent-connect: dropped a notification nobody was listening for: "
+                  f"{notification.method}", file=sys.stderr)
+            return
         try:
-            await asyncio.wait_for(self._process.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            pass
-        return AcpAgentGone(
-            "the ACP Agent exited "
-            f"(code {self._process.returncode}){_suffix(self.stderr_tail())}"
-        )
+            result = self._on_notification(notification)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 — reported, never fatal
+            print(f"agent-connect: notification handler failed: {exc}", file=sys.stderr)
 
     async def _on_update_received(self, update: Update) -> None:
         if self._turn_updates is not None:
@@ -505,6 +691,52 @@ class AcpClient:
 
 async def _await(value: Any) -> Any:
     return await value
+
+
+#: Answered when the SDK is installed without its optional transport extra.
+WS_EXTRA_ADVICE = (
+    "the ACP SDK's WebSocket transport is not installed. Install the extra:\n"
+    "    pip install 'agent-client-protocol[http]'"
+)
+
+
+def new_cookie_store() -> Any:
+    """A cookie store to hand back to `dial`, or `None` if the extra is absent.
+
+    Affinity cookies matter across *dials*, not within one, so the store belongs
+    to whoever dials repeatedly rather than to a connection.
+    """
+    try:
+        from acp.ws.client import MemoryAcpCookieStore
+    except ImportError:
+        return None
+    return MemoryAcpCookieStore()
+
+
+async def _websocket_transport(
+    url: str, *, token: Optional[str] = None, cookie_store: Any = None
+) -> Any:
+    """Dial `url` and return the SDK `Transport` for it."""
+    try:
+        from acp.ws.client import create_websocket_stream
+    except ImportError as exc:
+        raise AcpDialFailed(WS_EXTRA_ADVICE) from exc
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    try:
+        return await create_websocket_stream(
+            url, headers=headers, cookie_store=cookie_store
+        )
+    except Exception as exc:  # noqa: BLE001 — every dial failure is one failure
+        raise AcpDialFailed(_dial_failure(url, exc)) from exc
+
+
+def _dial_failure(url: str, exc: Exception) -> str:
+    """Why a dial failed, in the terms the operator can act on."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (401, 403):
+        # The setting's name belongs to the layer that reads it, not here.
+        return f"the ACP Agent at {url} refused the bearer token (HTTP {status})"
+    return f"could not reach the ACP Agent at {url}: {exc}"
 
 
 async def _drain(stream: Any, sink: deque) -> None:

@@ -374,6 +374,128 @@ grep -q '^AGENT_CONNECT_TOKEN="T2"$' "$ACPCFG" \
   && ok "while the managed settings still update around it" \
   || bad "re-run did not update the token"
 
+# 9c) --acp-url: the dialled door. Written through with its token, kept across a
+#     re-run the same way a command is, and refused outright beside one.
+: > "$NPM_LOG"
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:8802/acp" \
+         --acp-token "listener-secret" --no-start 2>&1) \
+  || bad "acp --acp-url dry-run failed"
+grep -q '^AGENT_CONNECT_ACP_URL="ws://127.0.0.1:8802/acp"$' "$ACPCFG" \
+  && ok "--acp-url is written to config.env" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--acp-url not written"; }
+grep -q '^AGENT_CONNECT_ACP_TOKEN="listener-secret"$' "$ACPCFG" \
+  && ok "and its bearer goes with it, into the 0600 file that already holds one" \
+  || bad "--acp-token not written"
+
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T3 --adapter acp --no-start 2>&1) \
+  || bad "acp re-run without --acp-url failed"
+grep -q '^AGENT_CONNECT_ACP_URL="ws://127.0.0.1:8802/acp"$' "$ACPCFG" \
+  && ok "a re-run WITHOUT --acp-url keeps the dialled door" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a re-run without --acp-url wiped the URL"; }
+
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
+     --acp-url "ws://127.0.0.1:8802/acp" --acp-command "my-agent --acp" \
+     --no-start >/dev/null 2>&1; then
+  bad "--acp-url beside --acp-command was accepted; they name two different agents"
+else
+  ok "--acp-url and --acp-command together are refused, not silently resolved"
+fi
+
+# 9d) The transition either way must leave exactly ONE endpoint behind. Both
+#     settings in one config is a config the worker refuses to start on, so an
+#     installer that leaves the old one has produced a file that will not run.
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:8802/acp" \
+     --acp-token "sec" --no-start >/dev/null 2>&1 || bad "url install failed"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-command "my-agent --acp" \
+     --no-start >/dev/null 2>&1 || bad "url→command install failed"
+grep -q '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" \
+  && ! grep -q '^AGENT_CONNECT_ACP_URL=' "$ACPCFG" \
+  && ! grep -q '^AGENT_CONNECT_ACP_TOKEN=' "$ACPCFG" \
+  && ok "switching from a dialled door to a command removes the URL and its token" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "url→command left both endpoints set"; }
+
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:9999/acp" \
+     --acp-token "s2" --no-start >/dev/null 2>&1 || bad "command→url install failed"
+grep -q '^AGENT_CONNECT_ACP_URL="ws://127.0.0.1:9999/acp"$' "$ACPCFG" \
+  && ! grep -q '^AGENT_CONNECT_ACP_COMMAND=' "$ACPCFG" \
+  && ok "and switching back to a dialled door removes the command" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "command→url left both endpoints set"; }
+
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-agent claude --no-start >/dev/null 2>&1 \
+  || bad "url→preset install failed"
+! grep -q '^AGENT_CONNECT_ACP_URL=' "$ACPCFG" \
+  && ok "and naming a preset — which means spawning — removes it too" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "url→preset left the URL set"; }
+
+# 9e) The extra has to reach the environment the worker runs in: it is installed
+#     into pipx or a private venv, which a later plain `pip install` never sees.
+: > "$NPM_LOG"
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+: > "$PIPX_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:8802/acp" \
+         --acp-token "sec" --no-start 2>&1) || bad "url install failed"
+grep -q 'ag2-agent-connect\[websocket\]' "$PIPX_LOG" \
+  && ok "a dialled install asks pipx for the [websocket] extra, in the worker's own environment" \
+  || { sed 's/^/    /' "$PIPX_LOG"; bad "the websocket extra was not on the install spec"; }
+
+# And a spawning install must NOT drag the extra in.
+: > "$PIPX_LOG"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-agent gemini --no-start >/dev/null 2>&1 \
+  || bad "preset install failed"
+grep -q 'websocket' "$PIPX_LOG" \
+  && { sed 's/^/    /' "$PIPX_LOG"; bad "a spawning install pulled in the websocket extra"; } \
+  || ok "and a spawning install does not pull it in"
+grep -q "claude-agent-acp" "$NPM_LOG" \
+  && { sed 's/^/    /' "$NPM_LOG"; bad "a bridge was installed for an agent that is only dialled"; } \
+  || ok "and no bridge is fetched, because nothing is spawned"
+
+# 9f) Rotating the bearer on its own. A re-run that supplies only a new token
+#     must replace the stored one — leaving the old bearer would restart the
+#     worker with a credential the operator has just revoked.
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-url "ws://127.0.0.1:8802/acp" \
+     --acp-token "OLD" --no-start >/dev/null 2>&1 || bad "url install failed"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --acp-token "ROTATED" --no-start >/dev/null 2>&1 \
+  || bad "token-only rotation failed"
+grep -q '^AGENT_CONNECT_ACP_TOKEN="ROTATED"$' "$ACPCFG" \
+  && ok "--acp-token on its own replaces the stored bearer" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a token-only re-run kept the old bearer"; }
+grep -q '^AGENT_CONNECT_ACP_URL="ws://127.0.0.1:8802/acp"$' "$ACPCFG" \
+  && ok "and leaves the door it belongs to exactly as it was" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a token-only re-run disturbed the URL"; }
+
+# And a plain re-run — no ACP flags at all — still keeps both.
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  sh "$SCRIPT" --token T4 --adapter acp --no-start >/dev/null 2>&1 \
+  || bad "plain acp re-run failed"
+grep -q '^AGENT_CONNECT_ACP_TOKEN="ROTATED"$' "$ACPCFG" \
+  && grep -q '^AGENT_CONNECT_ACP_URL=' "$ACPCFG" \
+  && ok "a re-run with no ACP flags keeps the dialled door and its bearer" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a plain re-run lost the dialled settings"; }
+
+# The documented interface is the flag OR the environment variable, so a bearer
+# rotated through the environment must replace the stored one too. Reading only
+# the flag left the revoked credential in the file.
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" TMP_PIPX_LOG="$PIPX_LOG" \
+  AGENT_CONNECT_ACP_TOKEN="FROM_ENV" \
+  sh "$SCRIPT" --token T --adapter acp --no-start >/dev/null 2>&1 \
+  || bad "env-var token rotation failed"
+grep -q '^AGENT_CONNECT_ACP_TOKEN="FROM_ENV"$' "$ACPCFG" \
+  && ok "a bearer rotated through AGENT_CONNECT_ACP_TOKEN replaces the stored one" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "an env-supplied token did not replace the stored bearer"; }
+
 # A run that DOES supply one rewrites it, exactly once.
 out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
       sh "$SCRIPT" --token T3 --adapter acp --acp-command "other-agent --acp" --no-start 2>&1) \

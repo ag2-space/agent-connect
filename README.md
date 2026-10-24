@@ -225,6 +225,54 @@ through major versions fast, so the installer never fetches `@latest`. The pin
 lives in two places that `install.test.sh` forces to agree: `ACP_BRIDGE_SPEC` in
 `install.sh` and `BRIDGE_VERSION` in `agent_connect/adapters/acp.py`.
 
+### Dialling an agent that is already running
+
+The adapter can also reach an ACP agent that is **already up**, over a WebSocket,
+instead of starting one per message:
+
+```bash
+./install.sh --token <token> --adapter acp \
+  --acp-url ws://127.0.0.1:8802/acp --acp-token <the listener's token>
+pip install 'ag2-agent-connect[websocket]'   # the SDK's transport extra
+```
+
+Why you would: spawning is a cold start per room message. An agent whose
+entrypoint builds a whole runtime — a gateway, MCP servers — pays for all of it
+on every message and throws it away after one turn. An agent that hosts its
+listener inside the process serving its own UI can also stream a turn into a page
+you already have open; over stdio that turn happens inside a subprocess your UI
+has no connection to.
+
+Four things worth knowing before you use it:
+
+- **A URL and a command are refused together**, rather than one winning. They name
+  two different agents, and a worker that guessed would answer your rooms as one
+  nobody picked. Unset whichever you do not want.
+- **A dial that fails stays failed.** Nothing is spawned to cover for a door that
+  is down — that would substitute a different agent exactly when nobody is looking.
+- **Loopback unless you say otherwise, and `wss://` beyond it.** The permission
+  policy that guards file operations resolves paths on *this* machine; against an
+  agent on another host its answers are guesses shaped like a guarantee.
+  `AGENT_CONNECT_ACP_ALLOW_REMOTE=1` is how you accept that, deliberately. It does
+  **not** cover putting the credential on the wire: the bearer travels on the
+  handshake, so a non-loopback URL must be `wss://`. Plaintext `ws://` stays fine
+  on loopback, where nothing leaves the machine. Credentials written into the URL
+  itself are refused — the bearer belongs in `AGENT_CONNECT_ACP_TOKEN`.
+- **The working directory is the remote's.** `session/new` requires one, so the
+  worker always sends a value: its own directory, which on loopback is a real
+  path on the same filesystem, or `AGENT_CONNECT_ACP_REMOTE_CWD` when you are
+  dialling another host and this machine's paths mean nothing there. A session
+  is retired when *that* directory changes, not when the worker's own does — and
+  the permission policy judges the same directory the session was opened in.
+- **A turn that overruns can only be asked to stop.** `session/cancel` is sent
+  first, as it always was. If the agent ignores it, a spawned agent's process is
+  ended; a dialled one is not yours to end, so the connection is dropped and the
+  room is told it may still be working.
+
+The bearer travels on the WebSocket handshake, is read fresh on every dial (so
+rotating it needs no restart), and lives in the same `0600` config file as your
+relay token. See `docs/adr/0004` for the reasoning, including what this costs.
+
 ## The ladder: one message, from "on it" to the answer
 
 A request used to be met with silence until the answer arrived — sometimes ten
@@ -265,6 +313,24 @@ names.
 If the worker holds no relay token, or the relay refuses a room op, the answer
 travels the way it always did — as the task result the relay client posts. The
 ladder degrades; it never eats the answer.
+
+## What the agent says unasked comes back to the room (ACP)
+
+A dialled agent can speak first. AG2 Assistant runs scheduled tasks; one created from a room
+finishes hours later, and its outcome arrives as an ACP extension notification,
+`_ag2/notify`, which agent-connect posts to the room it names. Two things make that work and
+neither needs a setting:
+
+- every Session is opened with the room as its destination (`_meta["ag2/destination"]` on
+  `session/new`), so the agent knows where a Task created in it belongs;
+- a dialled agent gets a **listener link** — one standing dial the Worker keeps open, re-dialled
+  after a pause when it drops — so there is a client to deliver to between Turns. The agent
+  queues while there is none, so a Worker that was down gets what it missed on its next dial.
+
+Only a connection that can deliver asks for the queue: the link and a Turn's dial say so on
+`initialize` (`_meta["ag2/receive"] = true`), the startup preflight does not, and the agent
+flushes to the ones that asked. A spawned agent needs no link: it only exists during a Turn,
+whose own dial listens too. See `docs/adr/0005`.
 
 ## The agent remembers the conversation (ACP)
 
@@ -681,6 +747,8 @@ table.
 | `AGENT_CONNECT_REPO` | the working directory the agent operates in. Created for you when it is the default; a path under `~/Documents`, `~/Desktop` or `~/Downloads` is warned about, because macOS privacy protection turns agent file operations there into an unexplained "operation not permitted" | `~/agents` |
 | `AGENT_CONNECT_WORKSPACE` | workspace dir holding the relay client's state under `relay/`, the session map and the status file | `~/.agent-connect/workspace` |
 | `AGENT_CONNECT_STATUS_FILE` | the status file this worker owns (see the section above) | `<workspace>/status.json` |
+| `AGENT_CONNECT_HITL_WORKSPACE` | the Sutando workspace whose HITL store an ACP `request_permission` the Policy cannot allow is handed to (the owner answers on a chat card; the click is read back from `<workspace>/state/hitl/requirements/`). Unset = the seam is off and such a permission is refused | *(unset)* |
+| `AGENT_CONNECT_HITL_TIMEOUT` | seconds to wait for the owner's answer before the request is refused (a timeout is never an allow) | `600` |
 | `AGENT_CONNECT_STATUS_HEARTBEAT` | seconds between refreshes of the status file's `updated_at`, and the staleness window an observer reads out of it | `15.0` |
 | `AGENT_CONNECT_INSTANCE` | a name for this worker instance: carried into its status file so a supervisor watching several can tell them apart, and used to namespace the relay client's state under `<workspace>/relay/`. Letters, digits, `_` and `-`, at most 32 — a name outside that is refused rather than mangled, because two instances quietly sharing one sanitised name would share one journal | `default` |
 | `AGENT_CONNECT_POLL` | seconds one read of the relay client's task queue waits before the worker looks around. It paces nothing else: a task that arrives wakes the read immediately, and the long-poll cadence on the wire belongs to the relay client | `1.0` |
@@ -711,6 +779,10 @@ ACP adapter (see the section above):
 | --- | --- | --- |
 | `AGENT_CONNECT_ACP_AGENT` | preset naming the ACP agent to run: `claude`, `gemini` | *(unset)* |
 | `AGENT_CONNECT_ACP_COMMAND` | the ACP agent's command line, split as a shell would. **Overrides any preset**. `install.sh --acp-command` writes it; a re-run without that flag keeps it | *(unset)* |
+| `AGENT_CONNECT_ACP_URL` | an ACP agent **already running** behind a WebSocket URL, dialled instead of spawned (e.g. `ws://127.0.0.1:8802/acp`). Mutually exclusive with `AGENT_CONNECT_ACP_COMMAND` — setting both is refused rather than resolved, because they name two different agents. Needs the SDK's transport extra: `pip install 'agent-client-protocol[http]'` | *(unset)* |
+| `AGENT_CONNECT_ACP_TOKEN` | bearer for that URL's door, sent on the WebSocket handshake. Read at dial time, so rotating it needs no restart | *(unset)* |
+| `AGENT_CONNECT_ACP_REMOTE_CWD` | the directory a **dialled** agent opens its sessions in. `session/new` requires one, so something is always sent; unset means "this worker's own directory", which is correct on loopback and wrong across hosts | *(unset)* |
+| `AGENT_CONNECT_ACP_ALLOW_REMOTE` | `1` to allow `AGENT_CONNECT_ACP_URL` to name a host other than loopback. Off by default because the Permission Policy resolves paths on *this* machine: against another host its answers are guesses shaped like a guarantee. A non-loopback URL must also be `wss://` — this setting accepts the policy's uncertainty, not an unencrypted bearer | *(unset)* |
 | `AGENT_CONNECT_ACP_MODE` | session mode id to request. Left alone by default: every bridge's own default already routes permission requests to the worker, and mode ids are the agent's to name | *(unset)* |
 | `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK` | `1` to start even when the agent advertises authentication methods. The escape hatch for an agent whose `authMethods` mean something else | *(unset)* |
 | `AGENT_CONNECT_TURN_TIMEOUT` | seconds one turn may run before it is cancelled **through the protocol**, keeping whatever it produced. `0` waits forever | `600` |
