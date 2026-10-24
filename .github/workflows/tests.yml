@@ -166,8 +166,20 @@ jobs:
   installer:
     # Hermetic: it stubs pipx, npm and the installed bins onto PATH, so this
     # neither reaches the network nor installs anything.
-    name: install.sh
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: install.sh
+          - os: macos-latest
+            name: install.sh (macOS)
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
       - run: sh install.test.sh
+      - run: python3 tests/test_installer_instances.py

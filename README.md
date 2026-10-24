@@ -541,6 +541,76 @@ setting you added by hand survives a re-run of the one-liner.
 
 ## Running more than one agent on one machine
 
+Give each agent its own instance. The web setup flow passes the agent's full
+Matrix identity so the installer derives a stable name:
+
+```sh
+./install.sh --token '<gateway>|<agent-one-token>' --adapter codex --agent-id '@owner-codex-one.agent:example.org'
+./install.sh --token '<gateway>|<agent-two-token>' --adapter codex --agent-id '@owner-codex-two.agent:example.org'
+```
+
+Each gets its own private config, launcher, workspace, log and background
+service under `~/.agent-connect/instances/agent-<identity-hash>/`. The hash uses
+the full identity including its homeserver, not the token: reconnecting or
+rotating a token reuses that agent's instance. Codex and Claude can run beside
+each other in the same way. Two agents may use the same working repository;
+their connector state still lives in separate workspaces.
+
+For a manual install, `--instance codex-one` is an alternative to `--agent-id`.
+Names use 1–32 lowercase letters, digits, `_` or `-`. Reuse the same name when
+reconnecting that agent. Do not run the same agent credential in two instances.
+`AGENT_CONNECT_INSTANCE` is the environment default for the install location
+and service as well as the worker's status label. An explicit `--instance`
+overrides that default; `--agent-id` ignores it and derives the name from the
+identity instead. Passing both explicit flags is refused.
+
+Without either flag, the legacy single-agent location and service remain the
+default. Reinstalling there replaces that one connection. A named install leaves
+a different agent's legacy service alone. When the legacy service has the exact
+same credential, a normal install retires that service before starting the named
+one; its old config and workspace remain on disk. `--no-start` changes no service.
+Without launchd/systemd, stop the matching legacy worker before starting its
+replacement as a named instance.
+
+### Legacy migration cleanup
+
+Automatic migration can identify the legacy connection only by an exact
+credential match. If you rotated its token before reinstalling, the installer
+cannot tell that revoked token from another agent's credential: it leaves the
+legacy service alone and prints a cleanup note. That obsolete service can keep
+restarting with the revoked token until you stop it.
+
+After confirming the legacy default belongs to the agent you migrated, stop
+and disable **only that default service**. Keep it running if it belongs to
+another working agent. On macOS, unload it if it is currently loaded, then move
+its plist out of the login service list:
+
+```sh
+legacy_plist="$HOME/Library/LaunchAgents/space.ag2.agent-connect.plist"
+if launchctl print "gui/$(id -u)/space.ag2.agent-connect" >/dev/null 2>&1; then
+  launchctl unload "$legacy_plist" && mv "$legacy_plist" "$legacy_plist.retired"
+else
+  mv "$legacy_plist" "$legacy_plist.retired"
+fi
+```
+
+With systemd:
+
+```sh
+systemctl --user disable --now agent-connect.service
+```
+
+The named services have different names and remain running. The legacy config
+and workspace can stay on disk; removing the agent identity or its chat history
+is unnecessary.
+
+The broader installer work in [issue #32](https://github.com/ag2-space/agent-connect/issues/32)
+also requests refusing a different credential in a flagless legacy install and
+listing installed/online agents. Those remain follow-ups; flagless installs
+still replace the legacy connection, and this installer does not provide an
+agent inventory/status command. Use one of the selectors above for each agent.
+
+
 **The launch unit is one worker pointed at one config file.** That is the
 contract a supervisor builds on, and it is deliberately not a wire: what a
 supervisor should depend on is the unit, named by the config file it was given.
@@ -750,7 +820,7 @@ table.
 | `AGENT_CONNECT_HITL_WORKSPACE` | the Sutando workspace whose HITL store an ACP `request_permission` the Policy cannot allow is handed to (the owner answers on a chat card; the click is read back from `<workspace>/state/hitl/requirements/`). Unset = the seam is off and such a permission is refused | *(unset)* |
 | `AGENT_CONNECT_HITL_TIMEOUT` | seconds to wait for the owner's answer before the request is refused (a timeout is never an allow) | `600` |
 | `AGENT_CONNECT_STATUS_HEARTBEAT` | seconds between refreshes of the status file's `updated_at`, and the staleness window an observer reads out of it | `15.0` |
-| `AGENT_CONNECT_INSTANCE` | a name for this worker instance: carried into its status file so a supervisor watching several can tell them apart, and used to namespace the relay client's state under `<workspace>/relay/`. Letters, digits, `_` and `-`, at most 32 — a name outside that is refused rather than mangled, because two instances quietly sharing one sanitised name would share one journal | `default` |
+| `AGENT_CONNECT_INSTANCE` | a name for this worker instance: carried into its status file so a supervisor watching several can tell them apart, and used to namespace the relay client's state under `<workspace>/relay/`. Letters, digits, `_` and `-`, at most 32 — a name outside that is refused rather than mangled, because two instances quietly sharing one sanitised name would share one journal. The installer also uses it as the config/workspace/service location default and requires lowercase ASCII names; `--agent-id` overrides this environment default | `default` |
 | `AGENT_CONNECT_POLL` | seconds one read of the relay client's task queue waits before the worker looks around. It paces nothing else: a task that arrives wakes the read immediately, and the long-poll cadence on the wire belongs to the relay client | `1.0` |
 | `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` | how much of one attached file is read into a prompt. An attachment over this is reported in the room, never shrunk to fit. `0` means no limit | `10485760` (10 MB) |
 | `AGENT_CONNECT_EGRESS_ROOTS` | extra directories a file the agent produced may be sent to the room *from*, separated by `:`. The working directory (`AGENT_CONNECT_REPO`) is always one; this is for a worker whose agent writes somewhere else as well. Nothing outside these directories is ever uploaded, and the list is fixed when the worker starts | *(none)* |
