@@ -159,6 +159,27 @@ else:
                                     env=self.env, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
+    def test_agent_id_overrides_exported_instance_default(self):
+        identity = "@owner-codex.agent:example.org"
+        name = "agent-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+        # Even an invalid exported default is irrelevant to an explicit ID.
+        for exported in ["shell-default", "Codex", "../unused"]:
+            with self.subTest(exported=exported):
+                self.env["AGENT_CONNECT_INSTANCE"] = exported
+                self.install(agent_id=identity)
+                config = (self.directory(name) / "config.env").read_text()
+                self.assertIn(f'AGENT_CONNECT_INSTANCE="{name}"', config)
+        self.assertEqual([p.name for p in (self.home / ".agent-connect/instances").iterdir()], [name])
+        self.assertFalse((self.directory("default") / "config.env").exists())
+
+    def test_exported_instance_is_used_without_an_explicit_id(self):
+        self.env["AGENT_CONNECT_INSTANCE"] = "shell-default"
+        self.install()
+        self.assertTrue((self.directory("shell-default") / "config.env").exists())
+        self.install("explicit", "token-b")
+        self.assertIn('AGENT_CONNECT_TOKEN="token-b"',
+                      (self.directory("explicit") / "config.env").read_text())
+
     def test_launchd_only_reloads_selected_named_service(self):
         self.install(start=True)
         legacy = self.home / "Library/LaunchAgents/space.ag2.agent-connect.plist"
@@ -206,6 +227,38 @@ case "$1:$2" in unload:*/space.ag2.agent-connect.plist) exit 1 ;; esac
         self.assertNotIn("load " + str(self.home / "Library/LaunchAgents/space.ag2.agent-connect.first.plist"),
                          self.log.read_text())
         self.assertTrue((self.home / "Library/LaunchAgents/space.ag2.agent-connect.plist").exists())
+        self.assertFalse((self.home / "Library/LaunchAgents/space.ag2.agent-connect.first.plist").exists(),
+                         "failed migration left a second worker scheduled for the next login")
+
+    def test_failed_systemd_migration_does_not_leave_a_named_unit(self):
+        self.install(start=True, os_name="Linux")
+        self.write_bin("systemctl", '''#!/bin/sh
+printf "%s\\n" "$*" >> "$TEST_SERVICE_LOG"
+case "$*" in '--user disable --now agent-connect.service') exit 1 ;; esac
+''')
+        self.log.write_text("")
+        result = subprocess.run(["sh", str(ROOT / "install.sh"), "--token", "token-a",
+                                 "--instance", "first"], env={**self.env, "TEST_OS": "Linux"},
+                                capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("--user enable --now agent-connect-first.service", self.log.read_text())
+        units = self.home / ".config/systemd/user"
+        self.assertTrue((units / "agent-connect.service").exists())
+        self.assertFalse((units / "agent-connect-first.service").exists())
+
+    def test_different_legacy_credential_is_preserved_with_cleanup_guidance(self):
+        self.install(start=True)
+        legacy = self.home / "Library/LaunchAgents/space.ag2.agent-connect.plist"
+        original = legacy.read_bytes()
+        self.log.write_text("")
+        output = self.install("first", "rotated-token", start=True)
+        self.assertEqual(legacy.read_bytes(), original)
+        self.assertNotIn(str(legacy), self.log.read_text())
+        self.assertIn("legacy default", output)
+        self.assertIn("revoked", output)
+        self.assertIn("README", output)
+        self.assertNotIn("token-a", output)
+        self.assertNotIn("rotated-token", output)
 
     def test_systemd_uses_separate_units_and_restarts_on_reconnect(self):
         self.install(start=True, os_name="Linux")
@@ -225,6 +278,20 @@ case "$1:$2" in unload:*/space.ag2.agent-connect.plist) exit 1 ;; esac
                                          "--instance", name, "--no-start"], env=self.env,
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 2)
+        self.assertFalse((self.home / ".agent-connect").exists())
+
+    def test_instance_names_remain_ascii_in_utf8_locales(self):
+        available = subprocess.check_output(["locale", "-a"], text=True).splitlines()
+        locales = ["C"] + [loc for loc in available
+                           if loc.lower().startswith("en_us.") and "utf" in loc.lower()]
+        for loc in locales:
+            for name in ["Codex", "CODEX", "codéx", "codex١"]:
+                with self.subTest(locale=loc, name=name):
+                    result = subprocess.run(["sh", str(ROOT / "install.sh"), "--token", "test",
+                                             "--instance", name, "--no-start"],
+                                            env={**self.env, "LC_ALL": loc},
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertFalse((self.home / ".agent-connect").exists())
 
     def test_no_start_and_legacy_layout_remain_compatible(self):

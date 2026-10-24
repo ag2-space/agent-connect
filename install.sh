@@ -29,7 +29,8 @@
 #   --instance AGENT_CONNECT_INSTANCE  separate config, workspace and service
 #                                    [default: default, the legacy single-agent install]
 #   --agent-id                        derive a stable instance from the full Matrix id;
-#                                     use instead of --instance (survives token rotation)
+#                                     overrides AGENT_CONNECT_INSTANCE; cannot combine
+#                                     with --instance (survives token rotation)
 #   --no-start                       install only; print the run command, don't launch
 #
 # Retired: --sutando-workspace, which installed `ag2-sparrow` alone against a
@@ -53,7 +54,6 @@ INSTANCE="${AGENT_CONNECT_INSTANCE:-default}"
 AGENT_ID=""
 AGENT_ID_GIVEN=0
 INSTANCE_GIVEN=0
-[ -z "${AGENT_CONNECT_INSTANCE:-}" ] || INSTANCE_GIVEN=1
 ADAPTER="${AGENT_CONNECT_ADAPTER:-codex}"
 # Working dir default is ~/agents (NOT pwd): a pwd default silently bakes
 # wherever the user happened to run the installer into the service config —
@@ -150,18 +150,26 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# An explicit identity wins over an exported instance default. Only two
+# explicit selectors are ambiguous; a shell's default must not break the web
+# setup command or move that identity into the shell's instance directory.
+if [ "$AGENT_ID_GIVEN" -eq 1 ]; then
+  if [ "$INSTANCE_GIVEN" -eq 1 ]; then
+    echo 'install.sh: pass --agent-id or --instance, not both.' >&2
+    exit 2
+  fi
+  INSTANCE=default
+fi
+
 # Names become paths and service labels. Lowercase avoids aliases on the
 # case-insensitive filesystems macOS commonly uses; never sanitise two names
-# into one. Keep the Worker's 32-character instance bound.
+# into one. Spell out ASCII characters: [a-z] also matches capitals/accented
+# letters under macOS UTF-8 locales. Keep the Worker's 32-character bound.
 case "$INSTANCE" in
-  ''|*[!a-z0-9_-]*) echo 'install.sh: --instance must use 1-32 lowercase letters, digits, _ or -.' >&2; exit 2 ;;
+  ''|*[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) echo 'install.sh: --instance must use 1-32 lowercase letters, digits, _ or -.' >&2; exit 2 ;;
 esac
 if [ "${#INSTANCE}" -gt 32 ]; then
   echo 'install.sh: --instance must use 1-32 lowercase letters, digits, _ or -.' >&2
-  exit 2
-fi
-if [ "$AGENT_ID_GIVEN" -eq 1 ] && [ "$INSTANCE_GIVEN" -eq 1 ]; then
-  echo 'install.sh: pass --agent-id or --instance, not both.' >&2
   exit 2
 fi
 
@@ -277,10 +285,16 @@ ACP_COMMAND_STORED="$(stored AGENT_CONNECT_ACP_COMMAND)"
 ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
 ACP_URL_STORED="$(stored AGENT_CONNECT_ACP_URL)"
 MIGRATE_DEFAULT=0
-if [ "$INSTANCE" != default ] && [ "$(stored AGENT_CONNECT_TOKEN "$HOME/.agent-connect/config.env")" = "$TOKEN" ]; then
-  # Only retire the legacy service when it uses this exact credential. A
-  # different agent's default service must keep running beside this one.
-  MIGRATE_DEFAULT=1
+if [ "$INSTANCE" != default ]; then
+  LEGACY_TOKEN="$(stored AGENT_CONNECT_TOKEN "$HOME/.agent-connect/config.env")"
+  if [ "$LEGACY_TOKEN" = "$TOKEN" ]; then
+    # Only retire the legacy service when it uses this exact credential. A
+    # different agent's default service must keep running beside this one.
+    MIGRATE_DEFAULT=1
+  elif [ -n "$LEGACY_TOKEN" ]; then
+    say "legacy default has a different credential; its service is left unchanged"
+    say "if that credential was revoked, stop and disable the old service after confirming it is obsolete (README: Legacy migration cleanup)"
+  fi
 fi
 
 # A stored command outranks any preset at runtime, so each way of arriving has
@@ -561,6 +575,15 @@ if [ "$OS" = "Darwin" ]; then
   say "starting via launchd (per-user LaunchAgent)"
   LA_DIR="$HOME/Library/LaunchAgents"; mkdir -p "$LA_DIR"
   PLIST="$LA_DIR/$SERVICE_LABEL.plist"
+  # Retire the old service before writing any new RunAtLoad/KeepAlive plist.
+  # If unload fails, leave no second worker scheduled for the next login.
+  if [ "$MIGRATE_DEFAULT" -eq 1 ] && [ -f "$LA_DIR/space.ag2.agent-connect.plist" ]; then
+    say "moving this credential from the legacy default service to $INSTANCE"
+    if launchctl print "gui/$(id -u)/space.ag2.agent-connect" >/dev/null 2>&1; then
+      launchctl unload "$LA_DIR/space.ag2.agent-connect.plist"
+    fi
+    mv "$LA_DIR/space.ag2.agent-connect.plist" "$LA_DIR/space.ag2.agent-connect.plist.migrated"
+  fi
   cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -581,19 +604,16 @@ if [ "$OS" = "Darwin" ]; then
   <key>StandardErrorPath</key><string>$APP_DIR/agent-connect.log</string>
 </dict></plist>
 PLIST
-  if [ "$MIGRATE_DEFAULT" -eq 1 ] && [ -f "$LA_DIR/space.ag2.agent-connect.plist" ]; then
-    say "moving this credential from the legacy default service to $INSTANCE"
-    if launchctl print "gui/$(id -u)/space.ag2.agent-connect" >/dev/null 2>&1; then
-      launchctl unload "$LA_DIR/space.ag2.agent-connect.plist"
-    fi
-    mv "$LA_DIR/space.ag2.agent-connect.plist" "$LA_DIR/space.ag2.agent-connect.plist.migrated"
-  fi
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load "$PLIST"
   say "loaded. Logs: $APP_DIR/agent-connect.log"
 elif command -v systemctl >/dev/null 2>&1; then
   say "starting via systemd (per-user unit)"
   UNIT_DIR="$HOME/.config/systemd/user"; mkdir -p "$UNIT_DIR"
+  if [ "$MIGRATE_DEFAULT" -eq 1 ] && [ -f "$UNIT_DIR/agent-connect.service" ]; then
+    say "moving this credential from the legacy default service to $INSTANCE"
+    systemctl --user disable --now agent-connect.service
+  fi
   cat > "$UNIT_DIR/$SERVICE_UNIT" <<UNIT
 [Unit]
 Description=AG2 Space agent-connect worker ($INSTANCE)
@@ -606,10 +626,6 @@ Restart=always
 [Install]
 WantedBy=default.target
 UNIT
-  if [ "$MIGRATE_DEFAULT" -eq 1 ] && [ -f "$UNIT_DIR/agent-connect.service" ]; then
-    say "moving this credential from the legacy default service to $INSTANCE"
-    systemctl --user disable --now agent-connect.service
-  fi
   systemctl --user daemon-reload
   systemctl --user enable --now "$SERVICE_UNIT"
   # enable --now does not restart an already-running unit after a config change.
