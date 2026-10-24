@@ -26,6 +26,10 @@
 #   --acp-command AGENT_CONNECT_ACP_COMMAND  the ACP agent's command line, run as
 #             typed. Overrides any preset. Omitted on a re-run, the stored one is kept.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
+#   --instance AGENT_CONNECT_INSTANCE  separate config, workspace and service
+#                                    [default: default, the legacy single-agent install]
+#   --agent-id                        derive a stable instance from the full Matrix id;
+#                                     use instead of --instance (survives token rotation)
 #   --no-start                       install only; print the run command, don't launch
 #
 # Retired: --sutando-workspace, which installed `ag2-sparrow` alone against a
@@ -45,6 +49,11 @@ set -eu
 
 # ── args ────────────────────────────────────────────────────────────────────
 TOKEN="${AGENT_CONNECT_TOKEN:-}"
+INSTANCE="${AGENT_CONNECT_INSTANCE:-default}"
+AGENT_ID=""
+AGENT_ID_GIVEN=0
+INSTANCE_GIVEN=0
+[ -z "${AGENT_CONNECT_INSTANCE:-}" ] || INSTANCE_GIVEN=1
 ADAPTER="${AGENT_CONNECT_ADAPTER:-codex}"
 # Working dir default is ~/agents (NOT pwd): a pwd default silently bakes
 # wherever the user happened to run the installer into the service config —
@@ -124,6 +133,8 @@ while [ $# -gt 0 ]; do
     --acp-url) ACP_URL="$2"; shift 2 ;;
     --acp-token) ACP_TOKEN="$2"; ACP_TOKEN_GIVEN=1; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
+    --instance) INSTANCE="${2:-}"; INSTANCE_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --instance needs a name.' >&2; exit 2; }; shift 2 ;;
+    --agent-id) AGENT_ID="${2:-}"; AGENT_ID_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --agent-id needs a Matrix id.' >&2; exit 2; }; shift 2 ;;
     --sutando-workspace|--sutando-workspace=*) sutando_gone ;;
     --no-start) START=0; shift ;;
     --token=*)   TOKEN="${1#*=}"; shift ;;
@@ -133,9 +144,26 @@ while [ $# -gt 0 ]; do
     --acp-url=*) ACP_URL="${1#*=}"; shift ;;
     --acp-token=*) ACP_TOKEN="${1#*=}"; ACP_TOKEN_GIVEN=1; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
+    --instance=*) INSTANCE="${1#*=}"; INSTANCE_GIVEN=1; shift ;;
+    --agent-id=*) AGENT_ID="${1#*=}"; AGENT_ID_GIVEN=1; shift ;;
     *) echo "install.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# Names become paths and service labels. Lowercase avoids aliases on the
+# case-insensitive filesystems macOS commonly uses; never sanitise two names
+# into one. Keep the Worker's 32-character instance bound.
+case "$INSTANCE" in
+  ''|*[!a-z0-9_-]*) echo 'install.sh: --instance must use 1-32 lowercase letters, digits, _ or -.' >&2; exit 2 ;;
+esac
+if [ "${#INSTANCE}" -gt 32 ]; then
+  echo 'install.sh: --instance must use 1-32 lowercase letters, digits, _ or -.' >&2
+  exit 2
+fi
+if [ "$AGENT_ID_GIVEN" -eq 1 ] && [ "$INSTANCE_GIVEN" -eq 1 ]; then
+  echo 'install.sh: pass --agent-id or --instance, not both.' >&2
+  exit 2
+fi
 
 if [ -z "$TOKEN" ]; then
   echo "install.sh: --token is required (get it from the AG2 Space Agent Portal)." >&2
@@ -177,6 +205,18 @@ reject_multiline() {  # <flag> <value>
 reject_multiline --token "$TOKEN"
 reject_multiline --repo "$REPO"
 reject_multiline --adapter "$ADAPTER"
+[ -z "$AGENT_ID" ] || reject_multiline --agent-id "$AGENT_ID"
+if [ "$AGENT_ID_GIVEN" -eq 1 ]; then
+  case "$AGENT_ID" in
+    @:*|@*:) echo 'install.sh: --agent-id needs a full Matrix id (@name:server).' >&2; exit 2 ;;
+    @*:*) : ;;
+    *) echo 'install.sh: --agent-id needs a full Matrix id (@name:server).' >&2; exit 2 ;;
+  esac
+  if [ "${#AGENT_ID}" -gt 512 ]; then
+    echo 'install.sh: --agent-id is too long.' >&2
+    exit 2
+  fi
+fi
 [ -z "$ACP_COMMAND" ] || reject_multiline --acp-command "$ACP_COMMAND"
 [ -z "$ACP_URL" ] || reject_multiline --acp-url "$ACP_URL"
 [ -z "$ACP_TOKEN" ] || reject_multiline --acp-token "$ACP_TOKEN"
@@ -207,20 +247,41 @@ PIP="python3 -m pip"
 $PIP --version >/dev/null 2>&1 || {
   echo "install.sh: pip not available (python3 -m pip). Install pip first." >&2; exit 1; }
 
+if [ "$AGENT_ID_GIVEN" -eq 1 ]; then
+  # Hash public identity, not the bearer: rotating a token must reuse the same
+  # config and conversation state. Include the homeserver to isolate dev/prod.
+  INSTANCE="agent-$(printf '%s' "$AGENT_ID" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:24])')"
+fi
+
 APP_DIR="$HOME/.agent-connect"
+SERVICE_LABEL="space.ag2.agent-connect"
+SERVICE_UNIT="agent-connect.service"
+if [ "$INSTANCE" != default ]; then
+  APP_DIR="$APP_DIR/instances/$INSTANCE"
+  SERVICE_LABEL="$SERVICE_LABEL.$INSTANCE"
+  SERVICE_UNIT="agent-connect-$INSTANCE.service"
+fi
 mkdir -p "$APP_DIR"
 # Named here rather than at 1c: the ACP decisions below need to read it.
 CONFIG="$APP_DIR/config.env"
 
 # Read, never executed. Last occurrence wins, as the worker's own parser does.
-stored() {  # <KEY>
-  [ -f "$CONFIG" ] || return 0
-  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -n 1 \
+stored() {  # <KEY> [config path]
+  _source="${2:-$CONFIG}"
+  [ -f "$_source" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$_source" | tail -n 1 \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
     | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
 }
 ACP_COMMAND_STORED="$(stored AGENT_CONNECT_ACP_COMMAND)"
 ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
 ACP_URL_STORED="$(stored AGENT_CONNECT_ACP_URL)"
+MIGRATE_DEFAULT=0
+if [ "$INSTANCE" != default ] && [ "$(stored AGENT_CONNECT_TOKEN "$HOME/.agent-connect/config.env")" = "$TOKEN" ]; then
+  # Only retire the legacy service when it uses this exact credential. A
+  # different agent's default service must keep running beside this one.
+  MIGRATE_DEFAULT=1
+fi
 
 # A stored command outranks any preset at runtime, so each way of arriving has
 # to say what happens to one that is already there:
@@ -380,6 +441,9 @@ if [ -f "$CONFIG" ]; then
   # ACP_COMMAND joins the set only when this run set or cleared one — otherwise
   # a re-run would wipe it and the adapter would fall back to the claude preset.
   MANAGED='AGENT_CONNECT_TOKEN|AGENT_CONNECT_ADAPTER|AGENT_CONNECT_REPO|AGENT_CONNECT_ACP_AGENT'
+  if [ "$INSTANCE" != default ]; then
+    MANAGED="$MANAGED|AGENT_CONNECT_INSTANCE|AGENT_CONNECT_WORKSPACE"
+  fi
   if [ -n "$ACP_CMD_KV" ] || [ "$ACP_CMD_CLEAR" -eq 1 ]; then
     MANAGED="$MANAGED|AGENT_CONNECT_ACP_COMMAND"
   fi
@@ -412,6 +476,10 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     printf '%s\n' "AGENT_CONNECT_TOKEN=\"$TOKEN\""
     printf '%s\n' "AGENT_CONNECT_ADAPTER=\"$ADAPTER\""
     printf '%s\n' "AGENT_CONNECT_REPO=\"$REPO\""
+    if [ "$INSTANCE" != default ]; then
+      printf '%s\n' "AGENT_CONNECT_INSTANCE=\"$INSTANCE\""
+      printf '%s\n' "AGENT_CONNECT_WORKSPACE=\"$APP_DIR/workspace\""
+    fi
     [ -z "$ACP_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_AGENT=\"$ACP_AGENT\""
     [ -z "$ACP_CMD_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_COMMAND=\"$ACP_COMMAND\""
     [ -z "$ACP_URL_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_URL=\"$ACP_URL\""
@@ -454,7 +522,7 @@ _cfg="\$("$WORKER_BIN" --export-config)" || exit 1
 eval "\$_cfg"
 unset _cfg
 : "\${AGENT_CONNECT_TOKEN:?no token — it should be in \$AGENT_CONNECT_CONFIG}"
-WS="\${AGENT_CONNECT_WORKSPACE:-\$HOME/.agent-connect/workspace}"
+WS="\${AGENT_CONNECT_WORKSPACE:-$APP_DIR/workspace}"
 export AGENT_CONNECT_WORKSPACE="\$WS"
 mkdir -p "\$WS"
 
@@ -492,12 +560,12 @@ OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
   say "starting via launchd (per-user LaunchAgent)"
   LA_DIR="$HOME/Library/LaunchAgents"; mkdir -p "$LA_DIR"
-  PLIST="$LA_DIR/space.ag2.agent-connect.plist"
+  PLIST="$LA_DIR/$SERVICE_LABEL.plist"
   cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>space.ag2.agent-connect</string>
+  <key>Label</key><string>$SERVICE_LABEL</string>
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>$LAUNCHER</string>
   </array>
@@ -513,15 +581,22 @@ if [ "$OS" = "Darwin" ]; then
   <key>StandardErrorPath</key><string>$APP_DIR/agent-connect.log</string>
 </dict></plist>
 PLIST
+  if [ "$MIGRATE_DEFAULT" -eq 1 ] && [ -f "$LA_DIR/space.ag2.agent-connect.plist" ]; then
+    say "moving this credential from the legacy default service to $INSTANCE"
+    if launchctl print "gui/$(id -u)/space.ag2.agent-connect" >/dev/null 2>&1; then
+      launchctl unload "$LA_DIR/space.ag2.agent-connect.plist"
+    fi
+    mv "$LA_DIR/space.ag2.agent-connect.plist" "$LA_DIR/space.ag2.agent-connect.plist.migrated"
+  fi
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load "$PLIST"
   say "loaded. Logs: $APP_DIR/agent-connect.log"
 elif command -v systemctl >/dev/null 2>&1; then
   say "starting via systemd (per-user unit)"
   UNIT_DIR="$HOME/.config/systemd/user"; mkdir -p "$UNIT_DIR"
-  cat > "$UNIT_DIR/agent-connect.service" <<UNIT
+  cat > "$UNIT_DIR/$SERVICE_UNIT" <<UNIT
 [Unit]
-Description=AG2 Space agent-connect worker
+Description=AG2 Space agent-connect worker ($INSTANCE)
 After=network-online.target
 [Service]
 # No token in the unit file: it is in a private file the launcher reads.
@@ -531,10 +606,25 @@ Restart=always
 [Install]
 WantedBy=default.target
 UNIT
+  if [ "$MIGRATE_DEFAULT" -eq 1 ] && [ -f "$UNIT_DIR/agent-connect.service" ]; then
+    say "moving this credential from the legacy default service to $INSTANCE"
+    systemctl --user disable --now agent-connect.service
+  fi
   systemctl --user daemon-reload
-  systemctl --user enable --now agent-connect.service
-  say "enabled. Logs: journalctl --user -u agent-connect -f"
+  systemctl --user enable --now "$SERVICE_UNIT"
+  # enable --now does not restart an already-running unit after a config change.
+  systemctl --user restart "$SERVICE_UNIT"
+  say "enabled. Logs: journalctl --user -u $SERVICE_UNIT -f"
 else
+  if [ "$MIGRATE_DEFAULT" -eq 1 ] && [ -f "$HOME/.agent-connect/workspace/.worker.pids" ]; then
+    while read -r old_pid; do
+      case "$old_pid" in ''|*[!0-9]*) continue ;; esac
+      if kill -0 "$old_pid" 2>/dev/null; then
+        echo 'install.sh: stop the legacy default worker before starting this same credential as a named instance.' >&2
+        exit 1
+      fi
+    done < "$HOME/.agent-connect/workspace/.worker.pids"
+  fi
   say "no service manager found — starting in the background (nohup)"
   env AGENT_CONNECT_CONFIG="$CONFIG" \
       nohup sh "$LAUNCHER" >"$APP_DIR/agent-connect.log" 2>&1 &

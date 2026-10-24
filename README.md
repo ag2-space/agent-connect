@@ -541,6 +541,34 @@ setting you added by hand survives a re-run of the one-liner.
 
 ## Running more than one agent on one machine
 
+Give each agent its own instance. The web setup flow passes the agent's full
+Matrix identity so the installer derives a stable name:
+
+```sh
+./install.sh --token '<gateway>|<agent-one-token>' --adapter codex --agent-id '@owner-codex-one.agent:example.org'
+./install.sh --token '<gateway>|<agent-two-token>' --adapter codex --agent-id '@owner-codex-two.agent:example.org'
+```
+
+Each gets its own private config, launcher, workspace, log and background
+service under `~/.agent-connect/instances/agent-<identity-hash>/`. The hash uses
+the full identity including its homeserver, not the token: reconnecting or
+rotating a token reuses that agent's instance. Codex and Claude can run beside
+each other in the same way. Two agents may use the same working repository;
+their connector state still lives in separate workspaces.
+
+For a manual install, `--instance codex-one` is an alternative to `--agent-id`.
+Names use 1–32 lowercase letters, digits, `_` or `-`. Reuse the same name when
+reconnecting that agent. Do not run the same agent credential in two instances.
+
+Without either flag, the legacy single-agent location and service remain the
+default. Reinstalling there replaces that one connection. A named install leaves
+a different agent's legacy service alone. When the legacy service has the exact
+same credential, a normal install retires that service before starting the named
+one; its old config and workspace remain on disk. `--no-start` changes no service.
+Without launchd/systemd, stop the matching legacy worker before starting its
+replacement as a named instance.
+
+
 **The launch unit is one worker pointed at one config file.** That is the
 contract a supervisor builds on, and it is deliberately not a wire: what a
 supervisor should depend on is the unit, named by the config file it was given.
