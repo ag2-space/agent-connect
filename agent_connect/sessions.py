@@ -56,7 +56,7 @@ _OFF = ("0", "false", "no", "off")
 
 #: A Session key as it travels: (room, Access Tier). Same pair as
 #: `TurnContext.session_key`, which is what the Worker locks on.
-Key = Tuple[str, str]
+Key = Tuple[str, ...]
 
 
 def workspace_dir(env: Optional[Mapping[str, str]] = None) -> Path:
@@ -94,7 +94,7 @@ class SessionRecord:
         return self.cwd == cwd
 
     def as_json(self, key: Key) -> dict:
-        return {
+        value = {
             "room": key[0],
             "access_tier": key[1],
             "session_id": self.session_id,
@@ -102,6 +102,9 @@ class SessionRecord:
             "turns": self.turns,
             "updated_at": self.updated_at,
         }
+        if len(key) > 2:
+            value["room_context_scope"] = key[2]
+        return value
 
 
 @dataclass(frozen=True)
@@ -214,10 +217,18 @@ class SessionStore:
             self._complain(f"cannot read {self.path}: {exc}")
             return {}
         records: Dict[Key, SessionRecord] = {}
-        for entry in (raw.get("sessions") if isinstance(raw, dict) else None) or []:
+        entries = []
+        if isinstance(raw, dict):
+            for name in ("sessions", "room_context_sessions"):
+                held = raw.get(name)
+                if isinstance(held, list):
+                    entries.extend(held)
+        for entry in entries:
             if not isinstance(entry, dict) or not entry.get("session_id"):
                 continue
             key = (str(entry.get("room") or ""), str(entry.get("access_tier") or ""))
+            if entry.get("room_context_scope"):
+                key += (str(entry["room_context_scope"]),)
             records[key] = SessionRecord(
                 session_id=str(entry["session_id"]),
                 cwd=str(entry.get("cwd") or ""),
@@ -229,7 +240,11 @@ class SessionStore:
     def _save(self) -> None:
         payload = {
             "version": 1,
-            "sessions": [r.as_json(k) for k, r in sorted(self._loaded().items())],
+            # Keep scoped records out of the legacy collection: an older
+            # Worker ignores extra fields and would otherwise resume one as an
+            # ordinary room/tier Session after rollback.
+            "sessions": [r.as_json(k) for k, r in sorted(self._loaded().items()) if len(k) == 2],
+            "room_context_sessions": [r.as_json(k) for k, r in sorted(self._loaded().items()) if len(k) > 2],
         }
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:

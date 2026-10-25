@@ -59,6 +59,7 @@ from typing import Any, List, Mapping, Optional, Tuple
 
 from .markers import mxids_in
 from .state import valid_wire_id
+from .room_context import MAX_ID, RoomContext, parse_room_context
 
 #: The gateway's unsigned metadata block. The bracket body is `[^\]]*` because
 #: the block carries no nested `]`, so the pattern cannot over-eat the user's
@@ -211,7 +212,7 @@ class Task:
         # Context the broker enriches a task with. Carried, never interpreted:
         # see the block comment in `__init__` below.
         "session_scope", "source", "interaction_type", "platform_card",
-        "thread_root", "source_room_id",
+        "thread_root", "source_room_id", "room_context", "room_context_reason",
     )
 
     def __init__(
@@ -244,6 +245,8 @@ class Task:
         platform_card: Optional[Mapping[str, str]] = None,
         thread_root: str = "",
         source_room_id: str = "",
+        room_context: Optional[RoomContext] = None,
+        room_context_reason: str = "absent",
     ):
         self.id = id
         #: The message text, metadata blocks removed (G2).
@@ -334,6 +337,9 @@ class Task:
         #: asked in.
         self.thread_root = thread_root
         self.source_room_id = source_room_id
+        #: Optional broker data; no read, grant, or transcript persistence.
+        self.room_context = room_context
+        self.room_context_reason = room_context_reason
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<Task {self.id} room={self.room_id} tier={self.access_tier!r}>"
@@ -345,7 +351,7 @@ class Task:
                    for name in self.__slots__)
 
 
-def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
+def parse_task(raw: Mapping[str, Any], *, agent_id: str = "") -> Optional[Task]:
     """A wire dict as a `Task`, or `None` when it is not usable as one.
 
     `None` means "this is not a task I can act on" — a non-dict, or an id that
@@ -366,10 +372,21 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
         # value is what an additive deploy looks like from here.
         priority = DEFAULT_PRIORITY
 
+    room_id = _text(raw.get("channel_id"), MAX_ID)
+    anchor = _text(raw.get("source_message_id") or raw.get("source_event_id"), MAX_ID)
+    attested = _text(raw.get("access_tier"), MAX_TIER)
+    effective = attested.strip() if attested.strip() in ("owner", "team") else "guest"
+    context, context_reason = parse_room_context(
+        raw.get("room_context_binding"), raw.get("room_context"),
+        task_id=wire_id, room_id=room_id, access_tier=effective,
+        anchor_event_id=anchor, agent_id=agent_id,
+    )
+    if context_reason == "absent" and ("room_context" in raw or "room_context_binding" in raw):
+        context_reason = "invalid_schema"
     return Task(
         id=wire_id,
         body=body,
-        room_id=_text(raw.get("channel_id")),
+        room_id=room_id,
         user_id=_text(raw.get("user_id")),
         access_tier=_text(raw.get("access_tier"), MAX_TIER),
         requested_access_tier=_text(raw.get("requested_access_tier"), MAX_TIER),
@@ -392,8 +409,7 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
         room_member_count=_count(raw.get("room_member_count")),
         # Canonical name first, with the older spelling as the fallback the
         # protocol documents as the same value.
-        source_message_id=_text(raw.get("source_message_id")
-                                or raw.get("source_event_id")),
+        source_message_id=anchor,
         attempt=_count(raw.get("attempt")),
         metadata_stripped=stripped,
         session_scope=_text(raw.get("session_scope")),
@@ -402,6 +418,8 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
         platform_card=_platform_card(raw.get("platform_card")),
         thread_root=_text(raw.get("thread_root")),
         source_room_id=_text(raw.get("source_room_id")),
+        room_context=context,
+        room_context_reason=context_reason,
     )
 
 

@@ -883,8 +883,17 @@ def prompt_blocks(
         passed.append(name)
     # The text block is built last and put first: it names what follows it, and
     # what follows it is only known once every attachment has been tried.
+    from .. import room_context
     text = preamble(ctx, passed, missing) + ctx.prompt
-    return [{"type": "text", "text": text}] + blocks, problems
+    # Current ask remains block zero. Mark context separately so a supporting
+    # ACP Agent can keep it out of conversation/profile-memory extraction.
+    ask = {"type": "text", "text": text, "_meta": room_context.task_meta(ctx)}
+    context_block = room_context.block(ctx)
+    if context_block is not None:
+        blocks.insert(0, context_block)
+    elif ctx.room_context_reason != "absent":
+        ask["text"] = preamble(ctx, passed, missing) + room_context.preamble(ctx) + ctx.prompt
+    return [ask] + blocks, problems
 
 
 def unread_notice(problems: Sequence[str], agent) -> str:
@@ -1204,7 +1213,12 @@ class AcpAdapter:
         policy = WorkingDirectoryPolicy(session_cwd)
         queue: asyncio.Queue = asyncio.Queue()
         settings = self.session_settings()
-        store = self.store() if settings.memory else None
+        from .. import room_context
+        packet, availability = room_context.current(ctx)
+        managed_unavailable = packet is None and availability != "absent"
+        # An invalid managed packet must not fall back into an old legacy
+        # Session that could still contain broader historical room material.
+        store = self.store() if settings.memory and not managed_unavailable else None
         key = ctx.session_key
 
         # Per-Turn, not per-Adapter: two rooms run their Turns concurrently and
@@ -1275,6 +1289,12 @@ class AcpAdapter:
         # even started: a retired or misplaced one is dropped here, and the room
         # hears about it whether or not the agent turns out to be reachable.
         record = store.get(key) if store is not None else None
+        if ctx.room_context is not None and room_context.current(ctx)[0] is None:
+            # An expired packet must not resume a Session which still contains
+            # the previously valid room material.
+            if store is not None:
+                store.forget(key)
+            record = None
         if record is not None:
             why = _why_unusable(record, session_cwd, settings)
             if why:
@@ -1343,6 +1363,22 @@ class AcpAdapter:
                 # is said out loud before the prompt goes, so the room learns it
                 # while the agent is still working rather than afterwards.
                 blocks, problems = prompt_blocks(ctx, agent, att.max_bytes())
+                packet, availability = room_context.current(ctx)
+                if ctx.room_context is not None and packet is None:
+                    # Attachment/block preparation can cross expiration after
+                    # loading a Session or materializing its context block.
+                    # Discard that prepared data and the previous Session;
+                    # keep the actual ask and already-read attachment bytes.
+                    blocks = room_context.omit_prepared(blocks, availability)
+                    if store is not None:
+                        store.forget(key)
+                    session_id = await client.new_session(
+                        cwd=session_cwd, meta=destination_meta(ctx)
+                    )
+                    if mode:
+                        await client.set_session_mode(session_id, mode)
+                    if not live.begin(session_id):
+                        return TurnResult(stop_reason="cancelled", text="")
                 if problems:
                     queue.put_nowait(Notice(text=unread_notice(problems, agent)))
                 return await client.prompt(session_id, blocks)

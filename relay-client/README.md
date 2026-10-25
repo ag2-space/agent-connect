@@ -66,7 +66,25 @@ envelope carries what the broker attests about the sender — `user_id`,
 `sender_name`, `room_members`, `room_member_count`, `reply_to_event`,
 `reply_to_me`, `reply_to_sender`, `addressed_to`, `source_message_id`,
 `thread_root`, `source_room_id`, `platform_card`, `attempt`. Plus
-`attachments`, which the media stage fills.
+`attachments`, which the media stage fills. Optional `room_context` is a typed,
+immutable `RoomContext`, with `room_context_reason` reporting availability.
+Its reserved wire fields `room_context_binding` and `room_context` are strictly
+shape-, size-, expiry- and scope-checked independently from the task body.
+`parse_task(..., agent_id=...)` optionally checks the configured acting identity;
+the message sender is never used as the actor. Consumers must revalidate with
+`packet.current(...)` against their effective tier immediately before inference.
+Room context does not grant authorization, initiate reads or persist inbound
+transcripts. The journal remains IDs and outbound pending results only.
+
+A consumer which supplies context to its Local Agent explicitly includes
+`ROOM_CONTEXT_CAPABILITY` (`room-context-v1`) in the client's `capabilities`
+constructor argument. That adds the existing scalar
+`capabilities=room-context-v1` field to each `GET /v1/tasks` alongside `wait`,
+and retains the heartbeat declaration. The generic default stays wait-only.
+Only this known scalar is encoded; the heartbeat's full list is not converted
+to an unestablished multiple-value poll format. The declaration grants no
+history access or execution tier; the authoritative producer still filters
+and authorizes each delivery.
 
 All of it crosses **as data**. This library maps none of it to a decision: the
 tier is an attestation and not a permission, the interaction type has no

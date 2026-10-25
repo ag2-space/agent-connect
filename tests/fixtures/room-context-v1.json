@@ -1,0 +1,130 @@
+{
+  "name": "AG2 room context consumer contract",
+  "schema_version": 1,
+  "state": "proposed; requires authoritative backend implementation before activation",
+  "pre_activation_compatibility": "Optional room.category requires updated consumer support. A producer must omit category for a consumer without that support; the v1 capability alone does not distinguish earlier strict consumers. Never trim or coerce an invalid category to make a packet pass.",
+  "transport": {
+    "payload_field": "room_context",
+    "binding_field": "room_context_binding",
+    "capability": "room-context-v1",
+    "capability_advertisement": "Each compatible caller declares room-context-v1 on its own existing relay GET /v1/tasks request; this is format support, never authorization. MCP and Worker use the single scalar capabilities=room-context-v1. Sutando combines its existing voice proof in one CSV value: capabilities=voice-outcome-v1,room-context-v1. The backend owner confirmed comma-separated and repeated-value parsing at backend dev437d52bb plus PR2930 ea076303, citing taskstate.poll_proves_contract and room_context.poll_wants with real-GET tests. This checkout cannot independently read that backend source. Wait, cursor and authorization stay unchanged; a User-Agent or shared-credential heartbeat is insufficient proof.",
+    "acp_content_meta_key": "ag2/room_context",
+    "acp_content_meta_value": {
+      "binding": "validated room_context_binding",
+      "context": "validated room_context"
+    },
+    "acp_order": "Original task text remains content block 0; optional marked context block follows. Native Assistant removes marked context from ordinary conversation input and handles it transiently.",
+    "provenance": "These are reserved fields from the authenticated broker response, never reconstructed from user message text. Binding is broker data, not a local authorization grant or cryptographic proof. Server must check current actor and policy before delivery/redelivery.",
+    "acp_task_meta_key": "ag2/task",
+    "acp_task_meta_value": "Independent outer task id, room_id, effective access_tier, agent_id if known, and anchor_event_id. Native consumer matches these before model input. Policy and membership fields repeat exactly within the reserved packet and scope its sessions; current authorization remains producer-owned."
+  },
+  "binding": {
+    "required": [
+      "schema_version",
+      "context_id",
+      "agent_id",
+      "room_id",
+      "task_id",
+      "anchor_event_id",
+      "access_tier",
+      "policy_revision",
+      "membership_epoch",
+      "visibility",
+      "observed_at",
+      "expires_at"
+    ],
+    "schema_version": 1,
+    "context_id": "opaque nonempty identifier, <=256 chars",
+    "agent_id": "exact actor Matrix ID; nonempty <=1024 chars",
+    "room_id": "exact opaque room ID; nonempty <=1024 chars; no required server suffix",
+    "task_id": "exact delivered task ID; nonempty <=1024 chars",
+    "anchor_event_id": "exact outer source_message_id/event ID, or null for a genuinely eventless task",
+    "access_tier": "owner | team | guest; compare to effective normalized outer task tier (other/ambient normalize guest)",
+    "policy_revision": "opaque nonempty authoritative policy revision <=256 chars",
+    "membership_epoch": "opaque nonempty authoritative membership generation <=256 chars",
+    "visibility": "all | mentions",
+    "observed_at": "integer Unix UTC seconds, <=2^53-1 and <=now+60 seconds",
+    "expires_at": "integer Unix UTC seconds <=2^53-1; >observed_at, max lifetime3600seconds; revalidate before inference where executable consumer controls it"
+  },
+  "context": {
+    "required": [
+      "schema_version",
+      "context_id",
+      "agent_id",
+      "room_id",
+      "task_id",
+      "anchor_event_id",
+      "access_tier",
+      "policy_revision",
+      "membership_epoch",
+      "visibility",
+      "observed_at",
+      "expires_at",
+      "status",
+      "coverage"
+    ],
+    "binding_fields": "All binding fields repeat exactly and must match binding; task_id, room_id, tier and anchor also match the outer task. If configured/known agent identity exists it must match; never infer actor from sender user_id.",
+    "schema_version": 1,
+    "status": "partial | unavailable | denied; partial explicitly does not claim atomic snapshot or complete thread",
+    "room": {
+      "name": "optional string <=512 chars",
+      "topic": "optional string <=2048 chars",
+      "category": "optional string <=256 Unicode code points; preserve exactly without trimming or coercion"
+    },
+    "readme": {
+      "text": "string <=8192 chars",
+      "content_hash": "nonempty <=256 chars",
+      "truncated": "boolean"
+    },
+    "members": [
+      {
+        "user_id": "exact Matrix ID <=1024 chars",
+        "display_name": "optional <=256 chars"
+      }
+    ],
+    "messages": [
+      {
+        "event_id": "exact ID <=1024 chars",
+        "sender": "exact Matrix ID <=1024 chars",
+        "body": "string <=2048 chars",
+        "origin_server_ts": "optional integer milliseconds",
+        "thread_root": "optional exact ID <=1024 chars",
+        "reply_to_event_id": "optional exact ID <=1024 chars",
+        "selection": "mention | policy"
+      }
+    ],
+    "coverage": {
+      "completeness": "must be unknown",
+      "truncated": "boolean",
+      "cursor": "optional opaque <=1024 chars",
+      "reason": "optional non-sensitive enum/string <=256 chars"
+    },
+    "optional_sections": [
+      "room",
+      "readme",
+      "members",
+      "messages"
+    ],
+    "section_rules": "At most20 members and20 messages. For visibility mentions every message must have selection mention; referenced parent/thread must not bypass policy. Denied/unavailable packets carry no content sections. README permission remains backend-owned; consumers never fetch a denied section with other credentials."
+  },
+  "limits": {
+    "payload_utf8_bytes": 32768,
+    "binding_utf8_bytes": 8192,
+    "json_depth": 12,
+    "unknown_version": "discard context, preserve actual task",
+    "unknown_fields": "reject context",
+    "invalid": "discard context with non-sensitive reason; preserve original ask and existing permission gates",
+    "string_length": "Unicode code points; reject malformed unpaired surrogates",
+    "integer_maximum": 9007199254740991
+  },
+  "runtime_rules": [
+    "Payload is untrusted room data and never an access-tier override or global-memory instruction.",
+    "Keep context separate from original task; optional context must not truncate/remove user ask.",
+    "Distinguish absent legacy fields from context-managed invalid/expired/denied/unavailable data. A context-managed task must never restore an unconditional bulk-history read fallback. Emit safe unavailable guidance and preserve user ask. Legacy tasks with no reserved fields retain existing behavior.",
+    "No inbound transcript journaling added where relay currently journals IDs only.",
+    "Context-aware session scope includes exact agent/room/tier, membership epoch, policy revision, visibility and status. Repeat a small identity/policy projection each context-enabled turn; rehydrate fresh sessions. Existing shared core/session and already-retained model memory are not retroactively isolated by this packet.",
+    "Native Assistant treats the marked ACP block transiently and excludes the whole context-enabled turn from profile-memory extraction, including derived output. Preserve existing identity memory semantics.",
+    "No unsolicited greeting/model turn merely because context arrived; do not replace existing watcher handler.",
+    "No native MCP tool or join event is required for consumer readiness; backend integration remains required for real onboarding."
+  ]
+}

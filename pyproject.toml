@@ -24,16 +24,17 @@ keywords = ["ag2space", "codex", "matrix", "agent", "bridge"]
 # disease its drift tests already treat (ADR 0001). It is stdlib-only, so this
 # adds no dependency tree.
 #
-# Published since relay-client-v0.1.0, so the floor below is a real resolution
-# and not a promise: until that tag the name existed nowhere and `pip install`
-# ended at `No matching distribution found`. Capped below 0.2 for the same
+# Relay Client 0.1.2 is prepared by the room-context change. Publish that sibling
+# distribution before releasing this Worker; until then install both editables
+# from this checkout. The publish workflow verifies the floor resolves from PyPI.
+# Capped below 0.2 for the same
 # reason the ACP SDK is capped below 1.0 — a 0.x library may move its surface
 # in a minor, and the two distributions release from this one repository on
 # separate tags, so nothing but this cap stops an old worker from resolving a
 # library it was never built against.
 dependencies = [
     "agent-client-protocol>=0.12,<1.0",
-    "ag2-relay-client>=0.1.0,<0.2",
+    "ag2-relay-client>=0.1.2,<0.2",
 ]
 
 [tool.uv.sources]

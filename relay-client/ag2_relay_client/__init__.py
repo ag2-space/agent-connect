@@ -17,7 +17,7 @@ and not a copy of it:
 from __future__ import annotations
 
 #: The single source of the distribution version (`pyproject.toml` reads it).
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # The seam, reachable in one import: a consumer needs the client, the credential
 # it is constructed from, the type of the thing that comes out of the queue, and
@@ -26,5 +26,6 @@ from .client import RelayClient  # noqa: E402
 from .credentials import TokenSource  # noqa: E402
 from .envelope import Task  # noqa: E402
 from .media import Attachment  # noqa: E402
+from .room_context import RoomContext  # noqa: E402
 
-__all__ = ["RelayClient", "TokenSource", "Task", "Attachment", "__version__"]
+__all__ = ["RelayClient", "TokenSource", "Task", "Attachment", "RoomContext", "__version__"]

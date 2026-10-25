@@ -81,6 +81,7 @@ from .journal import Journal, Reconciler
 from .media import MediaIngress, MediaStore
 from .outbound import MAX_FILES, Outbound, PreparedResult
 from .resolver import BoundedResolver
+from .room_context import ROOM_CONTEXT_CAPABILITY
 from .roomops import COOLDOWN_S as ROOM_OPS_COOLDOWN_S
 from .roomops import RoomOps
 from .singleton import LOST, STALE_AFTER_S, PollerGuard
@@ -608,8 +609,14 @@ class RelayClient:
         try:
             self._before_the_wire()
             self._raise_deferred_auth()
+            params: Dict[str, Any] = {"wait": self.poll_wait}
+            if ROOM_CONTEXT_CAPABILITY in self.capabilities:
+                # Per-poll format declaration: a credential can be shared or
+                # downgraded after a heartbeat. This is one supported scalar,
+                # not a guessed encoding of the heartbeat's capability list.
+                params["capabilities"] = ROOM_CONTEXT_CAPABILITY
             answer = self._http.get(
-                "/v1/tasks", params={"wait": self.poll_wait},
+                "/v1/tasks", params=params,
                 timeout=self.poll_wait + self.socket_margin)
             self._keep_guard_fresh()
             self._intake_all(answer)

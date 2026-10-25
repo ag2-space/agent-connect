@@ -20,7 +20,23 @@ later the `TurnReporter`) that consumes — so it must not depend on either.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Optional, Tuple
+from typing import Any, ClassVar, Optional, Protocol, Tuple
+
+
+class RoomContext(Protocol):
+    """Protocol-neutral bounded room-data value; validation lives at ingress."""
+
+    @property
+    def scope(self) -> str: ...
+
+    def current(self, *, task_id: str, room_id: str, access_tier: str,
+                anchor_event_id: str = "", agent_id: str = "",
+                now: Optional[float] = None) -> Tuple[Optional["RoomContext"], str]: ...
+
+    def as_meta(self) -> dict: ...
+
+    @property
+    def context_json(self) -> str: ...
 
 # ---------------------------------------------------------------------------
 # Why a Turn stopped. Ours, deliberately: a stop reason a person in a room can
@@ -131,9 +147,12 @@ class TurnContext:
     sandbox: str = "read-only"
     cwd: str = ""
     attachments: Tuple[Attachment, ...] = ()
+    room_context: Optional[RoomContext] = None
+    room_context_reason: str = "absent"
+    agent_id: str = ""
 
     @property
-    def session_key(self) -> Tuple[str, str]:
+    def session_key(self) -> Tuple[str, ...]:
         """The pair a Session is keyed by: room and Access Tier.
 
         Never the room alone — a Session carries a permission mode, and a Tier
@@ -141,7 +160,11 @@ class TurnContext:
         identifier gets a key of its own rather than sharing one with every
         other roomless Task, which would serialise unrelated work.
         """
-        return (self.room or f"task:{self.task_id}", self.access_tier)
+        key = (self.room or f"task:{self.task_id}", self.access_tier)
+        # A separate component cannot collide with an opaque room identifier.
+        if self.room_context is not None:
+            return key + (self.room_context.scope,)
+        return key
 
 
 @dataclass(frozen=True)

@@ -227,6 +227,8 @@ def turn_context(task, repo: str) -> TurnContext:
     """
     tier = attested_tier(task.access_tier)
     attachments = task_attachments(task)
+    from .room_context import delivered
+    context, context_reason, actor = delivered(task, tier)
     return TurnContext(
         prompt=(task.body or "").strip() or uncaptioned_prompt(attachments),
         task_id=task.id,
@@ -244,6 +246,9 @@ def turn_context(task, repo: str) -> TurnContext:
         sandbox=tier_to_sandbox(tier),
         cwd=repo,
         attachments=attachments,
+        room_context=context,
+        room_context_reason=context_reason,
+        agent_id=actor,
     )
 
 

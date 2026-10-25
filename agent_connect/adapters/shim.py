@@ -50,6 +50,7 @@ from __future__ import annotations
 from typing import Any, AsyncIterator
 
 from .. import attachments as att
+from .. import room_context
 from ..events import COMPLETED, Done, MessageChunk, Notice, TurnContext, TurnEvent
 from ..offthread import in_daemon_thread
 from ..sandbox import sandbox_preamble
@@ -119,12 +120,16 @@ class ShimAdapter:
         # `ctx.prompt` is passed exactly as the person typed it. Nothing about
         # the attachments is folded into it — not a filename, and above all not
         # a path.
-        prompt = sandbox_preamble(
-            ctx.sandbox, ctx.access_tier,
-            room_members=ctx.room_members, addressed_to=ctx.addressed_to,
-            room_member_count=ctx.room_member_count,
-        ) + ctx.prompt
-        text = await in_daemon_thread(self.impl.run, prompt, ctx.sandbox, ctx.cwd)
+        def invoke():
+            # Revalidate after waiting for the execution thread, immediately
+            # before handing any optional room material to the Local Agent.
+            prompt = sandbox_preamble(
+                ctx.sandbox, ctx.access_tier,
+                room_members=ctx.room_members, addressed_to=ctx.addressed_to,
+                room_member_count=ctx.room_member_count,
+            ) + room_context.preamble(ctx) + ctx.prompt
+            return self.impl.run(prompt, ctx.sandbox, ctx.cwd)
+        text = await in_daemon_thread(invoke)
         text = text if isinstance(text, str) else str(text)
         if text:
             yield MessageChunk(text=text)

@@ -57,6 +57,8 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from ag2_relay_client import RelayClient, TokenSource
+from ag2_relay_client.client import CAPABILITIES
+from ag2_relay_client.room_context import ROOM_CONTEXT_CAPABILITY
 from ag2_relay_client.state import valid_instance_name
 
 from .outgoing import UNSENDABLE, egress_roots, unsendable
@@ -168,6 +170,9 @@ def from_env(
     if not raw:
         return None
     credentials = TokenSource(token=raw, base_url=(env.get(URL_ENV) or "").strip())
+    # Advertise consumption only at the Worker boundary. A generic library
+    # consumer may parse packets without ever supplying them to a Local Agent.
+    options.setdefault("capabilities", CAPABILITIES + (ROOM_CONTEXT_CAPABILITY,))
     roots = options.setdefault("egress_roots", egress_roots(repo, env))
     for name in unsendable(roots):
         print(UNSENDABLE.format(name=name), file=sys.stderr, flush=True)

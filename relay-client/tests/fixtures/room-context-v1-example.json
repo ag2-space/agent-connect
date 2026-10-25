@@ -1,0 +1,65 @@
+{
+  "id": "context-task",
+  "task": "CURRENT_ASK: What is the decision?",
+  "channel_id": "!opaque-room",
+  "user_id": "@alice:example.test",
+  "source_message_id": "$anchor",
+  "access_tier": "owner",
+  "room_context_binding": {
+    "schema_version": 1,
+    "context_id": "context-one",
+    "agent_id": "@worker:example.test",
+    "room_id": "!opaque-room",
+    "task_id": "context-task",
+    "anchor_event_id": "$anchor",
+    "access_tier": "owner",
+    "policy_revision": "policy-one",
+    "membership_epoch": "membership-one",
+    "visibility": "all",
+    "observed_at": 1792900198,
+    "expires_at": 1792900798
+  },
+  "room_context": {
+    "schema_version": 1,
+    "context_id": "context-one",
+    "agent_id": "@worker:example.test",
+    "room_id": "!opaque-room",
+    "task_id": "context-task",
+    "anchor_event_id": "$anchor",
+    "access_tier": "owner",
+    "policy_revision": "policy-one",
+    "membership_epoch": "membership-one",
+    "visibility": "all",
+    "observed_at": 1792900198,
+    "expires_at": 1792900798,
+    "status": "partial",
+    "coverage": {
+      "completeness": "unknown",
+      "truncated": false
+    },
+    "room": {
+      "name": "Synthetic project",
+      "topic": "context fixture",
+      "category": "Research"
+    },
+    "readme": {
+      "text": "README_SENTINEL: release uses amber labels.",
+      "content_hash": "hash-one",
+      "truncated": false
+    },
+    "members": [
+      {
+        "user_id": "@alice:example.test",
+        "display_name": "Alice"
+      }
+    ],
+    "messages": [
+      {
+        "event_id": "$old",
+        "sender": "@alice:example.test",
+        "body": "HISTORY_SENTINEL: decision is amber.",
+        "selection": "policy"
+      }
+    ]
+  }
+}

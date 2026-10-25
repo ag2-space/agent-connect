@@ -812,6 +812,7 @@ table.
 | Setting | What it does | Default |
 | --- | --- | --- |
 | `AGENT_CONNECT_CONFIG` | the config file to read (see the section above). The `--config` flag wins over it | `~/.agent-connect/config.env`, if it exists |
+| `AGENT_CONNECT_AGENT_ID` | Optional exact Matrix ID of this Worker's Agent Identity; independently rejects context for a different actor. Grants no permissions. | unset |
 | `AGENT_CONNECT_TOKEN` | your agent identity's relay token, from the Agent Portal. It is a combined `<gateway-url>\|<secret>` credential: the gateway travels inside it, and there is no default to fall back on, so a bare secret needs `REMOTE_TASK_URL` beside it. Without a token the worker refuses to start, because it would have no way of being given any work | *(required)* |
 | `AGENT_CONNECT_ADAPTER` | which adapter runs the task: `codex`, `ollama`, `omnigent`, `cline`, `kilo`, `acp` | *(required)* |
 | `AGENT_CONNECT_REPO` | the working directory the agent operates in. Created for you when it is the default; a path under `~/Documents`, `~/Desktop` or `~/Downloads` is warned about, because macOS privacy protection turns agent file operations there into an unexplained "operation not permitted" | `~/agents` |
@@ -937,6 +938,74 @@ The framework is agent-agnostic; the relay client + onboarding + access-tiers ar
 client (workspace ADR 0001), so it long-polls the gateway itself — there is no
 second process to start. From a checkout of this repo, `./run-agent.sh` is the
 same single process with a pidfile that clears the last one.
+
+## Broker-supplied room context
+
+A capable broker can attach bounded, policy-filtered room metadata, README and
+eligible recent messages to each Task. The Worker validates the version,
+expiry and exact task/room/tier/event binding before passing it to the Local
+Agent. Optional `AGENT_CONNECT_AGENT_ID` adds an independent exact actor check;
+it must name the Agent Identity, never the sender. Room data cannot grant an
+Access Tier or change the Sandbox.
+
+The room card accepts optional `name`, `topic` and `category`. Category is a
+string of at most 256 Unicode code points and is preserved exactly without
+trimming or coercion; other unknown room fields remain invalid. During this
+pre-activation contract alignment, the producer must omit category for consumers
+without updated support. The existing `room-context-v1` capability alone cannot
+distinguish earlier strict consumers from this extension.
+
+ACP receives the current ask as block zero and room data as a separately marked
+block (`_meta["ag2/room_context"]`). A supporting ACP Agent can exclude that
+block from profile-memory extraction. Text-only adapters receive explicitly
+framed room data followed by the unchanged current ask. Every Turn receives
+its packet, including fresh or resumed Sessions. Context-aware ACP Sessions
+rotate when membership, policy or visibility changes; legacy Tasks retain the
+existing room/tier Session behavior.
+
+Context can be partial, denied or unavailable. Missing/invalid context never
+means the room is empty, and does not authorize broader history reads. This
+Worker does not fetch room history itself. The ID-only relay journal does not
+store inbound context or task bodies; after restart, the broker must redeliver
+and reauthorize context. Policy changes after a Task is delivered cannot be
+validated locally without a new authoritative backend signal.
+
+The delivered guidance tells the agent to use the briefing first and answer
+without additional context reads when it suffices. For a specific missing or
+fresh permitted fact, or a requested action, it may use available MCP tools as
+the same agent in the originating room under current policy and normal
+permission checks. It must not automatically replace unavailable context with
+bulk history, retrieve denied sections, or switch identity or credentials to
+bypass a restriction. If the needed information is unavailable or denied, it
+should state the limitation and ask. This is model guidance, not a tool-call
+gate; actual reads and actions still require backend authorization. These
+changes do not install MCP tools in the connected agent. Prompt-delivery tests
+do not prove arbitrary models follow the guidance.
+
+The Worker declares `room-context-v1` in each authenticated task poll using the
+existing scalar `capabilities=room-context-v1` query field, and in heartbeat
+metadata. Each poll identifies the receiving consumer even if a credential is
+shared or its installation changed since the last heartbeat. This declares v1
+format consumption; current history authorization and policy filtering remain
+the producer's responsibility. Generic Relay Client consumers keep their existing
+wait-only polls unless they explicitly opt in to this capability. The backend
+owner confirmed (see [backend PR #2930](https://github.com/ag2-space/ag2space-backend/pull/2930))
+comma-separated and repeated capability parsing at backend dev `437d52bb` plus
+PR #2930 `ea076303`, citing `taskstate.poll_proves_contract`,
+`room_context.poll_wants` and parser/real-GET tests. Sutando can use
+`capabilities=voice-outcome-v1,room-context-v1`; this Worker still needs only
+the scalar room-context token. Backend source remains unavailable to this
+checkout, so this records the owner's verification rather than an independent
+source inspection or a deployed refresh API.
+
+The consumer contract is proposed and requires backend integration before
+activation. This source change prepares Relay Client 0.1.2 and Worker 0.2.2;
+Relay Client 0.1.2 must be published first, before installing/releasing the
+Worker. No package publication is performed by these changes. To test both
+source distributions locally, install `-e relay-client` before `-e .`. Local synthetic relay/ACP tests do not establish real room join,
+history authorization or model-answer success. See
+[ADR 0006](docs/adr/0006-room-context-is-task-data.md) and the
+[shared contract](tests/fixtures/room-context-v1.json).
 
 ## Tests
 

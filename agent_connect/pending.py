@@ -51,7 +51,7 @@ from typing import Dict, List, Optional, Tuple
 
 #: A Session key as it travels: (room, Access Tier). The same pair
 #: `TurnContext.session_key` produces and `agent_connect.sessions` maps.
-Key = Tuple[str, str]
+Key = Tuple[str, ...]
 
 
 class PendingTurn:
