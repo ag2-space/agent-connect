@@ -49,6 +49,8 @@ from __future__ import annotations
 
 from typing import Any, AsyncIterator
 
+from ..routing import routing_preamble
+
 from .. import attachments as att
 from ..events import COMPLETED, Done, MessageChunk, Notice, TurnContext, TurnEvent
 from ..offthread import in_daemon_thread
@@ -123,7 +125,7 @@ class ShimAdapter:
             ctx.sandbox, ctx.access_tier,
             room_members=ctx.room_members, addressed_to=ctx.addressed_to,
             room_member_count=ctx.room_member_count,
-        ) + ctx.prompt
+        ) + routing_preamble(ctx) + ctx.prompt
         text = await in_daemon_thread(self.impl.run, prompt, ctx.sandbox, ctx.cwd)
         text = text if isinstance(text, str) else str(text)
         if text:

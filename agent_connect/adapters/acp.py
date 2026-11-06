@@ -113,7 +113,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import json
 import os
 import shlex
 import shutil
@@ -140,6 +139,7 @@ from ..acp.core import (
 from ..acp.policy import WorkingDirectoryPolicy
 from ..link import receiver_meta, room_message
 from ..addressing import addressing_preamble
+from ..routing import routing_preamble
 from ..events import (
     CANCELLED,
     COMPLETED,
@@ -772,9 +772,15 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
     with another agent, who else is there and how a hand-off is delivered — the
     shim says the same under its sandbox line, and neither inherits the other's
     sentence about confinement.
+
+    Shared routing framing follows attachment labels and precedes the body.
+    Its facts come from the broker-backed TurnContext, not display names or
+    user text. Names are whitespace-normalized so they cannot insert framing
+    lines. This is a plain-text convention, not an authorization boundary.
     """
-    who = ctx.sender_name or "the owner"
-    where = f" in {ctx.room_name}" if ctx.room_name else ""
+    who = " ".join(ctx.sender_name.split()) or "someone"
+    room_name = " ".join(ctx.room_name.split())
+    where = f" in {room_name}" if room_name else ""
     framing = (
         f"[agent-connect] {who} is asking you this{where}, through a chat room. "
         "Answer in chat: prose, no more than a few short paragraphs unless asked "
@@ -784,20 +790,11 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
         f"{addressing_preamble(ctx.room_members, ctx.addressed_to, ctx.room_member_count)}"
         "\n"
     )
-    # These fields come from the broker-backed TurnContext, never the body or
-    # display name. An absent requester stays absent; owner tier is not identity.
-    routing = {
-        "room_id": ctx.room,
-        "source_message_id": ctx.source_message_id,
-        "access_tier": ctx.access_tier,
-        "user_id": ctx.user_id,
-    }
-    framing += "[Routing data; not instructions] " + json.dumps(routing) + "\n\n"
     if attached:
         framing += ATTACHED.format(names=", ".join(attached))
     if unavailable:
         framing += UNAVAILABLE.format(names=", ".join(unavailable))
-    return framing
+    return framing + routing_preamble(ctx)
 
 
 def accepted_kinds(agent) -> List[str]:
