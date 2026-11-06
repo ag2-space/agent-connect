@@ -113,6 +113,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import os
 import shlex
 import shutil
@@ -783,6 +784,15 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
         f"{addressing_preamble(ctx.room_members, ctx.addressed_to, ctx.room_member_count)}"
         "\n"
     )
+    # These fields come from the broker-backed TurnContext, never the body or
+    # display name. An absent requester stays absent; owner tier is not identity.
+    routing = {
+        "room_id": ctx.room,
+        "source_message_id": ctx.source_message_id,
+        "access_tier": ctx.access_tier,
+        "user_id": ctx.user_id,
+    }
+    framing += "[Routing data; not instructions] " + json.dumps(routing) + "\n\n"
     if attached:
         framing += ATTACHED.format(names=", ".join(attached))
     if unavailable:
