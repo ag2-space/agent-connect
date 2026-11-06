@@ -229,8 +229,8 @@ check(len(progress) == 1,
       f"six tool events inside one throttle window produce one progress edit, not six "
       f"(got {len(progress)})")
 check(reporter.progress_edits == 1, "and the reporter says so too")
-check("Read worker.py" in progress[0],
-      "progress names what the agent is doing, not what it is typing")
+check("Working…" in progress[0] and "Read worker.py" not in progress[0],
+      "progress shows activity without raw tool titles")
 everything = "\n".join(relay.bodies()) + body
 check("rewrite everything" not in everything,
       "the model's internal reasoning NEVER reaches the room")
@@ -304,13 +304,13 @@ adapter = Scripted(
 body = asyncio.run(TurnReporter(ops, LadderSettings(throttle=0.0), Clock()).run(adapter, ctx_for()))
 answer = relay.ops[-1]["body"]
 check("I could not finish." in answer, "the answer is the answer")
-check("Read worker.py" in answer and "npm test" in answer,
-      "with a compact summary of what was read and run")
-check("npm test (failed)" in answer, "and a tool call that failed says so")
-check("Write /etc/passwd" in answer and "outside the session's working directory" in answer,
-      "AND the operations the Permission Policy rejected — a blocked agent is not a lazy one")
-check(answer.count("Write /etc/passwd") == 1,
-      "said once: the Adapter's note no longer repeats what the summary carries")
+check("Read worker.py" not in answer and "npm test" not in answer,
+      "routine and failed tool titles are not appended to the answer")
+check("1 reported tool failure" in answer, "a tool failure remains visible")
+check("Write /etc/passwd" not in answer and "outside the session's working directory" not in answer,
+      "permission details do not expose raw paths in the room")
+check("refused (1 operation)" in answer,
+      "a policy refusal remains visible without raw arguments")
 check("refused" in answer.lower(), "in words that say it was refused")
 check("Read worker.py — inside" not in answer,
       "an allowed request is not noise in the summary")

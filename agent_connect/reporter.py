@@ -391,8 +391,8 @@ class TurnReporter:
 
         What follows the marker is for whoever reads the archived result: the
         machine-readable reason, the Adapter's own explanation, any
-        announcement that never reached the room, and the summary of what the
-        Turn managed to do before it ended with nothing to say.
+        announcement that never reached the room, and aggregate failure/refusal
+        notices. The shared formatter omits raw tool activity here too.
         """
         self.rejected = True
         parts = [
@@ -458,9 +458,9 @@ class TurnReporter:
             self.progress_edits += 1
 
     def _progress_body(self) -> str:
-        step = self._steps[-1]
-        count = f" (step {len(self._steps)})" if len(self._steps) > 1 else ""
-        return f"{PLACEHOLDER}\n\n{step}{count}"
+        # Tool titles can contain commands, arguments and local paths. They
+        # are not safe room-facing labels, even when live progress is enabled.
+        return f"{PLACEHOLDER}\n\nWorking…"
 
     async def _edit(self, body: str) -> bool:
         try:
@@ -483,11 +483,9 @@ def _pointer(count: int) -> str:
 def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str:
     """The answer, its ending, and a compact summary of what was done.
 
-    The summary is not a log. It is the two or three lines that let a person see
-    the effects without reading one — *including the operations the Permission
-    Policy rejected*, because without them a blocked agent is indistinguishable
-    from a lazy one and the person is left wondering why the thing did not
-    happen.
+    Routine tool activity is not appended to the answer. Only aggregate failure
+    and refusal notices are retained: tool titles and permission details may
+    contain raw arguments, commands or local paths, not public-facing prose.
 
     `notices` are announcements that could not be posted as their own message
     (no relay, no room, a refused op). They lead the body rather than being
@@ -531,13 +529,11 @@ def _ending(reason: str, note: str) -> str:
 
 def _summary(steps, failed, refused, limit: int = 6) -> str:
     lines: List[str] = []
-    if steps:
-        shown = [f"{s} (failed)" if s in failed else s for s in steps[:limit]]
-        more = len(steps) - len(shown)
-        lines.append(
-            "— did: " + " · ".join(shown) + (f" · +{more} more" if more > 0 else "")
-        )
+    # Do not echo raw tool titles, including failed ones, into the room.
+    if failed:
+        count = "1 reported tool failure" if len(failed) == 1 else f"{len(failed)} reported tool failures"
+        lines.append(f"— {count} during this turn.")
     if refused:
         count = "1 operation" if len(refused) == 1 else f"{len(refused)} operations"
-        lines.append(f"— refused ({count}): " + " · ".join(refused[:limit]))
+        lines.append(f"— refused ({count}) by the permission policy.")
     return "\n".join(lines)

@@ -277,10 +277,13 @@ relay token. See `docs/adr/0004` for the reasoning, including what this costs.
 
 A request used to be met with silence until the answer arrived — sometimes ten
 minutes of it. Now a placeholder appears as soon as the worker picks the task
-up, the same message is edited as the agent works ("Read worker.py", "npm test"),
+up, the same message shows generic activity ("Working…") as the agent works,
 and it is finally edited into the answer. **One message**: the room sees exactly
-one reply, and the answer carries a compact summary of what was run — including
-the operations the permission policy rejected.
+one reply, without a routine tool-activity footer. Reported tool failures and
+permission-policy refusals remain visible as aggregate notices. Raw tool titles
+and permission details are not copied into progress or these notices: they can
+contain code, arguments and local paths. This governs reporter-generated text,
+not the content of the agent's own answer or explicit notices.
 
 The shape is the relay's, not ours: the broker places the intake reaction, the
 worker posts the fleet-wide `⏳ On it...` copy and edits it, and closes the lease
