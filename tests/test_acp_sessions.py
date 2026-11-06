@@ -304,7 +304,7 @@ bench.set_script({"sessionPrefix": "replay",
                       "stopReason": "end_turn"}})
 relay = FakeRelay()
 bench.handle("r3", "do live work", ops=relay.ops_client)
-check(len(relay.ops) > 2 and "LIVE-TOOL-" in relay.bodies(),
+check(len(relay.ops) > 2 and "Working…" in relay.bodies() and "LIVE-TOOL-" not in relay.bodies(),
       "the same activity happening live DOES reach the room — suppression is "
       "the resumption's, not a Ladder that never worked")
 relay.stop()

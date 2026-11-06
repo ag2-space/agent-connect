@@ -29,7 +29,8 @@ jobs:
     # sutando's, which is the consumer the separate distribution exists for. A
     # claim no job exercises is a claim that decays.
     name: relay-client (py${{ matrix.python }}, no deps)
-    runs-on: ubuntu-latest
+    # Python 3.9 binaries are unavailable on Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

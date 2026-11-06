@@ -360,8 +360,8 @@ relay, body, _ = asyncio.run(_rejection(
     Done(reason=FAILED, text="", note="agent-connect: the ACP Agent exited (code 3)")))
 check(body.startswith(NO_SEND) and "code 3" in body,
       "a bridge that died is a rejection too, with the exit code kept for the operator")
-check("Read x.py" in body,
-      "and what the Turn did manage to do is archived with it")
+check("Read x.py" in body and "Operator diagnostics" in body,
+      "operator diagnostics are retained only in archived rejected results")
 relay.stop()
 
 body = asyncio.run(

@@ -18,12 +18,12 @@ noise. Retreating must cost a setting, not a rewrite.
 
 Three rules govern what the room sees while the work runs:
 
-*Tool activity, not text.* Progress says "reading worker.py", not the answer as
-it is being typed. An edit per message chunk would be a storm of replacements
+*Tool activity, not text.* Progress says "Working…", never raw tool titles or
+the answer as it is being typed. An edit per message chunk would be a storm of replacements
 for content the final edit overwrites anyway.
 
 *Throttled.* At most one progress edit per throttle window, however busy the
-Turn is.
+Turn is. The generic activity edit is sent only once per Turn.
 
 *Never the model's reasoning.* `Thinking` is in the vocabulary so that some
 consumer *may* read it. The room is not that consumer, and there is a test that
@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import List, Mapping, Optional, Sequence, Tuple
 
@@ -234,9 +235,12 @@ class TurnReporter:
         #: are filtered to. Empty means unknown, and unknown filters nothing.
         self._members: Tuple[str, ...] = ()
         self._last_edit = 0.0
-        self._steps: List[str] = []      # tool titles, in the order they started
-        self._failed: set = set()        # titles of tool calls that failed
-        self._refused: List[str] = []    # what the Permission Policy rejected
+        self._activity = False
+        self._failed_ids: set = set()  # terminal updates deduplicated by tool id
+        self._started_ids: set = set()  # in-progress updates repeat per tool id
+        self._anonymous_failures = 0
+        self._refused = 0  # policy or owner may have declined
+        self._diagnostics = deque(maxlen=50)  # rejection archive only
         self._unposted: List[str] = []   # notices the room could not be told
         #: Number of progress edits actually issued — the throttle, observable.
         self.progress_edits = 0
@@ -306,25 +310,30 @@ class TurnReporter:
         )
 
     async def on_event(self, event) -> None:
-        """Note what the agent is doing, and maybe say so in the room.
+        """Count outcomes and signal generic activity without exposing tool metadata.
 
         `Thinking` reaches this method and goes no further — deliberately, and
         the room never learns it existed.
         """
         if isinstance(event, ToolStarted):
-            self._steps.append(event.title or event.action or "working")
+            self._activity = True
+            if not event.tool_id or event.tool_id not in self._started_ids:
+                self._started_ids.add(event.tool_id)
+                self._diagnostics.append((event.title or event.action or "working")[:500])
             await self._progress()
         elif isinstance(event, ToolFinished):
-            if event.title:
-                if event.title not in self._steps:
-                    self._steps.append(event.title)
-                if event.status != COMPLETED:
-                    self._failed.add(event.title)
+            self._activity = True
+            if event.status != COMPLETED:
+                if event.tool_id:
+                    self._failed_ids.add(event.tool_id)
+                else:
+                    self._anonymous_failures += 1
+                self._diagnostics.append(("failed: " + (event.title or event.tool_id or "untitled tool"))[:500])
             await self._progress()
         elif isinstance(event, PermissionAsked) and not event.allowed:
-            self._refused.append(
-                f"{event.title} — {event.reason}" if event.reason else event.title
-            )
+            self._refused += 1
+            reason = f" — {event.reason}" if event.reason else ""
+            self._diagnostics.append(f"refused: {event.title}{reason}"[:500])
         elif isinstance(event, Notice):
             await self.notice(event.text)
 
@@ -360,7 +369,7 @@ class TurnReporter:
             # the rejection above is right: an empty answer must not be posted.
             answer = SILENT
         body = _assemble(
-            answer, ending, self._steps, self._failed, self._refused, self._unposted,
+            answer, ending, self._failure_count(), self._refused, self._unposted,
         )
         if not self.event_id:
             return body
@@ -391,8 +400,8 @@ class TurnReporter:
 
         What follows the marker is for whoever reads the archived result: the
         machine-readable reason, the Adapter's own explanation, any
-        announcement that never reached the room, and the summary of what the
-        Turn managed to do before it ended with nothing to say.
+        announcement that never reached the room, and aggregate failure/refusal
+        notices. Bounded raw diagnostics follow only on this archived, no-send path.
         """
         self.rejected = True
         parts = [
@@ -403,9 +412,11 @@ class TurnReporter:
         parts += [n.strip() for n in self._unposted if n and n.strip()]
         if ending.strip():
             parts.append(ending.strip())
-        summary = _summary(self._steps, self._failed, self._refused)
+        summary = _summary(self._failure_count(), self._refused)
         if summary:
             parts.append(summary)
+        if self._diagnostics:
+            parts.append("Operator diagnostics (last 50 events):\n" + "\n".join(self._diagnostics))
         return "\n\n".join(parts)
 
     # -- internals ----------------------------------------------------------
@@ -447,8 +458,11 @@ class TurnReporter:
             self._unposted.append(text)
         return False
 
+    def _failure_count(self) -> int:
+        return len(self._failed_ids) + self._anonymous_failures
+
     async def _progress(self) -> None:
-        if not self.settings.live or not self.event_id or not self._steps:
+        if not self.settings.live or not self.event_id or not self._activity or self.progress_edits:
             return
         now = self._clock()
         if now - self._last_edit < self.settings.throttle:
@@ -458,9 +472,9 @@ class TurnReporter:
             self.progress_edits += 1
 
     def _progress_body(self) -> str:
-        step = self._steps[-1]
-        count = f" (step {len(self._steps)})" if len(self._steps) > 1 else ""
-        return f"{PLACEHOLDER}\n\n{step}{count}"
+        # Tool titles can contain commands, arguments and local paths. They
+        # are not safe room-facing labels, even when live progress is enabled.
+        return f"{PLACEHOLDER}\n\nWorking…"
 
     async def _edit(self, body: str) -> bool:
         try:
@@ -480,14 +494,12 @@ def _pointer(count: int) -> str:
     return FILE_POINTER_MANY.format(count=count)
 
 
-def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str:
+def _assemble(answer: str, note: str, failed: int, refused: int, notices=()) -> str:
     """The answer, its ending, and a compact summary of what was done.
 
-    The summary is not a log. It is the two or three lines that let a person see
-    the effects without reading one — *including the operations the Permission
-    Policy rejected*, because without them a blocked agent is indistinguishable
-    from a lazy one and the person is left wondering why the thing did not
-    happen.
+    Routine tool activity is not appended to the answer. Only aggregate failure
+    and refusal notices are retained: tool titles and permission details may
+    contain raw arguments, commands or local paths, not public-facing prose.
 
     `notices` are announcements that could not be posted as their own message
     (no relay, no room, a refused op). They lead the body rather than being
@@ -507,7 +519,7 @@ def _assemble(answer: str, note: str, steps, failed, refused, notices=()) -> str
         parts.append(answer.strip())
     if note.strip():
         parts.append(note.strip())
-    summary = _summary(steps, failed, refused)
+    summary = _summary(failed, refused)
     if summary:
         parts.append(summary)
     return "\n\n".join(parts).strip()
@@ -529,15 +541,13 @@ def _ending(reason: str, note: str) -> str:
     return note or STOP_LINES.get(reason, STOP_LINES[FAILED])
 
 
-def _summary(steps, failed, refused, limit: int = 6) -> str:
+def _summary(failed: int, refused: int) -> str:
     lines: List[str] = []
-    if steps:
-        shown = [f"{s} (failed)" if s in failed else s for s in steps[:limit]]
-        more = len(steps) - len(shown)
-        lines.append(
-            "— did: " + " · ".join(shown) + (f" · +{more} more" if more > 0 else "")
-        )
+    # Do not echo raw tool titles, including failed ones, into the room.
+    if failed:
+        count = "1 reported tool failure" if failed == 1 else f"{failed} reported tool failures"
+        lines.append(f"— {count} during this turn.")
     if refused:
-        count = "1 operation" if len(refused) == 1 else f"{len(refused)} operations"
-        lines.append(f"— refused ({count}): " + " · ".join(refused[:limit]))
+        count = "1 operation" if refused == 1 else f"{refused} operations"
+        lines.append(f"— refused ({count}).")
     return "\n".join(lines)
