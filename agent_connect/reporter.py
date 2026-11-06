@@ -237,6 +237,7 @@ class TurnReporter:
         self._last_edit = 0.0
         self._activity = False
         self._failed_ids: set = set()  # terminal updates deduplicated by tool id
+        self._started_ids: set = set()  # in-progress updates repeat per tool id
         self._anonymous_failures = 0
         self._refused = 0  # policy or owner may have declined
         self._diagnostics = deque(maxlen=50)  # rejection archive only
@@ -316,7 +317,9 @@ class TurnReporter:
         """
         if isinstance(event, ToolStarted):
             self._activity = True
-            self._diagnostics.append((event.title or event.action or "working")[:500])
+            if not event.tool_id or event.tool_id not in self._started_ids:
+                self._started_ids.add(event.tool_id)
+                self._diagnostics.append((event.title or event.action or "working")[:500])
             await self._progress()
         elif isinstance(event, ToolFinished):
             self._activity = True
@@ -329,7 +332,8 @@ class TurnReporter:
             await self._progress()
         elif isinstance(event, PermissionAsked) and not event.allowed:
             self._refused += 1
-            self._diagnostics.append((f"refused: {event.title} — {event.reason}")[:500])
+            reason = f" — {event.reason}" if event.reason else ""
+            self._diagnostics.append(f"refused: {event.title}{reason}"[:500])
         elif isinstance(event, Notice):
             await self.notice(event.text)
 

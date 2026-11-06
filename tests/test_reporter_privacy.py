@@ -49,6 +49,16 @@ async def exercise(live):
     diagnostics = archive.split("Operator diagnostics (last 50 events):\n", 1)[1].splitlines()
     check(len(diagnostics) == 50 and all(len(line) <= 500 for line in diagnostics),
           "archive diagnostics are bounded by count and size")
+    repeat = TurnReporter(None)
+    for _ in range(60):
+        await repeat.on_event(ToolStarted(tool_id="long", title="long tool"))
+    await repeat.on_event(ToolStarted(tool_id="next", title="next tool"))
+    await repeat.on_event(PermissionAsked(title="Write x", allowed=False))
+    archive = repeat.reject(FAILED, "bridge exited")
+    check(archive.count("long tool") == 1 and "next tool" in archive,
+          "repeated in-progress updates of one tool are archived once")
+    check("refused: Write x\n" in archive + "\n" and "Write x — " not in archive,
+          "refusal without a reason has no dangling separator")
     clean = TurnReporter(None)
     await clean.on_event(ToolStarted(title=raw))
     check(await clean.finish("Done.") == "Done.", "successful answer has no activity footer")
