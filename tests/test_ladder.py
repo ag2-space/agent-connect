@@ -255,8 +255,8 @@ class Slow:
 
 body = asyncio.run(TurnReporter(ops, LadderSettings(live=True, throttle=5.0), clock)
                    .run(Slow(), ctx_for()))
-check(len(relay.ops_of("edit")) == 5,
-      "four tool starts spread across the throttle window: four progress edits + the answer")
+check(len(relay.ops_of("edit")) == 2,
+      "spaced tool starts produce one generic activity edit plus the answer")
 check(len(relay.ops_of("message")) == 1, "still exactly one message in the room")
 relay.stop()
 

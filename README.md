@@ -283,7 +283,9 @@ one reply, without a routine tool-activity footer. Reported tool failures and
 permission-policy refusals remain visible as aggregate notices. Raw tool titles
 and permission details are not copied into progress or these notices: they can
 contain code, arguments and local paths. This governs reporter-generated text,
-not the content of the agent's own answer or explicit notices.
+not the content of the agent's own answer, adapter ending notes or explicit notices.
+Rejected no-send results retain bounded operator diagnostics in the archive only
+(last 50 events, at most 500 characters per event); these are never room replies.
 
 The shape is the relay's, not ours: the broker places the intake reaction, the
 worker posts the fleet-wide `⏳ On it...` copy and edits it, and closes the lease
