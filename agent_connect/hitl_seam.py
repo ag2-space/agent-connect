@@ -18,6 +18,7 @@ without that, one room's click would answer another room's request.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -100,7 +101,10 @@ def guard_for(request: Any, session: str = "") -> str:
     tc = _tool_call_dict(request.tool_call)
     ident = tc.get("toolCallId") or tc.get("tool_call_id") or tc.get("id") or ""
     ident = str(ident) if ident else uuid.uuid4().hex
-    return f"acp:{_safe(session)}:{ident}"
+    # `_safe` folds and truncates, so distinct Sessions can read alike; the
+    # digest of the raw pair is what keeps them apart.
+    digest = hashlib.sha256(f"{session}\0{ident}".encode()).hexdigest()[:24]
+    return f"acp:{digest}:{_safe(session)[:40]}:{_safe(ident)[:32]}"
 
 
 def event_for(request: Any, session: str, asked_by: str = "") -> dict:

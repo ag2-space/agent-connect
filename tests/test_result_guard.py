@@ -23,6 +23,7 @@ def check(cond, name):
 
 SAMPLES = {
     "AWS access key": "AKIA" + "ABCDEFGHIJKLMNOP",
+    "AWS access key (temporary)": "ASIA" + "ABCDEFGHIJKLMNOP",
     "GitHub token": "ghp_" + "a" * 36,
     "GitHub fine-grained token": "github_pat_" + "a" * 40,
     "Google API key": "AIza" + "b" * 35,
@@ -36,7 +37,7 @@ SAMPLES = {
     "private key": "-----BEGIN OPENSSH PRIVATE KEY-----",
 }
 for name, sample in SAMPLES.items():
-    check(name in result_guard.secret_types(f"here it is: {sample} ok"), f"detects a {name}")
+    check(name.split(" (")[0] in result_guard.secret_types(f"here it is: {sample} ok"), f"detects a {name}")
 check(result_guard.secret_types("The build passed; see worker.py line 12.") == (),
       "ordinary prose has no secrets")
 

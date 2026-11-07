@@ -1051,6 +1051,9 @@ class AcpAdapter:
         must not be handed what the agent queued for a Client that can post it."""
         return receiver_meta() if self._notifier is not None else None
 
+    async def _ignore_notification(self, notification) -> None:
+        """A collaborator's Turn: nothing the agent sends unasked is posted from it."""
+
     async def _on_notification(self, notification) -> None:
         if self._notifier is None:
             return
@@ -1344,9 +1347,13 @@ class AcpAdapter:
                 cwd=cwd,
                 on_update=on_update,
                 permission_handler=on_permission,
-                on_notification=self._on_notification,
+                # Only an owner's Turn may carry `_ag2/notify`: it posts
+                # unchecked, to any destination the agent names.
+                on_notification=(self._on_notification if ctx.access_tier == OWNER
+                                 else self._ignore_notification),
             ) as client:
-                agent = await client.initialize(meta=self._receiver_meta())
+                agent = await client.initialize(
+                    meta=self._receiver_meta() if ctx.access_tier == OWNER else None)
                 live.client = client
                 # Muted from before the Session is touched until the prompt is
                 # sent. Not merely "during `load_session`": the boundary that

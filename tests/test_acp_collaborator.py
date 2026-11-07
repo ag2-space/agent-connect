@@ -100,6 +100,12 @@ with tempfile.TemporaryDirectory() as tmp:
     script.write_text(json.dumps({}))
     adapter = AcpAdapter(command=[sys.executable, FAKE, str(script)],
                          store=SessionStore(base / "sessions.json"))
+    posted_unasked = []
+
+    async def post(destination, text):
+        posted_unasked.append((destination, text))
+
+    adapter.set_notifier(post)
 
     async def drive(c, name):
         os.environ["FAKE_ACP_REPORT"] = str(base / f"{name}.json")
@@ -143,6 +149,41 @@ with tempfile.TemporaryDirectory() as tmp:
     check(DESTINATION_META_KEY not in opened["a"][0]["params"]["_meta"],
           "a collaborator's Session gets no destination for unsolicited posts")
     check(DESTINATION_META_KEY in opened["o"][0]["params"]["_meta"], "the owner's still does")
+
+    def receives(name):
+        report = json.loads((base / f"{name}.json").read_text())
+        return bool(((report.get("initialize") or {}).get("_meta") or {}).get("ag2/receive"))
+
+    check(not receives("a") and not receives("b"),
+          "a collaborator's Turn does not offer to receive unsolicited messages")
+    check(receives("o"), "an owner's Turn still does")
+
+from agent_connect.link import NOTIFY_METHOD
+from agent_connect.acp.core import Notification
+
+relay = AcpAdapter(command=["true"])
+got = []
+
+
+async def record_post(destination, text):
+    got.append(text)
+
+relay.set_notifier(record_post)
+note = Notification(NOTIFY_METHOD, {"destination": "!dm:s.space", "text": "secret"})
+asyncio.run(relay._ignore_notification(note))
+check(got == [], "a notification on a collaborator's Turn is never posted")
+asyncio.run(relay._on_notification(note))
+check(got == ["secret"], "while an owner's Turn posts it, as before")
+
+# --- card guards cannot collide across Sessions -------------------------------
+from agent_connect import hitl_seam
+tc = SimpleNamespace(tool_call={"toolCallId": "t1"}, options=[])
+g1 = hitl_seam.guard_for(tc, "!r:s.space|collaborator:@x_y:s.space")
+g2 = hitl_seam.guard_for(tc, "!r:s.space|collaborator:@x=y:s.space")
+check(g1 != g2, "two Sessions that fold to the same text keep distinct guards")
+long_a = hitl_seam.guard_for(tc, "!r|collaborator:@" + "a" * 200 + "1:s.space")
+long_b = hitl_seam.guard_for(tc, "!r|collaborator:@" + "a" * 200 + "2:s.space")
+check(long_a != long_b and len(long_a) <= 120, "and long ones differ after truncation, within 120")
 
 # --- an escalation card names a collaborator, and never the owner -----------
 from types import SimpleNamespace as NS

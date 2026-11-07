@@ -31,7 +31,7 @@ OWNER = "owner"
 
 #: Known secret formats, from Sutando's `chat_secret_filter` fallback list.
 PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
-    ("AWS access key", re.compile(r"AKIA[A-Z0-9]{16}")),
+    ("AWS access key", re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")),
     ("GitHub token", re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}")),
     ("GitHub fine-grained token", re.compile(r"github_pat_[A-Za-z0-9_]{36,}")),
     ("Google API key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
