@@ -147,6 +147,8 @@ STOP_LINES = {
 SILENT = "✅ agent-connect: the agent finished without an answer to give."
 #: A collaborator's reply waiting for the owner (`agent_connect.result_guard`).
 HELD = "🔒 agent-connect: this reply is waiting for the owner's review."
+#: A notice on a collaborator's Turn that the guard would have held.
+NOTICE_WITHHELD = "🔒 agent-connect: a notice about this turn was withheld because it may contain sensitive data."
 #: A collaborator's reply the owner did not release. Names the reasons, never the content.
 WITHHELD = "🔒 agent-connect: this reply was withheld. It contained {why}, and the owner did not release it."
 
@@ -298,6 +300,7 @@ class TurnReporter:
 
     async def run(self, adapter, ctx: TurnContext) -> str:
         """One whole Turn: placeholder, live edits, answer, result body."""
+        self._ctx = ctx
         await self.start(ctx)
         chunks: List[str] = []
         done: Optional[Done] = None
@@ -313,7 +316,8 @@ class TurnReporter:
         reason = done.reason if done else COMPLETED
         held = result_guard.verdict(ctx, f"{answer}\n{note}")
         if held.hold:
-            await self._edit(HELD)
+            if self.event_id:
+                await self._edit(HELD)
             if not await result_guard.ask_owner(ctx, held.why):
                 return await self.finish(WITHHELD.format(why=", ".join(held.why)), "", reason)
         return await self.finish(answer, note, reason)
@@ -452,6 +456,10 @@ class TurnReporter:
         text = (text or "").strip()
         if not text:
             return False
+        ctx = getattr(self, "_ctx", None)
+        if ctx is not None and result_guard.verdict(ctx, text).hold:
+            # A notice can carry the agent's own words (a refused resume, say).
+            text = NOTICE_WITHHELD
         if self.ops is not None and self._room and getattr(self.ops, "available", True):
             try:
                 # Stamped for whoever it names: an announcement that hands a

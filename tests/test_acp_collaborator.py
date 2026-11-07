@@ -106,8 +106,18 @@ with tempfile.TemporaryDirectory() as tmp:
         posted_unasked.append((destination, text))
 
     adapter.set_notifier(post)
+    wired = {}
+    real_connect = adapter._connect
+
+    def spy_connect(*args, **kwargs):
+        wired[current[0]] = kwargs.get("on_notification")
+        return real_connect(*args, **kwargs)
+
+    adapter._connect = spy_connect
+    current = [""]
 
     async def drive(c, name):
+        current[0] = name
         os.environ["FAKE_ACP_REPORT"] = str(base / f"{name}.json")
         os.environ[COLLABORATORS_ENV] = f"{AGENT} {OTHER}"
         try:
@@ -157,6 +167,9 @@ with tempfile.TemporaryDirectory() as tmp:
     check(not receives("a") and not receives("b"),
           "a collaborator's Turn does not offer to receive unsolicited messages")
     check(receives("o"), "an owner's Turn still does")
+    check(wired.get("a") == adapter._ignore_notification and wired.get("b") == adapter._ignore_notification,
+          "a collaborator's Turn is wired to ignore notifications")
+    check(wired.get("o") == adapter._on_notification, "an owner's Turn is wired to post them")
 
 from agent_connect.link import NOTIFY_METHOD
 from agent_connect.acp.core import Notification
@@ -181,6 +194,8 @@ tc = SimpleNamespace(tool_call={"toolCallId": "t1"}, options=[])
 g1 = hitl_seam.guard_for(tc, "!r:s.space|collaborator:@x_y:s.space")
 g2 = hitl_seam.guard_for(tc, "!r:s.space|collaborator:@x=y:s.space")
 check(g1 != g2, "two Sessions that fold to the same text keep distinct guards")
+check(hitl_seam.guard_for(SimpleNamespace(tool_call={"toolCallId": "t2"}, options=[]), "s")
+      != hitl_seam.guard_for(tc, "s"), "the tool call id is part of the guard")
 long_a = hitl_seam.guard_for(tc, "!r|collaborator:@" + "a" * 200 + "1:s.space")
 long_b = hitl_seam.guard_for(tc, "!r|collaborator:@" + "a" * 200 + "2:s.space")
 check(long_a != long_b and len(long_a) <= 120, "and long ones differ after truncation, within 120")

@@ -1375,7 +1375,9 @@ class AcpAdapter:
                         except SessionResumeRefused as exc:
                             queue.put_nowait(
                                 Notice(text=RESET.format(
-                                    why=WHY_REFUSED.format(detail=exc)))
+                                    why=WHY_REFUSED.format(
+                                        detail=exc if ctx.access_tier == OWNER
+                                        else "details are in the Worker log")))
                             )
                     if not session_id:
                         session_id = await client.new_session(

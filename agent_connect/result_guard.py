@@ -54,8 +54,12 @@ DISPLAY_NAME_MAX = 40
 
 
 def secret_types(text: str) -> Tuple[str, ...]:
-    """The known secret formats `text` contains, in `PATTERNS` order."""
-    return tuple(name for name, pattern in PATTERNS if pattern.search(text or ""))
+    """The known secret formats `text` contains, in `PATTERNS` order.
+
+    Format characters (zero-width spaces and the like) are removed first, so one
+    planted inside a token does not hide it."""
+    text = "".join(c for c in (text or "") if unicodedata.category(c) != "Cf")
+    return tuple(name for name, pattern in PATTERNS if pattern.search(text))
 
 
 def guarded(ctx: TurnContext) -> bool:
@@ -90,7 +94,7 @@ def _display_name(raw: str) -> str:
     """A sender-set display name, safe to show: no control or format characters
     (bidi overrides included), one line, capped."""
     kept = "".join(" " if unicodedata.category(c)[0] == "C" else c for c in raw)
-    name = " ".join(kept.split())
+    name = " ".join(kept.split()).replace('"', "'")
     return name if len(name) <= DISPLAY_NAME_MAX else name[:DISPLAY_NAME_MAX - 1] + "…"
 
 
@@ -111,7 +115,9 @@ async def ask_owner(ctx: TurnContext, why: Tuple[str, ...],
         return False
     request = SimpleNamespace(
         tool_call={
-            "toolCallId": f"release-{ctx.task_id or uuid.uuid4().hex}",
+            # Fresh per ask: a click on a card left live by a killed Worker
+            # must not release a different reply for a re-served Task.
+            "toolCallId": f"release-{ctx.task_id}-{uuid.uuid4().hex}",
             "title": "post a collaborator's reply containing " + ", ".join(why),
             "kind": "release",
         },

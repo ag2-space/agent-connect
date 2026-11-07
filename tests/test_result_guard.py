@@ -173,6 +173,69 @@ ops, body, cards = run_turn(owner, secret_reply)
 check(not cards and SAMPLES["GitHub token"] in "\n".join(ops.edits) + body,
       "the owner's reply is never held")
 
+# --- notes, notices, zero-width, stale releases --------------------------------
+
+
+class NoteAdapter:
+    async def turn(self, c):
+        yield MessageChunk(text="All done.")
+        yield Done(note="agent-connect: " + SAMPLES["GitHub token"])
+
+
+async def note_turn():
+    ops = Ops()
+    body = await TurnReporter(ops).run(NoteAdapter(), ctx())
+    return ops, body
+
+os.environ[hitl_seam.TIMEOUT_ENV] = "0"
+ops, body = asyncio.run(note_turn())
+os.environ.pop(hitl_seam.TIMEOUT_ENV, None)
+check(SAMPLES["GitHub token"] not in "\n".join(ops.edits) + body, "a secret in the note is held too")
+
+
+async def notice_turn(c):
+    ops = Ops()
+    reporter = TurnReporter(ops)
+    reporter._ctx = c
+    reporter._room = c.room
+    await reporter.notice("could not resume; " + SAMPLES["GitHub token"])
+    return ops
+
+check(SAMPLES["GitHub token"] not in "\n".join(asyncio.run(notice_turn(ctx())).messages),
+      "a collaborator's notice carrying a secret is withheld")
+check(SAMPLES["GitHub token"] in "\n".join(asyncio.run(notice_turn(owner)).messages),
+      "an owner's notice is posted as is")
+check("GitHub token" in result_guard.secret_types("ghp_" + "a" * 10 + "\u200b" + "a" * 30),
+      "a zero-width space inside a token does not hide it")
+
+
+async def stale_release():
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        os.environ[hitl_seam.WORKSPACE_ENV] = str(ws)
+        try:
+            async def click_first():
+                events = ws / "state" / "hitl" / "events"
+                while not (events.is_dir() and any(events.glob("*.json"))):
+                    await asyncio.sleep(0.01)
+                posted = json.loads(next(events.glob("*.json")).read_text())
+                req = ws / "state" / "hitl" / "requirements"
+                req.mkdir(parents=True, exist_ok=True)
+                (req / "hitl_1.json").write_text(json.dumps({"requirement": {
+                    "id": "hitl_1", "guard": posted["guard"],
+                    "chosen_action": result_guard.RELEASE, "status": "in_progress"}}))
+
+            clicker = asyncio.create_task(click_first())
+            first = await result_guard.ask_owner(ctx(), ("a possible GitHub token",), timeout=3, poll=0.01)
+            await clicker
+            second = await result_guard.ask_owner(ctx(), ("a redirect to another room",), timeout=0.2, poll=0.01)
+            return first, second
+        finally:
+            os.environ.pop(hitl_seam.WORKSPACE_ENV, None)
+
+first, second = asyncio.run(stale_release())
+check(first and not second, "a release answers only its own card, never a later ask for the same Task")
+
 if fails:
     raise SystemExit(f"FAIL — {fails} check(s)")
 print("PASS — collaborator result guard")

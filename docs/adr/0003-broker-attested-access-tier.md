@@ -79,7 +79,9 @@ A reply matching a known secret format, carrying a `[file:]`, or failing the sca
 held, and is posted only if the owner releases it from an approval card. A `[channel:]`
 redirect is held whatever the filter says. With the filter off, the owner has accepted
 unchecked replies. The detector matches known formats only, as sparrow's does, so it is a
-backstop, not containment. A collaborator's Session gets no `ag2/destination`, so
-`_ag2/notify` cannot carry its words past the check. Everyone else is refused as
+backstop, not containment. A collaborator's own Turn neither offers nor posts
+`_ag2/notify`. The agent's own tools are outside this: a listed sender can steer it into,
+for example, changing and running one of the owner's scheduled tasks, whose outcome is
+posted unchecked. Scoping such tools by requester belongs to the agent. Everyone else is refused as
 before. This matches sparrow's per-adapter `--allow-collaborator` opt-in, narrowed to
 named senders because the room default cannot be told apart from an owner's choice.
