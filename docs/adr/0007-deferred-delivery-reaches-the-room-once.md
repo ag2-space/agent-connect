@@ -51,8 +51,9 @@ Worker acknowledges it (step 3), not until it is written to a socket.
 **2. Deliveries are bound to a room by the Worker, not by the agent.** `session/new` carries
 a new `_meta["ag2/delivery"]`, separate from `ag2/destination` (which #40 sends only to owner
 Sessions). It is sent only on a listener-declared Worker, and for a collaborator Session
-only while the room's sensitive data filter is off for that agent, until deliveries pass
-through #40's result guard. It holds:
+only while the owner has set `AGENT_CONNECT_UNCHECKED_COLLABORATORS` on this machine, until
+deliveries pass through #40's result guard. The room's filter flag does not count: a room
+moderator can change it. It holds:
 
 - `binding`: an opaque id the Worker creates per Session key (room and owner, or room and
   collaborator; ADR 0003's amendment, #40). It is `<worker id>.<random>`. The worker id is
@@ -271,9 +272,9 @@ paths, by design.
 
 - One extra idle process per Worker for a spawned agent that declares `ag2/deliver`, and
   none otherwise.
-- Deliveries are not scanned by the room's sensitive data filter unless agent-connect's
-  collaborator result guard (#40) is applied to them too; until it is, collaborator Sessions
-  get no `ag2/delivery` while the room's filter is on.
+- Deliveries are not checked by agent-connect's collaborator result guard (#40). Until they
+  are, collaborator Sessions get no `ag2/delivery` unless the owner set
+  `AGENT_CONNECT_UNCHECKED_COLLABORATORS` on this machine.
 - With the repo or an egress root at `~`, delivery stays off until the roots are narrowed.
 - A `resource_link` in a Turn is no wider than a `[file: …]` marker. For an admitted
   collaborator, a prompt can ask for any file inside the egress allowlist roots, so choose
