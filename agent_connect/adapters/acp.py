@@ -117,7 +117,6 @@ import asyncio
 import base64
 import contextlib
 import os
-import unicodedata
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -127,6 +126,7 @@ from urllib.parse import urlsplit
 
 from .. import attachments as att
 from .. import hitl_seam
+from ..result_guard import asked_by
 from .. import outgoing
 from ..acp.core import (
     AcpAgentGone,
@@ -351,26 +351,6 @@ def admitted(ctx: TurnContext, env: Optional[Mapping[str, str]] = None) -> bool:
     if ctx.access_tier == OWNER:
         return True
     return ctx.collaborator and bool(ctx.user_id) and ctx.user_id in allowed_collaborators(env)
-
-
-#: Longest display name shown beside the attested Matrix id on a card.
-DISPLAY_NAME_MAX = 40
-
-
-def _display_name(raw: str) -> str:
-    """A sender-set display name, safe to show: no format or control characters
-    (bidi overrides included), one line, capped."""
-    kept = "".join(" " if unicodedata.category(c)[0] == "C" else c for c in raw)
-    name = " ".join(kept.split())
-    return name if len(name) <= DISPLAY_NAME_MAX else name[:DISPLAY_NAME_MAX - 1] + "…"
-
-
-def asked_by(ctx: TurnContext) -> str:
-    """Who a non-owner Turn is for, led by the attested Matrix id; `""` for the owner."""
-    if ctx.access_tier == OWNER:
-        return ""
-    name = _display_name(ctx.sender_name)
-    return f'{ctx.user_id} ("{name}")' if name and name != ctx.user_id else ctx.user_id
 
 
 def refusal(ctx: TurnContext) -> str:
@@ -605,8 +585,12 @@ DESTINATION_META_KEY = "ag2/destination"
 
 
 def destination_meta(ctx: TurnContext) -> dict:
-    """The `session/new` metadata for this Turn's room, or `{}` for a roomless Task."""
-    if not ctx.room:
+    """The `session/new` metadata for this Turn's room, or `{}` for a roomless Task.
+
+    A collaborator's Session gets none: `_ag2/notify` posts unchecked, and a
+    collaborator's words reach the room only through `result_guard`.
+    """
+    if not ctx.room or ctx.access_tier != OWNER:
         return {}
     return {
         DESTINATION_META_KEY: {

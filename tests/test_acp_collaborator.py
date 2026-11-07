@@ -139,6 +139,10 @@ with tempfile.TemporaryDirectory() as tmp:
           "and so did session/new")
     check(opened["o"][1]["_meta"][REQUESTER_META_KEY]["admitted_as"] == "owner",
           "the owner's prompt says owner")
+    from agent_connect.adapters.acp import DESTINATION_META_KEY
+    check(DESTINATION_META_KEY not in opened["a"][0]["params"]["_meta"],
+          "a collaborator's Session gets no destination for unsolicited posts")
+    check(DESTINATION_META_KEY in opened["o"][0]["params"]["_meta"], "the owner's still does")
 
 # --- an escalation card names a collaborator, and never the owner -----------
 from types import SimpleNamespace as NS

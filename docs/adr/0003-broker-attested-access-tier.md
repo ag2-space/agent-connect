@@ -73,7 +73,13 @@ is the agent's to enforce. To let it, the Worker sends `_meta["ag2/requester"]` 
 all from the broker's attestation and never from message text. Each collaborator gets
 a Session per (room, sender), so collaborators never share history with each other or
 with the owner. Separate history does not separate files, memory or credentials.
-agent-connect does not implement the room's sensitive data filter, and a listed
-sender's results are not scanned. Everyone else is refused as
+With the room's sensitive data filter on (the default, sent as `sensitive_data_filter`),
+a collaborator's reply is checked before the Ladder posts it (`agent_connect.result_guard`).
+A reply matching a known secret format, carrying a `[file:]`, or failing the scan is
+held, and is posted only if the owner releases it from an approval card. A `[channel:]`
+redirect is held whatever the filter says. With the filter off, the owner has accepted
+unchecked replies. The detector matches known formats only, as sparrow's does, so it is a
+backstop, not containment. A collaborator's Session gets no `ag2/destination`, so
+`_ag2/notify` cannot carry its words past the check. Everyone else is refused as
 before. This matches sparrow's per-adapter `--allow-collaborator` opt-in, narrowed to
 named senders because the room default cannot be told apart from an owner's choice.

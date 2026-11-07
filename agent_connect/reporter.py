@@ -87,6 +87,7 @@ from .events import (
     TurnContext,
     final_text,
 )
+from . import result_guard
 from .outgoing import named_files
 from .roomops import RoomOpError
 
@@ -144,6 +145,10 @@ STOP_LINES = {
 #: failure — nothing went wrong, so no broker notice is coming, and the room
 #: would otherwise be left watching the placeholder for ever.
 SILENT = "✅ agent-connect: the agent finished without an answer to give."
+#: A collaborator's reply waiting for the owner (`agent_connect.result_guard`).
+HELD = "🔒 agent-connect: this reply is waiting for the owner's review."
+#: A collaborator's reply the owner did not release. Names the reasons, never the content.
+WITHHELD = "🔒 agent-connect: this reply was withheld. It contained {why}, and the owner did not release it."
 
 DEFAULT_THROTTLE = 3.0
 DEFAULT_CEILING = 4000
@@ -303,11 +308,15 @@ class TurnReporter:
                 done = event
             else:
                 await self.on_event(event)
-        return await self.finish(
-            final_text(done, chunks),
-            done.note if done else "",
-            done.reason if done else COMPLETED,
-        )
+        answer = final_text(done, chunks)
+        note = done.note if done else ""
+        reason = done.reason if done else COMPLETED
+        held = result_guard.verdict(ctx, f"{answer}\n{note}")
+        if held.hold:
+            await self._edit(HELD)
+            if not await result_guard.ask_owner(ctx, held.why):
+                return await self.finish(WITHHELD.format(why=", ".join(held.why)), "", reason)
+        return await self.finish(answer, note, reason)
 
     async def on_event(self, event) -> None:
         """Count outcomes and signal generic activity without exposing tool metadata.
