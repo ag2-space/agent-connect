@@ -130,6 +130,7 @@ class TurnContext:
     addressed_to: str = ""
     reply_to_me: bool = False
     reply_to_sender: str = ""
+    reply_to_event: str = ""
     room_members: Tuple[str, ...] = ()
     room_member_count: int = 0
     sandbox: str = "read-only"

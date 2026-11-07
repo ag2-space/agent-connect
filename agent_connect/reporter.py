@@ -87,7 +87,7 @@ from .events import (
     TurnContext,
     final_text,
 )
-from . import result_guard
+from . import result_guard, withheld
 from .outgoing import named_files
 from .roomops import RoomOpError
 
@@ -145,12 +145,10 @@ STOP_LINES = {
 #: failure — nothing went wrong, so no broker notice is coming, and the room
 #: would otherwise be left watching the placeholder for ever.
 SILENT = "✅ agent-connect: the agent finished without an answer to give."
-#: A collaborator's reply waiting for the owner (`agent_connect.result_guard`).
-HELD = "🔒 agent-connect: this reply is waiting for the owner's review."
 #: A notice on a collaborator's Turn that the guard would have held.
 NOTICE_WITHHELD = "🔒 agent-connect: a notice about this turn was withheld because it may contain sensitive data."
-#: A collaborator's reply the owner did not release. Names the reasons, never the content.
-WITHHELD = "🔒 agent-connect: this reply was withheld. It contained {why}, and the owner did not release it."
+#: A collaborator's reply that cannot be released: a redirect, or one that could not be stored.
+WITHHELD = "🔒 agent-connect: this reply was withheld and cannot be released."
 
 DEFAULT_THROTTLE = 3.0
 DEFAULT_CEILING = 4000
@@ -316,10 +314,15 @@ class TurnReporter:
         reason = done.reason if done else COMPLETED
         held = result_guard.verdict(ctx, f"{answer}\n{note}")
         if held.hold:
+            review = None
+            if "a redirect to another room" not in held.why:
+                review = withheld.hold(ctx.room, answer, held.why)
+            if review is None:
+                return await self.finish(WITHHELD, "", reason)
+            body = await self.finish(withheld.review_message(review, held.why), "", reason)
             if self.event_id:
-                await self._edit(HELD)
-            if not await result_guard.ask_owner(ctx, held.why):
-                return await self.finish(WITHHELD.format(why=", ".join(held.why)), "", reason)
+                withheld.bind_event(review, self.event_id)
+            return body
         return await self.finish(answer, note, reason)
 
     async def on_event(self, event) -> None:

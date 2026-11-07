@@ -5,13 +5,14 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from agent_connect import hitl_seam, result_guard
 from agent_connect.events import Done, MessageChunk, TurnContext
 from types import SimpleNamespace
 
-from agent_connect.reporter import HELD, TurnReporter
+from agent_connect.reporter import TurnReporter
 
 NS_REQ = SimpleNamespace(tool_call={"toolCallId": "t1", "title": "x"}, options=[])
 
@@ -80,7 +81,10 @@ def broken(_):
 check(result_guard.verdict(ctx(), "fine", scan=broken).why == ("a scan that failed",),
       "a failed scan holds the reply")
 
-# --- the Ladder: held, then released or withheld --------------------------------
+# --- the Ladder: held for the owner, released or discarded from the room ------
+
+from agent_connect import withheld
+from agent_connect.worker import process_one
 
 
 class Ops:
@@ -106,79 +110,99 @@ class Adapter:
         yield Done()
 
 
-def run_turn(c, text, answer=None, hitl=True):
-    """One Turn through the reporter; `answer` is the owner's click, or None for none."""
-    with tempfile.TemporaryDirectory() as tmp:
-        ws = Path(tmp)
-        if hitl:
-            os.environ[hitl_seam.WORKSPACE_ENV] = str(ws)
-        os.environ[hitl_seam.TIMEOUT_ENV] = "2.5"
-        cards = []
+def run_turn(c, text, ops=None):
+    async def go():
+        o = Ops() if ops is None else ops
+        return o, await TurnReporter(o).run(Adapter(text), c)
+    return asyncio.run(go())
 
-        async def owner_clicks():
-            events = ws / "state" / "hitl" / "events"
-            while True:
-                for path in events.glob("*.json") if events.is_dir() else ():
-                    posted = json.loads(path.read_text())
-                    if posted.get("kind") == "permission" and not cards:
-                        cards.append(posted)
-                        if answer:
-                            req = ws / "state" / "hitl" / "requirements"
-                            req.mkdir(parents=True, exist_ok=True)
-                            (req / "hitl_1.json").write_text(json.dumps({"requirement": {
-                                "id": "hitl_1", "guard": posted["guard"],
-                                "chosen_action": answer, "status": "in_progress"}}))
-                await asyncio.sleep(0.01)
 
-        async def go():
-            ops = Ops()
-            clicker = asyncio.create_task(owner_clicks())
-            try:
-                body = await TurnReporter(ops).run(Adapter(text), c)
-            finally:
-                clicker.cancel()
-            return ops, body
+def owner_says(text, reply_to="$placeholder", room="!r:s.space", tier="owner"):
+    task = SimpleNamespace(
+        id="t-owner", body=text, room_id=room, room_name="", access_tier=tier,
+        requested_access_tier="", collaborator=False, sensitive_data_filter=True,
+        sender_name="Mark", user_id="@mark:s.space", source_message_id="$m",
+        addressed_to="", reply_to_me=True, reply_to_sender="", reply_to_event=reply_to,
+        room_members=(), room_member_count=0, attachments=())
 
-        try:
-            ops, body = asyncio.run(asyncio.wait_for(go(), timeout=30))
-        finally:
-            os.environ.pop(hitl_seam.WORKSPACE_ENV, None)
-            os.environ.pop(hitl_seam.TIMEOUT_ENV, None)
-        return ops, body, cards
+    class Never:
+        async def turn(self, c):
+            raise AssertionError("a release must never reach the agent")
+            yield  # pragma: no cover
+
+    return asyncio.run(process_one(task, Never(), "/tmp"))
 
 
 secret_reply = "the key is " + SAMPLES["GitHub token"]
+workspace = tempfile.mkdtemp()
+os.environ["AGENT_CONNECT_WORKSPACE"] = workspace
+held_dir = Path(workspace) / "withheld"
 
-ops, body, cards = run_turn(ctx(sender_name="cc"), secret_reply, answer=result_guard.RELEASE)
-check(HELD in ops.edits, "a held reply tells the room it is waiting for the owner")
-check(bool(cards) and "a possible GitHub token" in cards[0]["prompt"]
-      and "@cc:s.space" in cards[0]["prompt"],
-      "the owner's card names the reason and the collaborator")
-check(SAMPLES["GitHub token"] not in (cards[0]["prompt"] + cards[0]["subject"]["input"] if cards else ""),
-      "the card never shows the secret itself")
-check(SAMPLES["GitHub token"] in body or any(SAMPLES["GitHub token"] in e for e in ops.edits),
-      "a released reply is posted")
+ops, body = run_turn(ctx(), secret_reply)
+room_text = "\n".join(ops.edits + ops.messages) + body
+check(SAMPLES["GitHub token"] not in room_text, "a held reply never reaches the room")
+check("GitHub token" not in room_text, "and the room is not told which secret type matched")
+check("reply to this message" in room_text and "`release`" in room_text and "`discard`" in room_text,
+      "the withheld message tells the owner how to release or discard it")
+files = list(held_dir.glob("wr_*.json"))
+check(len(files) == 1 and json.loads(files[0].read_text())["body"] == secret_reply,
+      "the exact reply is stored on the Worker's machine")
+check(oct(held_dir.stat().st_mode & 0o777) == "0o700" and oct(files[0].stat().st_mode & 0o777) == "0o600",
+      "owner-only: the folder 0700, the file 0600")
+check(files[0].name.split(".")[0] in room_text, "the message names the review id")
 
-ops, body, _ = run_turn(ctx(), secret_reply, answer=result_guard.DISCARD)
-posted = "\n".join(ops.edits + ops.messages) + body
-check(SAMPLES["GitHub token"] not in posted, "a discarded reply is never posted or returned")
-check("withheld" in posted and "GitHub token" in posted, "the room is told it was withheld, and why")
+review_id = files[0].name.split(".")[0]
+check(json.loads(files[0].read_text())["event_id"] == "$placeholder",
+      "the review is bound to the room message that announced it")
 
-ops, body, _ = run_turn(ctx(), secret_reply, answer=None)
-check(SAMPLES["GitHub token"] not in "\n".join(ops.edits) + body, "a timeout withholds it")
 
-ops, body, _ = run_turn(ctx(), secret_reply, hitl=False)
-check(SAMPLES["GitHub token"] not in "\n".join(ops.edits) + body,
-      "with no approval cards configured, it is withheld")
+def as_ctx(text, **kw):
+    base = dict(prompt=text, room="!r:s.space", access_tier="owner",
+                reply_to_event="$placeholder", reply_to_me=True)
+    return TurnContext(**{**base, **kw})
 
-ops, body, cards = run_turn(ctx(), "All done.")
-check(not cards and HELD not in ops.edits and "All done." in "\n".join(ops.edits) + body,
-      "a clean collaborator reply is posted without asking")
 
-ops, body, cards = run_turn(owner, secret_reply)
-check(not cards and SAMPLES["GitHub token"] in "\n".join(ops.edits) + body,
-      "the owner's reply is never held")
+check(withheld.decide(as_ctx("release", access_tier="guest", collaborator=True)) is None,
+      "a collaborator saying release releases nothing")
+check(withheld.decide(as_ctx("release", room="!other:s.space")) is not None
+      and files[0].exists(), "a release in another room does not touch this review")
+check(withheld.decide(as_ctx("please release the build notes")) is None,
+      "an ordinary sentence is not a command")
+released = owner_says("release")
+check(released.startswith(secret_reply) and withheld.RELEASED_NOTE in released,
+      "the owner's reply 'release' posts the exact held reply")
+check(not files[0].exists(), "and the stored copy is deleted")
+check(owner_says("release") == withheld.NOT_FOUND, "a second release finds nothing")
 
+ops, body = run_turn(ctx(), secret_reply)
+review_id = next(held_dir.glob("wr_*.json")).name.split(".")[0]
+check(owner_says(f"release {review_id}", reply_to="").startswith(secret_reply),
+      "`release <id>` works without replying to the message")
+
+ops, body = run_turn(ctx(), secret_reply)
+check(owner_says("discard") == withheld.DISCARDED and not list(held_dir.glob("wr_*.json")),
+      "discard deletes it without posting")
+
+ops, body = run_turn(ctx(), secret_reply)
+path = next(held_dir.glob("wr_*.json"))
+record = json.loads(path.read_text())
+record["body"] = "something else the agent wrote"
+path.write_text(json.dumps(record))
+check(owner_says("release") == withheld.TAMPERED, "a reply changed on disk after it was held is refused")
+
+ops, body = run_turn(ctx(), secret_reply)
+withheld.sweep(now=time.time() + withheld.TTL_S + 1)
+check(not list(held_dir.glob("wr_*.json")), "reviews expire after 24 hours")
+
+ops, body = run_turn(ctx(), "[channel: !other:s.space]\nhi")
+check(not list(held_dir.glob("wr_*.json")) and "cannot be released" in "\n".join(ops.edits) + body,
+      "a redirect is withheld and never releasable")
+
+ops, body = run_turn(ctx(), "All done.")
+check("All done." in "\n".join(ops.edits) + body and not list(held_dir.glob("wr_*.json")),
+      "a clean collaborator reply is posted without review")
+ops, body = run_turn(owner, secret_reply)
+check(SAMPLES["GitHub token"] in "\n".join(ops.edits) + body, "the owner's reply is never held")
 # --- notes, notices, zero-width, stale releases --------------------------------
 
 
@@ -193,9 +217,7 @@ async def note_turn():
     body = await TurnReporter(ops).run(NoteAdapter(), ctx())
     return ops, body
 
-os.environ[hitl_seam.TIMEOUT_ENV] = "0"
 ops, body = asyncio.run(note_turn())
-os.environ.pop(hitl_seam.TIMEOUT_ENV, None)
 check(SAMPLES["GitHub token"] not in "\n".join(ops.edits) + body, "a secret in the note is held too")
 
 
@@ -215,37 +237,6 @@ check("GitHub token" in result_guard.secret_types("ghp_" + "a" * 10 + "\u200b" +
       "a zero-width space inside a token does not hide it")
 
 
-async def stale_release(task_id="t1"):
-    with tempfile.TemporaryDirectory() as tmp:
-        ws = Path(tmp)
-        os.environ[hitl_seam.WORKSPACE_ENV] = str(ws)
-        try:
-            async def click_first():
-                events = ws / "state" / "hitl" / "events"
-                while not (events.is_dir() and any(events.glob("*.json"))):
-                    await asyncio.sleep(0.01)
-                posted = json.loads(next(events.glob("*.json")).read_text())
-                req = ws / "state" / "hitl" / "requirements"
-                req.mkdir(parents=True, exist_ok=True)
-                (req / "hitl_1.json").write_text(json.dumps({"requirement": {
-                    "id": "hitl_1", "guard": posted["guard"],
-                    "chosen_action": result_guard.RELEASE, "status": "in_progress"}}))
-
-            clicker = asyncio.create_task(click_first())
-            first = await result_guard.ask_owner(ctx(task_id=task_id), ("a possible GitHub token",),
-                                                 timeout=3, poll=0.01)
-            await clicker
-            second = await result_guard.ask_owner(ctx(task_id=task_id), ("a redirect to another room",),
-                                                  timeout=0.2, poll=0.01)
-            return first, second
-        finally:
-            os.environ.pop(hitl_seam.WORKSPACE_ENV, None)
-
-first, second = asyncio.run(stale_release())
-check(first and not second, "a release answers only its own card, never a later ask for the same Task")
-first, second = asyncio.run(stale_release("0b8e3a52-7d3f-4c2a-9f1e-6a5b4c3d2e1f" * 2))
-check(first and not second, "and so with a long task id, where only the digest tells asks apart")
-
 for value in ("0", "false", "2", "y", "enable", "@a:b", "\uff11", "1\u200b"):
     check(result_guard.verdict(ctx(), SAMPLES["GitHub token"],
                                env={result_guard.UNCHECKED_ENV: value}).hold,
@@ -261,14 +252,11 @@ check(result_guard.notify_verdict("[channel: !x:s.space]\nhi", "!r:s.space", {"!
 
 
 async def no_placeholder():
-    os.environ[hitl_seam.TIMEOUT_ENV] = "0"
-    try:
-        return await TurnReporter(None).run(Adapter(secret_reply), ctx())
-    finally:
-        os.environ.pop(hitl_seam.TIMEOUT_ENV, None)
+    return await TurnReporter(None).run(Adapter(secret_reply), ctx())
 
 body = asyncio.run(no_placeholder())
-check(SAMPLES["GitHub token"] not in body, "with no Room Ops the reply is still withheld, without error")
+check(SAMPLES["GitHub token"] not in body and "release" in body,
+      "with no Room Ops the reply is still withheld, and the body says how to release it")
 
 if fails:
     raise SystemExit(f"FAIL — {fails} check(s)")

@@ -60,6 +60,7 @@ from typing import List, Optional, Tuple
 from ag2_relay_client.status import DISPLACED, FATAL
 
 from . import attachments as att
+from . import withheld
 from . import relay as relay_client
 from .adapters import get as get_adapter
 from .config import CONFIG_ENV, DEFAULT_PATH, ConfigError
@@ -252,6 +253,7 @@ def turn_context(task, repo: str) -> TurnContext:
         addressed_to=task.addressed_to,
         reply_to_me=task.reply_to_me,
         reply_to_sender=task.reply_to_sender,
+        reply_to_event=getattr(task, "reply_to_event", "") or "",
         room_members=task.room_members,
         room_member_count=task.room_member_count,
         sandbox=tier_to_sandbox(tier),
@@ -333,6 +335,11 @@ async def process_one(
     ctx = turn_context(task, repo)
     if not ctx.prompt:
         return ""
+    # The owner releasing or discarding a held collaborator reply. It never
+    # reaches the agent; the answer is the released reply or a short note.
+    decision = withheld.decide(ctx)
+    if decision is not None:
+        return decision.body
     reporter = TurnReporter(ops, settings)
 
     async def announce(turn) -> None:
@@ -639,6 +646,7 @@ async def serve(
     # What the agent says unasked (a scheduled task's outcome) is posted to the room
     # it names, through the same Room Ops as everything else; a dialled Agent gets a
     # standing link so that can arrive between Turns too.
+    withheld.sweep()  # reviews a previous Worker held cannot be verified
     link = start_listener_link(adapter, ops)
     try:
         while True:

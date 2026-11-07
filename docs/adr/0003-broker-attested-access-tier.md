@@ -78,7 +78,10 @@ The room's `sensitive_data_filter` flag cannot switch the check off: a room mode
 only the owner, can write an agent's card. Only the owner can, on their machine, with
 `AGENT_CONNECT_UNCHECKED_COLLABORATORS`. The flag is still passed to the agent.
 A reply matching a known secret format, carrying a `[file:]`, or failing the scan is
-held, and is posted only if the owner releases it from an approval card. A `[channel:]`
+held. It is stored owner-only in the Worker's workspace (`agent_connect.withheld`), and
+the room is told how the owner can act: reply `release` or `discard` to the withheld
+message. Only a sender the broker attests as owner can, and only if the stored copy is
+unchanged (an HMAC keyed in the Worker process). No Sutando or other service is needed. A `[channel:]`
 redirect is held whatever the setting says. The detector matches known formats only, as sparrow's does, so it is a
 backstop, not containment. A collaborator's own Turn neither offers nor posts
 `_ag2/notify`. The agent may queue a notification and send it later on a listener or an

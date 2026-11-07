@@ -12,23 +12,20 @@ the room. A reply is held for the owner when it carries:
 The room's `sensitive_data_filter` flag is not trusted to turn the check off: a
 room moderator, not only the owner, can write it.
 
-A held reply is posted only if the owner releases it from an approval card. No
-card configured, a timeout or "Discard" means it is never posted. The detector
-matches known secret formats only; it is a backstop, not containment.
+A held reply is kept for the owner to release from the room (`agent_connect.withheld`);
+a redirect is never releasable. The detector matches known secret formats only; it
+is a backstop, not containment.
 """
 from __future__ import annotations
 
 import os
 import re
 import unicodedata
-import uuid
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Mapping, Optional, Tuple
 
 from ag2_relay_client import markers
 
-from . import hitl_seam
 from .events import TurnContext
 
 OWNER = "owner"
@@ -53,8 +50,6 @@ PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
 )
 
-RELEASE = "release"
-DISCARD = "discard"
 #: Longest display name shown beside the attested Matrix id on a card.
 DISPLAY_NAME_MAX = 40
 
@@ -138,34 +133,3 @@ def asked_by(ctx: TurnContext) -> str:
         return ""
     name = _display_name(ctx.sender_name)
     return f'{ctx.user_id} ("{name}")' if name and name != ctx.user_id else ctx.user_id
-
-
-async def ask_owner(ctx: TurnContext, why: Tuple[str, ...],
-                    timeout: Optional[float] = None,
-                    poll: float = hitl_seam.DEFAULT_POLL_S) -> bool:
-    """Ask the owner on a card whether to post a held reply. False unless released."""
-    workspace = hitl_seam.configured()
-    if workspace is None:
-        return False
-    request = SimpleNamespace(
-        tool_call={
-            # Fresh per ask: a click on a card left live by a killed Worker
-            # must not release a different reply for a re-served Task.
-            "toolCallId": f"release-{ctx.task_id}-{uuid.uuid4().hex}",
-            "title": "post a collaborator's reply containing " + ", ".join(why),
-            "kind": "release",
-        },
-        options=[
-            {"optionId": RELEASE, "name": "Post it", "kind": "allow_once"},
-            {"optionId": DISCARD, "name": "Discard", "kind": "reject_once"},
-        ],
-    )
-    chosen = await hitl_seam.escalate(
-        request,
-        session="|".join(ctx.session_key),
-        workspace=workspace,
-        timeout=hitl_seam.timeout_s() if timeout is None else timeout,
-        poll=poll,
-        asked_by=asked_by(ctx),
-    )
-    return chosen == RELEASE
