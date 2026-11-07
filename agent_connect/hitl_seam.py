@@ -24,6 +24,7 @@ import os
 import re
 import tempfile
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -107,7 +108,7 @@ def event_for(request: Any, session: str, asked_by: str = "") -> dict:
     approves a collaborator's request believing it is their own."""
     tc = _tool_call_dict(request.tool_call)
     title = str(tc.get("title") or tc.get("kind") or "tool call")
-    asked_by = " ".join(asked_by.split())
+    asked_by = " ".join("".join(" " if unicodedata.category(c)[0] == "C" else c for c in asked_by).split())
     options = []
     for o in request.options or []:
         oid = _option_id(o)

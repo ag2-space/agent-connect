@@ -207,7 +207,7 @@ def turn_context(task, repo: str) -> TurnContext:
     """Build the context one Turn travels with, from a delivered Task.
 
     The Access Tier is settled here, and everything downstream — the Sandbox,
-    the Session key, the ACP Adapter's owner-only check — reads the settled
+    the Session key, the ACP Adapter's admission check — reads the settled
     value rather than the attestation. It comes from `access_tier` as the broker
     attested it and from nothing else the sender can write; `attested_tier` then
     reduces it to the two values that cross the wire, so no consumer has to
@@ -245,6 +245,7 @@ def turn_context(task, repo: str) -> TurnContext:
         access_tier=tier,
         requested_access_tier=requested_tier(task),
         collaborator=attested_collaborator(task),
+        sensitive_data_filter=getattr(task, "sensitive_data_filter", True) is not False,
         sender_name=task.sender_name,
         user_id=task.user_id,
         source_message_id=task.source_message_id,

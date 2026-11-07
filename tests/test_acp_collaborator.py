@@ -87,7 +87,8 @@ check(ctx(collaborator=False).session_key == ("!r:s.space", GUEST), "a plain gue
 meta = requester_meta(TurnContext(prompt="p", access_tier=GUEST, requested_access_tier="team",
                                   collaborator=True, user_id=AGENT))[REQUESTER_META_KEY]
 check(meta == {"user_id": AGENT, "access_tier": GUEST, "requested_access_tier": "team",
-               "collaborator": True, "admitted_as": "collaborator"},
+               "collaborator": True, "sensitive_data_filter": True,
+               "admitted_as": "collaborator"},
       "requester metadata keeps the sender, both tiers, the flag and the admission apart")
 check(requester_meta(ctx(tier=OWNER))[REQUESTER_META_KEY]["admitted_as"] == "owner",
       "the owner is admitted as owner")
@@ -167,14 +168,16 @@ with tempfile.TemporaryDirectory() as tmp:
     adapter = AcpAdapter(command=[sys.executable, FAKE, str(script)],
                          store=SessionStore(base / "sessions.json"))
     cards = []
+    real_write = hitl_seam._write_atomic
 
-    async def fake_escalate(request, *, asked_by="", **_):
-        cards.append(hitl_seam.event_for(request, "s", asked_by)["prompt"])
-        return None
+    def capture(path, body):
+        if body.get("kind") == "permission":
+            cards.append(body["prompt"])
+        real_write(path, body)
 
-    real_escalate = acp_module.hitl_seam.escalate
-    acp_module.hitl_seam.escalate = fake_escalate
+    hitl_seam._write_atomic = capture
     os.environ[hitl_seam.WORKSPACE_ENV] = str(base / "hitl")
+    os.environ[hitl_seam.TIMEOUT_ENV] = "0.2"
     os.environ[COLLABORATORS_ENV] = AGENT
     try:
         def run_turn(c):
@@ -188,20 +191,34 @@ with tempfile.TemporaryDirectory() as tmp:
         owner = run_turn(TurnContext(prompt="hi", room="!r:s.space", cwd=str(repo),
                                      access_tier=OWNER, user_id="@mark:s.space"))
     finally:
-        acp_module.hitl_seam.escalate = real_escalate
+        hitl_seam._write_atomic = real_write
         os.environ.pop(hitl_seam.WORKSPACE_ENV, None)
+        os.environ.pop(hitl_seam.TIMEOUT_ENV, None)
         os.environ.pop(COLLABORATORS_ENV, None)
 
     check(len(cards) == 2, f"both out-of-directory writes were escalated ({len(cards)})")
-    check(bool(cards) and f"asked by cc-backend ({AGENT}), a collaborator" in cards[0],
+    check(bool(cards) and f'asked by {AGENT} ("cc-backend"), a collaborator' in cards[0],
           "the collaborator's escalation card names them")
     check(len(cards) == 2 and "asked by" not in cards[1], "the owner's does not")
     asks = [e for e in collab if isinstance(e, PermissionAsked)]
-    check(bool(asks) and asks[0].detail.get("asked_by") == f"cc-backend ({AGENT})",
+    check(bool(asks) and asks[0].detail.get("asked_by") == f'{AGENT} ("cc-backend")',
           "and the collaborator's PermissionAsked carries who asked")
     owner_asks = [e for e in owner if isinstance(e, PermissionAsked)]
     check(bool(owner_asks) and "asked_by" not in owner_asks[0].detail,
           "the owner's PermissionAsked does not")
+
+# --- a display name cannot impersonate on the card ----------------------------
+from agent_connect.adapters.acp import asked_by
+
+spoof = TurnContext(prompt="p", access_tier=GUEST, collaborator=True, user_id="@evil:s.space",
+                    sender_name="owner (@owner:example) \u2014 owner\u202e" + "x" * 300)
+label = asked_by(spoof)
+check(label.startswith("@evil:s.space "), "the attested Matrix id leads the label")
+check("\u202e" not in label and len(label) < 80, "bidi overrides are stripped and the name is capped")
+check(asked_by(TurnContext(prompt="p", access_tier=OWNER, user_id="@mark:s.space")) == "",
+      "the owner gets no label")
+check(requester_meta(TurnContext(prompt="p", sensitive_data_filter=False))[REQUESTER_META_KEY]
+      ["sensitive_data_filter"] is False, "the filter flag is passed to the agent")
 
 if fails:
     raise SystemExit(f"FAIL — {fails} check(s)")

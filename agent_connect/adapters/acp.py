@@ -117,6 +117,7 @@ import asyncio
 import base64
 import contextlib
 import os
+import unicodedata
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -352,12 +353,24 @@ def admitted(ctx: TurnContext, env: Optional[Mapping[str, str]] = None) -> bool:
     return ctx.collaborator and bool(ctx.user_id) and ctx.user_id in allowed_collaborators(env)
 
 
+#: Longest display name shown beside the attested Matrix id on a card.
+DISPLAY_NAME_MAX = 40
+
+
+def _display_name(raw: str) -> str:
+    """A sender-set display name, safe to show: no format or control characters
+    (bidi overrides included), one line, capped."""
+    kept = "".join(" " if unicodedata.category(c)[0] == "C" else c for c in raw)
+    name = " ".join(kept.split())
+    return name if len(name) <= DISPLAY_NAME_MAX else name[:DISPLAY_NAME_MAX - 1] + "…"
+
+
 def asked_by(ctx: TurnContext) -> str:
-    """Who a non-owner Turn is for, as the owner should see it; `""` for the owner."""
+    """Who a non-owner Turn is for, led by the attested Matrix id; `""` for the owner."""
     if ctx.access_tier == OWNER:
         return ""
-    name = " ".join(ctx.sender_name.split())
-    return f"{name} ({ctx.user_id})" if name and name != ctx.user_id else ctx.user_id
+    name = _display_name(ctx.sender_name)
+    return f'{ctx.user_id} ("{name}")' if name and name != ctx.user_id else ctx.user_id
 
 
 def refusal(ctx: TurnContext) -> str:
@@ -617,6 +630,7 @@ def requester_meta(ctx: TurnContext) -> dict:
             "access_tier": ctx.access_tier,
             "requested_access_tier": ctx.requested_access_tier,
             "collaborator": ctx.collaborator,
+            "sensitive_data_filter": ctx.sensitive_data_filter,
             "admitted_as": "owner" if ctx.access_tier == OWNER else "collaborator",
         }
     }
@@ -1312,7 +1326,8 @@ class AcpAdapter:
                 # The Policy could not allow it; the owner decides from a chat
                 # card. The core awaits this coroutine; a timeout is the reject.
                 chosen = await hitl_seam.escalate(
-                    request, session=key, workspace=hitl_ws, timeout=hitl_seam.timeout_s(),
+                    request, session="|".join(key), workspace=hitl_ws,
+                    timeout=hitl_seam.timeout_s(),
                     asked_by=requester,
                 )
                 allowed = chosen is not None and chosen != decision.option_id

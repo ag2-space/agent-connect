@@ -123,6 +123,7 @@ class TurnContext:
     #: The broker's `requested_access_tier` and exact `collaborator`, verbatim.
     requested_access_tier: str = ""
     collaborator: bool = False
+    sensitive_data_filter: bool = True
     sender_name: str = ""
     user_id: str = ""
     source_message_id: str = ""
