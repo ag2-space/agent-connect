@@ -102,6 +102,28 @@ def verdict(ctx: TurnContext, body: str, scan=secret_types,
     return Verdict(bool(why), tuple(why))
 
 
+def notify_verdict(text: str, destination: str, owner_rooms, scan=secret_types,
+                   env: Optional[Mapping[str, str]] = None) -> Verdict:
+    """Whether an unsolicited `_ag2/notify` must be dropped while collaborators are
+    listed. The agent queues a notification until some client receives it, so one a
+    collaborator induced can arrive on a listener or an owner's Turn; the Turn it
+    came from is unknown, so every notification is checked."""
+    why = []
+    if destination not in owner_rooms:
+        why.append("a room with no owner Session")
+    kinds = {action.kind for action in markers.parse(text or "").actions}
+    if "redirect" in kinds:
+        why.append("a redirect to another room")
+    if scanning(env):
+        if "attach" in kinds:
+            why.append("a file, which cannot be scanned")
+        try:
+            why += [f"a possible {name}" for name in scan(text)]
+        except Exception:  # noqa: BLE001
+            why.append("a scan that failed")
+    return Verdict(bool(why), tuple(why))
+
+
 def _display_name(raw: str) -> str:
     """A sender-set display name, safe to show: no control or format characters
     (bidi overrides included), one line, capped."""

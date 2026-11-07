@@ -188,6 +188,27 @@ check(got == [], "a notification on a collaborator's Turn is never posted")
 asyncio.run(relay._on_notification(note))
 check(got == ["secret"], "while an owner's Turn posts it, as before")
 
+os.environ[COLLABORATORS_ENV] = AGENT
+try:
+    relay._owner_rooms = {"!dm:s.space"}
+    relay._store = SessionStore(Path(tempfile.mkdtemp()) / "s.json")
+    got.clear()
+    asyncio.run(relay._on_notification(Notification(NOTIFY_METHOD, {
+        "destination": "!dm:s.space", "text": "key ghp_" + "a" * 36})))
+    check(got == [], "with collaborators listed, a notification carrying a secret is withheld")
+    asyncio.run(relay._on_notification(Notification(NOTIFY_METHOD, {
+        "destination": "!elsewhere:s.space", "text": "done"})))
+    check(got == [], "and one to a room with no owner Session is withheld")
+    asyncio.run(relay._on_notification(Notification(NOTIFY_METHOD, {
+        "destination": "!dm:s.space", "text": "nightly build passed"})))
+    check(got == ["nightly build passed"], "while a clean one to an owner room is posted")
+finally:
+    os.environ.pop(COLLABORATORS_ENV, None)
+got.clear()
+asyncio.run(relay._on_notification(Notification(NOTIFY_METHOD, {
+    "destination": "!elsewhere:s.space", "text": "key ghp_" + "a" * 36})))
+check(len(got) == 1, "with no collaborators listed, notify is unchanged")
+
 # --- card guards cannot collide across Sessions -------------------------------
 from agent_connect import hitl_seam
 tc = SimpleNamespace(tool_call={"toolCallId": "t1"}, options=[])

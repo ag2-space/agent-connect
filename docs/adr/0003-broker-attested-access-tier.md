@@ -81,7 +81,10 @@ A reply matching a known secret format, carrying a `[file:]`, or failing the sca
 held, and is posted only if the owner releases it from an approval card. A `[channel:]`
 redirect is held whatever the setting says. The detector matches known formats only, as sparrow's does, so it is a
 backstop, not containment. A collaborator's own Turn neither offers nor posts
-`_ag2/notify`. The agent's own tools are outside this: a listed sender can steer it into,
+`_ag2/notify`. The agent may queue a notification and send it later on a listener or an
+owner's Turn, and the Worker cannot tell which Turn caused it. So while any collaborator is
+listed, every `_ag2/notify` goes through the same check and may only target a room with an
+owner Session; one that fails is withheld and logged. The agent's own tools are outside this: a listed sender can steer it into,
 for example, changing and running one of the owner's scheduled tasks, whose outcome is
 posted unchecked. Scoping such tools by requester belongs to the agent. Everyone else is refused as
 before. This matches sparrow's per-adapter `--allow-collaborator` opt-in, narrowed to

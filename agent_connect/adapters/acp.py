@@ -117,6 +117,7 @@ import asyncio
 import base64
 import contextlib
 import os
+import sys
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -126,6 +127,7 @@ from urllib.parse import urlsplit
 
 from .. import attachments as att
 from .. import hitl_seam
+from .. import result_guard
 from ..result_guard import asked_by
 from .. import outgoing
 from ..acp.core import (
@@ -1039,6 +1041,8 @@ class AcpAdapter:
         #: None drops such notifications, which is what a Worker without Room
         #: Ops can honestly do.
         self._notifier = None
+        #: Rooms an owner Turn ran in during this process (`owner_rooms`).
+        self._owner_rooms: set = set()
 
     def set_notifier(self, post) -> None:
         """Where a message the ACP Agent sends unasked goes: `post(destination, text)`."""
@@ -1054,12 +1058,27 @@ class AcpAdapter:
     async def _ignore_notification(self, notification) -> None:
         """A collaborator's Turn: nothing the agent sends unasked is posted from it."""
 
+    def owner_rooms(self) -> set:
+        """Rooms this Worker has run an owner Turn in, from its Session map."""
+        try:
+            keys = self.store().keys()
+        except Exception:  # noqa: BLE001 — no readable map means no known rooms
+            keys = []
+        return {room for room, tier in keys if tier == OWNER} | self._owner_rooms
+
     async def _on_notification(self, notification) -> None:
         if self._notifier is None:
             return
         message = room_message(notification)
-        if message is not None:
-            await self._notifier(*message)
+        if message is None:
+            return
+        if allowed_collaborators():
+            held = result_guard.notify_verdict(message[1], message[0], self.owner_rooms())
+            if held.hold:
+                print(f"agent-connect: withheld a notification to {message[0]}: "
+                      f"it contained {', '.join(held.why)}", file=sys.stderr)
+                return
+        await self._notifier(*message)
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<AcpAdapter {self._url or self._command or 'from ' + COMMAND_ENV}>"
@@ -1235,6 +1254,8 @@ class AcpAdapter:
         if not admitted(ctx):
             yield Done(reason=REFUSED, text=refusal(ctx))
             return
+        if ctx.access_tier == OWNER and ctx.room:
+            self._owner_rooms.add(ctx.room)
 
         try:
             endpoint = self.endpoint()
