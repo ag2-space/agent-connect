@@ -34,7 +34,7 @@ keywords = ["ag2space", "codex", "matrix", "agent", "bridge"]
 # library it was never built against.
 dependencies = [
     "agent-client-protocol>=0.12,<1.0",
-    "ag2-relay-client>=0.2.0,<0.3",
+    "ag2-relay-client>=0.3.0,<0.4",
 ]
 
 [tool.uv.sources]

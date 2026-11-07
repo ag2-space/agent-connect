@@ -113,7 +113,7 @@ class Adapter:
 def run_turn(c, text, ops=None):
     async def go():
         o = Ops() if ops is None else ops
-        return o, await TurnReporter(o).run(Adapter(text), c)
+        return o, (await TurnReporter(o).run(Adapter(text), c)).body
     return asyncio.run(go())
 
 
@@ -130,7 +130,7 @@ def owner_says(text, reply_to="$placeholder", room="!r:s.space", tier="owner"):
             raise AssertionError("a release must never reach the agent")
             yield  # pragma: no cover
 
-    return asyncio.run(process_one(task, Never(), "/tmp"))
+    return asyncio.run(process_one(task, Never(), "/tmp")).body
 
 
 secret_reply = "the key is " + SAMPLES["GitHub token"]
@@ -142,8 +142,8 @@ ops, body = run_turn(ctx(), secret_reply)
 room_text = "\n".join(ops.edits + ops.messages) + body
 check(SAMPLES["GitHub token"] not in room_text, "a held reply never reaches the room")
 check("GitHub token" not in room_text, "and the room is not told which secret type matched")
-check("reply to this message" in room_text and "`release`" in room_text and "`discard`" in room_text,
-      "the withheld message tells the owner how to release or discard it")
+check("`release wr_" in room_text and "`discard wr_" in room_text,
+      "the withheld message tells the owner how to release or discard it, by review id")
 files = list(held_dir.glob("wr_*.json"))
 check(len(files) == 1 and json.loads(files[0].read_text())["body"] == secret_reply,
       "the exact reply is stored on the Worker's machine")
@@ -152,8 +152,8 @@ check(oct(held_dir.stat().st_mode & 0o777) == "0o700" and oct(files[0].stat().st
 check(files[0].name.split(".")[0] in room_text, "the message names the review id")
 
 review_id = files[0].name.split(".")[0]
-check(withheld._EVENT.get(review_id) == "$placeholder" and "event_id" not in json.loads(files[0].read_text()),
-      "the review is bound to the room message that announced it, in memory, not on disk")
+check("event_id" not in json.loads(files[0].read_text()),
+      "nothing on disk points the review at a room message")
 
 
 def as_ctx(text, **kw):
@@ -162,17 +162,19 @@ def as_ctx(text, **kw):
     return TurnContext(**{**base, **kw})
 
 
-check(withheld.decide(as_ctx("release", access_tier="guest", collaborator=True)) is None,
+check(withheld.decide(as_ctx(f"release {review_id}", access_tier="guest", collaborator=True)) is None,
       "a collaborator saying release releases nothing")
-check(withheld.decide(as_ctx("release", room="!other:s.space")) is not None
+check(withheld.decide(as_ctx(f"release {review_id}", room="!other:s.space")) is not None
       and files[0].exists(), "a release in another room does not touch this review")
 check(withheld.decide(as_ctx("please release the build notes")) is None,
       "an ordinary sentence is not a command")
-released = owner_says("release")
+check(withheld.decide(as_ctx("release")) is None,
+      "a bare 'release' replying to an unbound message is the agent's, not a command")
+released = owner_says(f"release {review_id}")
 check(released.startswith(secret_reply) and withheld.RELEASED_NOTE in released,
-      "the owner's reply 'release' posts the exact held reply")
+      "the owner's `release <id>` posts the exact held reply")
 check(not files[0].exists(), "and the stored copy is deleted")
-check(owner_says("release") == withheld.NOT_FOUND, "a second release finds nothing")
+check(owner_says(f"release {review_id}") == withheld.NOT_FOUND, "a second release finds nothing")
 
 ops, body = run_turn(ctx(), secret_reply)
 review_id = next(held_dir.glob("wr_*.json")).name.split(".")[0]
@@ -180,7 +182,8 @@ check(owner_says(f"release {review_id}", reply_to="").startswith(secret_reply),
       "`release <id>` works without replying to the message")
 
 ops, body = run_turn(ctx(), secret_reply)
-check(owner_says("discard") == withheld.DISCARDED and not list(held_dir.glob("wr_*.json")),
+review_id = next(held_dir.glob("wr_*.json")).stem
+check(owner_says(f"discard {review_id}") == withheld.DISCARDED and not list(held_dir.glob("wr_*.json")),
       "discard deletes it without posting")
 
 ops, body = run_turn(ctx(), secret_reply)
@@ -188,7 +191,7 @@ path = next(held_dir.glob("wr_*.json"))
 record = json.loads(path.read_text())
 record["body"] = "something else the agent wrote"
 path.write_text(json.dumps(record))
-check(owner_says("release") == withheld.TAMPERED, "a reply changed on disk after it was held is refused")
+check(owner_says(f"release {path.stem}") == withheld.TAMPERED, "a reply changed on disk after it was held is refused")
 
 ops, body = run_turn(ctx(), secret_reply)
 withheld.sweep(now=time.time() + withheld.TTL_S + 1)
@@ -305,7 +308,7 @@ class NoDm(AskingOps):
 
 ops, body = run_turn(ctx(), secret_reply, ops=NoDm())
 fallback = "\n".join(ops.edits) + body
-check("`release`" in fallback and str(Path(workspace)) not in fallback,
+check("`release wr_" in fallback and str(Path(workspace)) not in fallback,
       "with no private DM to ask in, the room message says how to release it, without the local path")
 for leftover in held_dir.glob("wr_*.json"):
     leftover.unlink()
@@ -339,7 +342,7 @@ for field, value in (("cwd", "/somewhere/else"), ("expires_at", 9e12)):
     path.write_text(json.dumps(record))
     asking.sync.answers["q1"] = ("answered", "release")
     asyncio.run(withheld.check_answers(asking))
-    check(not asking.messages[1:], f"a tampered {field} is never released")
+    check(not asking.messages, f"a tampered {field} is never released")
     for leftover in held_dir.glob("wr_*.json"):
         leftover.unlink()
 
@@ -353,7 +356,7 @@ broken.write_text(json.dumps(record))
 asking.sync.answers["q1"] = ("answered", "release")
 asking.sync.answers["q2"] = ("answered", "release")
 asyncio.run(withheld.check_answers(asking))
-check(any(SAMPLES["GitHub token"] in m for m in asking.messages[1:]) and not good.exists(),
+check(any(SAMPLES["GitHub token"] in m for m in asking.messages) and not good.exists(),
       "one broken review does not stop the others")
 for leftover in held_dir.glob("wr_*.json"):
     leftover.unlink()
@@ -363,7 +366,8 @@ class RaceOps(AskingOps):
     """Answers Post it, and meanwhile the owner releases it from the room."""
 
     async def _answer(self, question_id):
-        self.room_release = withheld.decide(as_ctx("release"))
+        review = next(held_dir.glob("wr_*.json")).stem
+        self.room_release = withheld.decide(as_ctx(f"release {review}"))
         return "answered", "release"
 
 
@@ -393,7 +397,7 @@ foreign = AskingOps()
 foreign.sync.__class__ = ForeignSync
 run_turn(ctx(), secret_reply, ops=foreign)
 asyncio.run(withheld.check_answers(foreign))
-check(len(list(held_dir.glob("wr_*.json"))) == 1 and len(foreign.messages) == 1,
+check(len(list(held_dir.glob("wr_*.json"))) == 1 and not foreign.messages,
       "an answer that is not the owner's releases nothing")
 for leftover in held_dir.glob("wr_*.json"):
     leftover.unlink()
@@ -420,7 +424,7 @@ class NoteAdapter:
 
 async def note_turn():
     ops = Ops()
-    body = await TurnReporter(ops).run(NoteAdapter(), ctx())
+    body = (await TurnReporter(ops).run(NoteAdapter(), ctx())).body
     return ops, body
 
 ops, body = asyncio.run(note_turn())
@@ -456,7 +460,7 @@ check(result_guard.notify_verdict("[channel: !x:s.space]\nhi", "!r:s.space", {"!
 
 
 async def no_placeholder():
-    return await TurnReporter(None).run(Adapter(secret_reply), ctx())
+    return (await TurnReporter(None).run(Adapter(secret_reply), ctx())).body
 
 body = asyncio.run(no_placeholder())
 check(SAMPLES["GitHub token"] not in body and "release" in body,

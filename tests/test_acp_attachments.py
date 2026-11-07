@@ -356,7 +356,7 @@ bench = Bench(ANSWERS)
 out = bench.handle("e1", "what is in this file?",
                    attachments=[bench.file("shot.png", PNG)],
                    access_tier="other")
-check("only answer my owner" in out and bench.report() is None,
+check("only work for my owner" in out and bench.report() is None,
       "a Task at another Tier is refused before an attachment is opened at all")
 
 print("\n" + ("PASS — acp attachments green" if fails == 0

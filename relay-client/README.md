@@ -44,9 +44,21 @@ if task:
 ```
 
 Two things wide, and that is the whole consumer surface: Tasks come out of an
-in-memory queue, answers go back through `complete` — or `reject(id, reason)`,
-which dead-letters a permanently malformed task instead of letting it re-serve
-five times.
+in-memory queue, and each one goes back through exactly one of:
+
+- `complete(id, body)`: an answer, sent with `status: "completed"`. The broker
+  posts it once and core-api's activity ledger records the task as responded.
+- `no_action(id, outcome="")`: nothing to say, sent as `status:
+  "no_action_needed"`. Nothing is posted; the ledger records no action.
+- `fail(id, diagnostics="")`: the agent could not finish, sent as `status:
+  "failed"`. The broker posts its one failure notice; the diagnostics are
+  archived, never shown.
+- `reject(id, reason)`: dead-letters a permanently malformed task instead of
+  letting it re-serve five times.
+
+Every result echoes the `lease_id` and `execution_generation` the task was
+served under, refreshed when the broker re-serves it. A result the ledger
+refuses as superseded (another serve owns the task) is dropped, not retried.
 
 `complete` is not a POST with extra steps. It reads the result-marker grammar
 (below), uploads any file the body names **from an allowlisted path**, appends a
@@ -94,9 +106,9 @@ plainly:
 - An answer is **retained until the broker takes it**. A failed POST, a killed
   process: the answer is on disk and goes out on a later pass, under the same
   id, which the broker dedups.
-- A blank answer is refused. "Nothing to say" is `[no-send]`, which completes
-  the lease and posts nothing; a blank body means "not ready", and delivering it
-  would archive the task and strand the real answer.
+- A blank answer is refused. "Nothing to say" is `no_action` (or a `[no-send]`
+  body), which completes the lease and posts nothing; a blank body means "not
+  ready", and delivering it would archive the task and strand the real answer.
 
 Everything the loop knows about itself is readable while it runs:
 `client.snapshot()` for a thread-safe copy, `client.on_status(hook)` for a
@@ -306,8 +318,8 @@ Speaking in a room *as* the agent identity — post, edit, react, upload:
 
 ```python
 rooms = client.room_ops                         # built from `egress_roots`
-event = rooms.message(room_id, "⏳ On it...")   # keep the id; the ladder needs it
-rooms.edit(room_id, event, answer)              # ...then complete with [REPLIED]
+event = rooms.message(room_id, "the context was reset")   # a notice of your own
+rooms.edit(room_id, event, "corrected text")
 ```
 
 `client.room_ops` is read-only and holds no reachable bearer: four ops, and the
@@ -399,9 +411,12 @@ refused file explained in-band as `[attachment not sent: …]`.
 
 Two properties are worth stating out loud:
 
-- `[no-send]` / `[REPLIED]` / `[deduped: <id>]` **still POST**. They complete
-  the lease with no user-visible message; skipping the POST as well leaves the
-  lease to expire and the task to be re-served for ever.
+- `[no-send]` / `[REPLIED]` / `[deduped: <id>]` **still POST**, as
+  `no_action_needed`. They complete the lease with no user-visible message;
+  skipping the POST as well leaves the lease to expire and the task to be
+  re-served for ever. A consumer that posted its own answer through Room Ops
+  and completes with `[REPLIED]` is recorded as no action, not responded: let
+  `complete` deliver the answer instead.
 - A **retried result POST uploads nothing more**. The body is re-derived from
   the same markers and the `(task, path)` ledger answers for the second pass;
   the ledger is retired by the POST that finally succeeds, because only success

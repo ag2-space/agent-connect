@@ -25,6 +25,10 @@
 #   --acp-token AGENT_CONNECT_ACP_TOKEN  bearer for that URL's door
 #   --acp-command AGENT_CONNECT_ACP_COMMAND  the ACP agent's command line, run as
 #             typed. Overrides any preset. Omitted on a re-run, the stored one is kept.
+#   --collaborators AGENT_CONNECT_ACP_COLLABORATORS  exact Matrix ids, comma
+#             separated, of the agents and people allowed to use an ACP agent
+#             besides you (they also need Collaborator access in the room).
+#             "" clears the list. Omitted on a re-run, the stored list is kept.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
 #   --instance AGENT_CONNECT_INSTANCE  separate config, workspace and service
 #                                    [default: default, the legacy single-agent install]
@@ -72,7 +76,7 @@ START=1
 # here rather than left to pyproject because this line is what a fresh host
 # resolves: without it an installer run can settle on a pre-transport worker
 # that still expects task files.
-AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.2.0}"
+AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.4.0}"
 ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-}"
 # Empty means "not asked for". The default is settled after arg parsing,
 # because it depends on whether a command was supplied.
@@ -83,6 +87,10 @@ ACP_TOKEN="${AGENT_CONNECT_ACP_TOKEN:-}"
 # re-run that only supplies a new one must replace the stored bearer rather than
 # leave the worker authenticating with a credential the operator just revoked.
 ACP_TOKEN_GIVEN=0
+# Given means the flag or the variable was supplied, even empty (which clears).
+COLLABORATORS="${AGENT_CONNECT_ACP_COLLABORATORS:-}"
+COLLABORATORS_GIVEN=0
+[ -z "${AGENT_CONNECT_ACP_COLLABORATORS+x}" ] || COLLABORATORS_GIVEN=1
 # Supplied is supplied: the documented interface is a flag *or* the environment
 # variable, and an operator who exported a fresh bearer and re-ran the installer
 # has rotated it just as much as one who typed the flag. Reading only the flag
@@ -132,6 +140,7 @@ while [ $# -gt 0 ]; do
     --acp-command) ACP_COMMAND="$2"; shift 2 ;;
     --acp-url) ACP_URL="$2"; shift 2 ;;
     --acp-token) ACP_TOKEN="$2"; ACP_TOKEN_GIVEN=1; shift 2 ;;
+    --collaborators) COLLABORATORS="${2-}"; COLLABORATORS_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --collaborators needs a list (or "").' >&2; exit 2; }; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --instance) INSTANCE="${2:-}"; INSTANCE_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --instance needs a name.' >&2; exit 2; }; shift 2 ;;
     --agent-id) AGENT_ID="${2:-}"; AGENT_ID_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --agent-id needs a Matrix id.' >&2; exit 2; }; shift 2 ;;
@@ -143,6 +152,7 @@ while [ $# -gt 0 ]; do
     --acp-command=*) ACP_COMMAND="${1#*=}"; shift ;;
     --acp-url=*) ACP_URL="${1#*=}"; shift ;;
     --acp-token=*) ACP_TOKEN="${1#*=}"; ACP_TOKEN_GIVEN=1; shift ;;
+    --collaborators=*) COLLABORATORS="${1#*=}"; COLLABORATORS_GIVEN=1; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
     --instance=*) INSTANCE="${1#*=}"; INSTANCE_GIVEN=1; shift ;;
     --agent-id=*) AGENT_ID="${1#*=}"; AGENT_ID_GIVEN=1; shift ;;
@@ -270,6 +280,18 @@ if [ "$INSTANCE" != default ]; then
   SERVICE_UNIT="agent-connect-$INSTANCE.service"
 fi
 mkdir -p "$APP_DIR"
+# Exact Matrix ids only: a typo here would silently admit nobody, or the wrong id.
+if [ "$COLLABORATORS_GIVEN" -eq 1 ]; then
+  _clean=""
+  for _id in $(printf '%s' "$COLLABORATORS" | tr ',' ' '); do
+    printf '%s\n' "$_id" | grep -Eq '^@[^@:[:space:]]+:[^@:[:space:]]+(:[0-9]+)?$' || {
+      echo "install.sh: --collaborators: not a Matrix id: $_id (expected @name:server)" >&2
+      exit 2
+    }
+    _clean="${_clean:+$_clean,}$_id"
+  done
+  COLLABORATORS="$_clean"
+fi
 # Named here rather than at 1c: the ACP decisions below need to read it.
 CONFIG="$APP_DIR/config.env"
 
@@ -470,6 +492,7 @@ if [ -f "$CONFIG" ]; then
     # credential beside it is replaced.
     MANAGED="$MANAGED|AGENT_CONNECT_ACP_TOKEN"
   fi
+  [ "$COLLABORATORS_GIVEN" -eq 0 ] || MANAGED="$MANAGED|AGENT_CONNECT_ACP_COLLABORATORS"
   KEPT="$(grep -v -E "^[[:space:]]*($MANAGED)[[:space:]]*=" "$CONFIG" \
           | grep -v -E '^[[:space:]]*(#|$)' || true)"
 fi
@@ -498,6 +521,9 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     [ -z "$ACP_CMD_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_COMMAND=\"$ACP_COMMAND\""
     [ -z "$ACP_URL_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_URL=\"$ACP_URL\""
     [ -z "$ACP_TOKEN_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_TOKEN=\"$ACP_TOKEN\""
+    if [ "$COLLABORATORS_GIVEN" -eq 1 ] && [ -n "$COLLABORATORS" ]; then
+      printf '%s\n' "AGENT_CONNECT_ACP_COLLABORATORS=\"$COLLABORATORS\""
+    fi
     if [ -n "$KEPT" ]; then
       printf '\n'
       printf '%s\n' "# kept from your previous config.env:"

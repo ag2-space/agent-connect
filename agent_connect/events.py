@@ -127,6 +127,8 @@ class TurnContext:
     sender_name: str = ""
     user_id: str = ""
     source_message_id: str = ""
+    #: The thread the message was posted in, as the broker sent it; "" at top level.
+    thread_root: str = ""
     addressed_to: str = ""
     reply_to_me: bool = False
     reply_to_sender: str = ""

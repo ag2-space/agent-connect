@@ -1,72 +1,25 @@
-"""The Ladder: one message, from acknowledgement to answer.
+"""One Turn's outcome, as the broker delivers it (ADR 0002, amended for 0.4.0).
 
-The shape is the relay protocol's, not ours, and `docs/adr/0002` fixes it:
+The Worker posts no placeholder and edits nothing into an answer. The broker's
+intake reaction and s.space's queued / working / replied indicators show that
+the agent took the request; the Turn ends in one `Outcome`, which the Worker
+hands to the relay client:
 
-1. The **broker** places the intake reaction when it acknowledges the Task.
-   The Worker must not — a second one is not a second opinion, it is a bug the
-   room can see.
-2. The Worker posts the **fleet-wide placeholder copy** and keeps the event
-   identifier that comes back.
-3. It **edits that same message** as the work proceeds.
-4. It **edits it into the answer**, and completes the lease with the terminal
-   marker so the delivery path posts nothing further. Exactly one reply.
+- `completed`: the answer is the result body, and the broker posts it once, as
+  a reply to the request. The activity ledger records the task as responded.
+- `no_action`: the agent had nothing to say — no text, or exactly `NO_REPLY`.
+  Nothing is posted and nobody is mentioned; the ledger records no action.
+- `failed`: the Turn produced nothing and did not end normally. The broker
+  posts its one failure notice; the diagnostics go to the archived result.
 
-Step 3 is *our* extension on top of a canonical two-step shape, and it is
-switchable off in one setting (`AGENT_CONNECT_LIVE_PROGRESS=0`), because the
-placeholder copy is fleet-wide and its owners may judge live editing to be
-noise. Retreating must cost a setting, not a rewrite.
-
-Three rules govern what the room sees while the work runs:
-
-*Tool activity, not text.* Progress says "Working…", never raw tool titles or
-the answer as it is being typed. An edit per message chunk would be a storm of replacements
-for content the final edit overwrites anyway.
-
-*Throttled.* At most one progress edit per throttle window, however busy the
-Turn is. The generic activity edit is sent only once per Turn.
-
-*Never the model's reasoning.* `Thinking` is in the vocabulary so that some
-consumer *may* read it. The room is not that consumer, and there is a test that
-says so.
-
-A `Notice` breaks the one-message shape on purpose, and only it does. An
-announcement — "the context was reset", "your message is queued" — is a fact
-about the run and not part of the answer, so it is posted as **its own message**
-and the placeholder is left alone. Editing the placeholder into an announcement
-would replace the answer with a remark about it.
-
-**A message that names an agent is stamped for it.** In a room shared with
-another agent, the broker delivers a message to that agent only when its full
-mxid is on the message — stamped in `m.mentions`, or written whole in the body
-— and the other agent ignores agent-authored messages it is not named in. So
-every message this reporter posts as its own carries `mentions` for the room
-members whose mxids it names (`mentioned_mxids`), and the placeholder carries
-none: it is for nobody in particular. The answer itself still travels as an
-edit of the placeholder, and whether the broker routes an edit to an agent
-named in it is the broker's to say, not assumed here.
-
-**Endings tell the truth, and there are two kinds of them.** A Turn that
-produced *something* and stopped short — a timeout that nearly finished, a token
-limit — keeps what it produced and carries an explicit line saying it was
-interrupted; silence that reads like a finished answer is the failure being
-prevented. A Turn that produced *nothing* — a refusal, an empty timeout, a dead
-bridge — is a **structured rejection**: the result body is marked `[no-send]`,
-the placeholder is left exactly as it is, and the Worker writes no failure
-message of its own. The broker owns that message, and two apologies for one
-failure is the thing the spec forbids.
-
-The reporter is the only thing that knows this contract. It works the same for
-the ACP Adapter and for a shimmed one, which simply emits fewer events: a
-shimmed Adapter gets a placeholder and a final answer, with nothing in between,
-and no code here is aware of the difference.
+A `Notice` is a fact about the run ("the context was reset"), posted as its own
+message through Room Ops; one that cannot be posted leads the answer instead.
 """
 from __future__ import annotations
 
-import os
-import time
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Mapping, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 from ag2_relay_client.markers import mxids_in
 
@@ -88,50 +41,21 @@ from .events import (
     final_text,
 )
 from . import result_guard, withheld
-from .outgoing import named_files
 from .roomops import RoomOpError
 
-#: The fleet-wide placeholder copy. Not ours to reword: every agent on the
-#: platform posts this same sentence, and a room learns to read it at a glance.
-PLACEHOLDER = "⏳ On it..."
+#: What an agent replies, alone, when the message needs no answer.
+NO_REPLY = "NO_REPLY"
 
-#: Completes the lease. The relay client archives the result and posts nothing,
-#: because the answer is already in the room. It must start the result body.
-REPLIED = "[REPLIED]"
+#: How a Turn ended, as the relay client reports it to the broker.
+ANSWERED = "completed"
+NO_ACTION = "no_action"
+FAILED_OUTCOME = "failed"
 
-#: What the placeholder becomes when the answer was too long to edit in. The
-#: answer follows as its own message, through the result path, which the relay
-#: client already knows how to chunk.
-POINTER = "✅ Done — the answer was too long for this message, so it follows below."
-
-#: What the placeholder becomes when the reply carries a file. Same branch, and
-#: now for a sharper reason: the file markers are read by the Relay Client's
-#: `complete`, and a skip marker is **terminal** — a `[REPLIED]` body is never
-#: parsed past, so the file would never leave. The reply and its files arrive
-#: together, just below.
-FILE_POINTER = "✅ Done — the reply and its file follow below."
-FILE_POINTER_MANY = "✅ Done — the reply and its {count} files follow below."
-
-#: What a person is told when their message arrives while the Session is busy.
-#: Only one Turn at a time may be open on a Session, so the message waits — and
-#: a wait nobody was told about is indistinguishable from a message that was
-#: dropped.
-QUEUED = ("📥 agent-connect: I am still working on an earlier message in this "
-          "room, so this one is queued and will be answered next{others}.")
-
-#: The structured rejection. `[no-send]` is one of the three skip markers the
-#: relay client's `parse_markers()` recognises at the start of a result body:
-#: the result is archived and **nothing at all is delivered**, which is exactly
-#: what "the broker owns the failure notice" needs. It is not a marker invented
-#: here — `worker.py` has written `[no-send] empty task` since long before the
-#: Ladder existed, and this is the same shape with a reason attached.
+#: The skip marker an archived, undelivered result starts with.
 NO_SEND = "[no-send]"
 
-#: The line that says a Turn ended somewhere other than a finished answer, for
-#: each reason that is not completion. Used only when the Adapter gave no note
-#: of its own; an Adapter that explained itself is not corrected. What must
-#: never happen is neither: a Turn that stopped short and reads as if it had
-#: not is the failure this table exists to prevent.
+#: The line that says a Turn ended somewhere other than a finished answer, used
+#: when the Adapter gave no note of its own.
 STOP_LINES = {
     TIMEOUT: "⏱ agent-connect: the turn ran past its deadline and was interrupted.",
     CANCELLED: "🛑 agent-connect: the turn was cancelled before it finished.",
@@ -141,72 +65,30 @@ STOP_LINES = {
     FAILED: "⚠️ agent-connect: the turn did not finish.",
 }
 
-#: What the room is told when the agent finished without saying anything. Not a
-#: failure — nothing went wrong, so no broker notice is coming, and the room
-#: would otherwise be left watching the placeholder for ever.
-SILENT = "✅ agent-connect: the agent finished without an answer to give."
 #: A notice on a collaborator's Turn that the guard would have held.
 NOTICE_WITHHELD = "🔒 agent-connect: a notice about this turn was withheld because it may contain sensitive data."
 #: A collaborator's reply that cannot be released: a redirect, or one that could not be stored.
 WITHHELD = "🔒 agent-connect: this reply was withheld and cannot be released."
-
-DEFAULT_THROTTLE = 3.0
-DEFAULT_CEILING = 4000
-
-LIVE_ENV = "AGENT_CONNECT_LIVE_PROGRESS"
-THROTTLE_ENV = "AGENT_CONNECT_PROGRESS_THROTTLE"
-CEILING_ENV = "AGENT_CONNECT_EDIT_CEILING"
-
-_OFF = ("0", "false", "no", "off")
+#: The owner's activity row for a Turn that needed no reply.
+NO_ACTION_OUTCOME = "The agent had nothing to add."
 
 
 @dataclass(frozen=True)
-class LadderSettings:
-    """How much of the Ladder this Worker climbs.
+class Outcome:
+    """How one Turn ended: `kind` is `ANSWERED`, `NO_ACTION` or `FAILED_OUTCOME`.
+    `body` is the answer for `ANSWERED`, archived diagnostics for `FAILED_OUTCOME`."""
 
-    `live` is the one setting the spec promises: false leaves the canonical
-    two-step shape — placeholder, then answer — untouched underneath.
-    """
-
-    live: bool = True
-    throttle: float = DEFAULT_THROTTLE
-    ceiling: int = DEFAULT_CEILING
-
-    @classmethod
-    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "LadderSettings":
-        env = os.environ if env is None else env
-        return cls(
-            live=(env.get(LIVE_ENV, "").strip().lower() or "1") not in _OFF,
-            throttle=_number(env.get(THROTTLE_ENV), DEFAULT_THROTTLE, float),
-            ceiling=_number(env.get(CEILING_ENV), DEFAULT_CEILING, int),
-        )
+    kind: str
+    body: str = ""
 
 
-def _number(raw, fallback, cast):
-    """A setting a person typed, or the default — never a crash at startup."""
-    try:
-        value = cast(str(raw).strip())
-    except (TypeError, ValueError, AttributeError):
-        return fallback
-    return value if value >= 0 else fallback
+def is_no_reply(text: str) -> bool:
+    """The whole reply is the `NO_REPLY` sentinel: exact, never a substring."""
+    return (text or "").strip() == NO_REPLY
 
 
 def mentioned_mxids(body: str, room_members: Sequence[str] = ()) -> List[str]:
-    """The full mxids a body names — who a message about it is for.
-
-    Full mxids only, because that is the routing token: the broker delivers a
-    message to an agent when the agent's mxid is stamped on it or written whole
-    in the body, and a bare localpart or a display name is an address for a
-    person, not for the deliverer. The grammar is the library's
-    (`ag2_relay_client.markers.mxids_in`), not a second copy of it.
-
-    `room_members` is the roster the Task arrived with, when it arrived with
-    one; then only members are kept, because stamping a stranger is a mention
-    nobody receives. The roster the broker sends is capped, so a member past
-    the cap loses the stamp and not the message: the mxid is still in the body,
-    where the broker's own scan finds it. With no roster nothing is filtered —
-    the Worker does not know who is *not* there, and does not guess.
-    """
+    """The full mxids a body names, kept to the room's roster when one is known."""
     found = mxids_in(body)
     if room_members:
         roster = set(room_members)
@@ -215,91 +97,26 @@ def mentioned_mxids(body: str, room_members: Sequence[str] = ()) -> List[str]:
 
 
 class TurnReporter:
-    """Drives one Turn up the Ladder and returns the Task's result body.
+    """Runs one Turn and returns its `Outcome`. `ops` (Room Ops) may be `None`:
+    then notices lead the answer instead of being posted."""
 
-    Constructed per Turn. `ops` may be `None` — a Worker with no relay token,
-    or a test — and then nothing is posted and the answer travels the way it
-    always did, as the result body. That fallback is also where a relay that
-    refuses a Room Op ends up, so a room that cannot be edited still gets its
-    answer.
-    """
-
-    def __init__(
-        self,
-        ops=None,
-        settings: Optional[LadderSettings] = None,
-        clock=time.monotonic,
-    ):
+    def __init__(self, ops=None):
         self.ops = ops
-        self.settings = settings or LadderSettings()
-        self._clock = clock
-        #: The placeholder's event identifier; falsy means nothing was posted.
-        self.event_id = ""
         self._room = ""
-        #: Who the Task said is in the room; what a posted message's mentions
-        #: are filtered to. Empty means unknown, and unknown filters nothing.
-        self._members: Tuple[str, ...] = ()
-        self._last_edit = 0.0
-        self._activity = False
-        self._failed_ids: set = set()  # terminal updates deduplicated by tool id
-        self._started_ids: set = set()  # in-progress updates repeat per tool id
+        self._members: tuple = ()
+        self._failed_ids: set = set()
+        self._started_ids: set = set()
         self._anonymous_failures = 0
-        self._refused = 0  # policy or owner may have declined
-        self._diagnostics = deque(maxlen=50)  # rejection archive only
-        self._unposted: List[str] = []   # notices the room could not be told
-        #: Number of progress edits actually issued — the throttle, observable.
-        self.progress_edits = 0
+        self._refused = 0
+        self._diagnostics = deque(maxlen=50)  # archived with a failure only
+        self._unposted: List[str] = []
         #: Number of `Notice` events posted as their own message.
         self.notices_posted = 0
-        #: True when the Turn ended as a structured rejection — observable so a
-        #: caller can tell "nothing was delivered" from "nothing happened".
-        self.rejected = False
-        #: How many files this Turn's answer named. Observable so a caller can
-        #: tell the pointer branch from the ceiling one; *what became of them*
-        #: is not knowable here and is not guessed at — the upload happens
-        #: inside `complete`, and `complete` is what reports it.
-        self.files_named = 0
 
-    # -- the Ladder ---------------------------------------------------------
-
-    async def start(self, ctx: TurnContext) -> None:
-        """Post the placeholder. Silence is what this is here to end."""
-        self._room = ctx.room
-        self._members = tuple(ctx.room_members)
-        if self.ops is None or not self._room or not getattr(self.ops, "available", True):
-            return
-        try:
-            # For nobody in particular: the placeholder names no one, and a
-            # mention on it would page an agent about a message not yet written.
-            self.event_id = await self.ops.message(self._room, PLACEHOLDER)
-        except RoomOpError:
-            self.event_id = ""
-        # `_last_edit` is deliberately left at its floor: the *first* piece of
-        # tool activity edits straight away, so a room learns what the agent is
-        # doing without waiting out a throttle window. The rate limit applies
-        # from there on.
-
-    async def queued(self, ctx: TurnContext, ahead: int = 1) -> bool:
-        """Say that this Task is waiting for the Session, before it starts.
-
-        Posted *before* `start()`, and therefore before the placeholder, so the
-        room reads it in the order it happened: "this one is queued" now, "⏳ On
-        it..." when the Session is free. A person who sends a second message and
-        hears nothing cannot tell it from a message that was dropped, which is
-        the whole reason this exists.
-
-        It is deliberately not kept: an announcement that is only true while the
-        Turn is waiting must not resurface stapled to the answer.
-        """
-        self._room = ctx.room
-        self._members = tuple(ctx.room_members)
-        others = "" if ahead <= 1 else f" ({ahead} messages are ahead of it)"
-        return await self.notice(QUEUED.format(others=others), keep=False)
-
-    async def run(self, adapter, ctx: TurnContext) -> str:
-        """One whole Turn: placeholder, live edits, answer, result body."""
+    async def run(self, adapter, ctx: TurnContext) -> Outcome:
         self._ctx = ctx
-        await self.start(ctx)
+        self._room = ctx.room
+        self._members = tuple(ctx.room_members)
         chunks: List[str] = []
         done: Optional[Done] = None
         async for event in adapter.turn(ctx):
@@ -310,6 +127,8 @@ class TurnReporter:
             else:
                 await self.on_event(event)
         answer = final_text(done, chunks)
+        if is_no_reply(answer):
+            answer = ""
         note = done.note if done else ""
         reason = done.reason if done else COMPLETED
         held = result_guard.verdict(ctx, f"{answer}\n{note}")
@@ -318,35 +137,24 @@ class TurnReporter:
             if "a redirect to another room" not in held.why:
                 review = withheld.hold(ctx.room, answer, held.why, cwd=ctx.cwd)
             if review is None:
-                return await self.finish(WITHHELD, "", reason)
+                return self.finish(WITHHELD, "", reason)
             asked = await self._ask_owner(ctx, review, answer, held.why)
-            body = await self.finish(withheld.review_message(review, held.why, asked), "", reason)
-            if self.event_id:
-                withheld.bind_event(review, self.event_id)
-            return body
-        return await self.finish(answer, note, reason)
+            return self.finish(withheld.review_message(review, held.why, asked), "", reason)
+        return self.finish(answer, note, reason)
 
     async def on_event(self, event) -> None:
-        """Count outcomes and signal generic activity without exposing tool metadata.
-
-        `Thinking` reaches this method and goes no further — deliberately, and
-        the room never learns it existed.
-        """
+        """Count outcomes for the archive; nothing reaches the room but notices."""
         if isinstance(event, ToolStarted):
-            self._activity = True
             if not event.tool_id or event.tool_id not in self._started_ids:
                 self._started_ids.add(event.tool_id)
                 self._diagnostics.append((event.title or event.action or "working")[:500])
-            await self._progress()
         elif isinstance(event, ToolFinished):
-            self._activity = True
             if event.status != COMPLETED:
                 if event.tool_id:
                     self._failed_ids.add(event.tool_id)
                 else:
                     self._anonymous_failures += 1
                 self._diagnostics.append(("failed: " + (event.title or event.tool_id or "untitled tool"))[:500])
-            await self._progress()
         elif isinstance(event, PermissionAsked) and not event.allowed:
             self._refused += 1
             reason = f" — {event.reason}" if event.reason else ""
@@ -354,78 +162,25 @@ class TurnReporter:
         elif isinstance(event, Notice):
             await self.notice(event.text)
 
-    async def finish(self, answer: str, note: str = "", reason: str = COMPLETED) -> str:
-        """Edit the placeholder into the answer; return what to write as result.
-
-        Four endings, and which one happened is visible in the return value.
-        The answer fits an edit: the placeholder becomes it, and the result body
-        is the terminal marker, so nothing further is posted. The answer does
-        not fit: the placeholder becomes a short pointer and the answer itself
-        is the result body, which the relay chunks as it always has. **The reply
-        carries a file**: the same pointer branch, for a different reason — a
-        `[REPLIED]` body is a skip, a skip is terminal in the marker grammar,
-        and the Relay Client never reads past one to find the file. And there is
-        no answer at all: nothing is edited and the result is a structured
-        rejection — see `reject`.
-        """
+    def finish(self, answer: str, note: str = "", reason: str = COMPLETED) -> Outcome:
+        """The Turn's outcome from its answer, note and stop reason."""
         ending = _ending(reason, note)
-        # The markers stay in the body on purpose. They are the answer's
-        # instructions to the Relay Client, which reads them in `complete` — the
-        # one parser — and strips them there. Reading them here to decide the
-        # ladder's branch is not a second parse: it is the same parser, asked a
-        # question about one body (`outgoing.named_files`).
-        self.files_named = len(named_files(answer))
         if not answer.strip():
-            if reason not in NORMAL_REASONS or not self.event_id:
-                return self.reject(reason, ending)
-            # A Turn that ended *normally* with nothing to say is not a failure,
-            # so no broker notice is coming — and a placeholder is already in the
-            # room promising one. Rejecting here would leave it reading "on it"
-            # for ever, so the Ladder is finished by the only party that knows
-            # what happened. With no placeholder there is nothing to finish, and
-            # the rejection above is right: an empty answer must not be posted.
-            answer = SILENT
-        body = _assemble(
-            answer, ending, self._failure_count(), self._refused, self._unposted,
-        )
-        if not self.event_id:
-            return body
-        if self.files_named or len(body) > self.settings.ceiling:
-            # Two reasons to leave the answer in the body. Too long to edit in —
-            # `/v1/results` chunks it. Or it carries a file: `[REPLIED]` is a
-            # skip marker, a skip is terminal in the grammar, and a body nobody
-            # parses past is a body whose attachment never leaves.
-            await self._edit(_pointer(self.files_named))
-            return body
-        if not await self._edit(body):
-            # The final edit is the one failure that must not lose the answer.
-            return body
-        return f"{REPLIED}\n\n{body}"
+            # An Adapter that explained the failure (not configured, not logged
+            # in) is answered with that explanation; a bare failure is the broker's.
+            if reason not in NORMAL_REASONS and not (reason == FAILED and (note or "").strip()):
+                return self.failed(reason, ending)
+            if not ending.strip() and not self._unposted:
+                return Outcome(NO_ACTION)
+        body = _assemble(answer, ending, self._failure_count(), self._refused, self._unposted)
+        if not body:
+            return Outcome(NO_ACTION)
+        return Outcome(ANSWERED, body)
 
-    def reject(self, reason: str, ending: str = "") -> str:
-        """A Turn that produced nothing: say so to the archive, not to the room.
-
-        **The Worker posts no failure message and edits nothing.** The relay
-        client reads `[no-send]` at the head of a result body as "archive this
-        and deliver nothing", so the room hears about the failure from the
-        broker, which owns that message — the spec's one rule here is that a
-        person must not receive two different apologies for one failure.
-
-        The placeholder is deliberately left as it stands. Every edit available
-        is a sentence the Worker would be writing about a failure, which is the
-        message it must not write; the broker's notice is the one that arrives.
-
-        What follows the marker is for whoever reads the archived result: the
-        machine-readable reason, the Adapter's own explanation, any
-        announcement that never reached the room, and aggregate failure/refusal
-        notices. Bounded raw diagnostics follow only on this archived, no-send path.
-        """
-        self.rejected = True
-        parts = [
-            f"{NO_SEND} agent-connect: nothing to deliver — this turn produced no "
-            f"answer (reason: {reason}). The broker posts the failure notice; "
-            f"the worker posts none."
-        ]
+    def failed(self, reason: str, ending: str = "") -> Outcome:
+        """A Turn that produced nothing: the broker posts the failure notice; the
+        archived body says why, for whoever reads it."""
+        parts = [f"agent-connect: this turn produced no answer (reason: {reason})."]
         parts += [n.strip() for n in self._unposted if n and n.strip()]
         if ending.strip():
             parts.append(ending.strip())
@@ -434,9 +189,7 @@ class TurnReporter:
             parts.append(summary)
         if self._diagnostics:
             parts.append("Operator diagnostics (last 50 events):\n" + "\n".join(self._diagnostics))
-        return "\n\n".join(parts)
-
-    # -- internals ----------------------------------------------------------
+        return Outcome(FAILED_OUTCOME, "\n\n".join(parts))
 
     async def _ask_owner(self, ctx: TurnContext, review: str, answer: str, why) -> bool:
         """Ask the owner privately whether to post a held reply; False if it can't be asked."""
@@ -452,38 +205,21 @@ class TurnReporter:
         return bool(question)
 
     async def notice(self, text: str, keep: bool = True) -> bool:
-        """Tell the room something about the run, as its own message.
-
-        **Never by editing the placeholder.** The placeholder belongs to this
-        Task's answer; editing it into "the context was reset" would replace the
-        answer with a remark about it. A notice is a second message, posted the
-        moment it is true, and the Ladder carries on above it untouched.
-
-        A room that cannot be posted to does not lose the notice: it rides out
-        on the result body instead, where the delivery path will post it — that
-        is `keep`, and it is what an announcement about memory needs.
-
-        `keep=False` is for an announcement that is only true *now*: "your
-        message is queued" arriving stapled to the answer is not a smaller
-        version of the same information, it is noise. A notice that could not be
-        posted while it was true is dropped.
-
-        Returns whether the room was actually told.
-        """
+        """Tell the room a fact about the run, as its own message. One that cannot
+        be posted leads the answer when `keep`. Returns whether it was posted."""
         text = (text or "").strip()
         if not text:
             return False
         ctx = getattr(self, "_ctx", None)
         if ctx is not None and result_guard.verdict(ctx, text).hold:
-            # A notice can carry the agent's own words (a refused resume, say).
             text = NOTICE_WITHHELD
         if self.ops is not None and self._room and getattr(self.ops, "available", True):
             try:
-                # Stamped for whoever it names: an announcement that hands a
-                # question to another agent has to reach that agent, and in a
-                # shared room the mention is what makes it.
+                # Mentions only for the full ids the notice itself names, never
+                # the requester: a notice must not wake the agent that asked.
                 await self.ops.message(self._room, text,
-                                       mentioned_mxids(text, self._members))
+                                       [m for m in mentioned_mxids(text, self._members)
+                                        if not ctx or m != ctx.user_id])
                 self.notices_posted += 1
                 return True
             except RoomOpError:
@@ -494,38 +230,6 @@ class TurnReporter:
 
     def _failure_count(self) -> int:
         return len(self._failed_ids) + self._anonymous_failures
-
-    async def _progress(self) -> None:
-        if not self.settings.live or not self.event_id or not self._activity or self.progress_edits:
-            return
-        now = self._clock()
-        if now - self._last_edit < self.settings.throttle:
-            return
-        self._last_edit = now
-        if await self._edit(self._progress_body()):
-            self.progress_edits += 1
-
-    def _progress_body(self) -> str:
-        # Tool titles can contain commands, arguments and local paths. They
-        # are not safe room-facing labels, even when live progress is enabled.
-        return f"{PLACEHOLDER}\n\nWorking…"
-
-    async def _edit(self, body: str) -> bool:
-        try:
-            await self.ops.edit(self._room, self.event_id, body)
-        except RoomOpError:
-            self.event_id = ""
-            return False
-        return True
-
-
-def _pointer(count: int) -> str:
-    """What the placeholder becomes when the reply travels below it."""
-    if not count:
-        return POINTER
-    if count == 1:
-        return FILE_POINTER
-    return FILE_POINTER_MANY.format(count=count)
 
 
 def _assemble(answer: str, note: str, failed: int, refused: int, notices=()) -> str:

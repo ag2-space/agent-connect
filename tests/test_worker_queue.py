@@ -200,7 +200,7 @@ answered = asyncio.run(_second_pass(relay, http, adapter, wire("q-1b", "and agai
 check(answered == ["q-1", "q-1b"],
       "the drain loop answers the Task that arrives after the first one — a "
       "loop that is still turning is one that takes the next thing it is given")
-check(http.results()[0] == {"id": "q-1", "body": "the answer"},
+check(http.results()[0] == {"id": "q-1", "body": "the answer", "status": "completed"},
       "each off the queue once, under the broker's own id, carrying exactly "
       "what the Turn produced")
 check(relay.inflight() == [],
@@ -244,7 +244,7 @@ adapter = Answers()
 results = outgoing()
 asyncio.run(_one_pass(relay, adapter, lambda: bool(http.results())))
 check([r.get("id") for r in http.results()] == ["q-6"], "it is answered, once")
-check("status" not in http.results()[0],
+check(http.results()[0].get("status") == "completed",
       "and it is a `complete`, not the dead-letter — a Task carrying a file has "
       "content, whatever its body says")
 check(len(adapter.seen) == 1, "the Adapter ran for it")

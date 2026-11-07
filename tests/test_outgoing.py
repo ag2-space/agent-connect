@@ -46,14 +46,7 @@ from agent_connect import outgoing
 from agent_connect import relay as relay_module
 from agent_connect.events import COMPLETED, Done, MessageChunk
 from agent_connect.outgoing import named_files
-from agent_connect.reporter import (
-    FILE_POINTER,
-    FILE_POINTER_MANY,
-    NO_SEND,
-    PLACEHOLDER,
-    REPLIED,
-    LadderSettings,
-)
+from agent_connect.reporter import NO_SEND
 from agent_connect.roomops import room_ops_for
 from agent_connect.sandbox import sandbox_preamble
 from agent_connect.worker import handle_one
@@ -203,8 +196,7 @@ def turn(wire, client, repo, said, task_id="task-1", room=ROOM, ladder=True):
     task = deliver(wire, client, task_id, room)
     ops = room_ops_for(client) if ladder else None
     return asyncio.run(handle_one(
-        task, answers(said), str(repo), None, ops,
-        LadderSettings(throttle=0.0), client=client))
+        task, answers(said), str(repo), None, ops, client=client))
 
 
 print("\n-- a file the agent produced arrives in the room --")
@@ -226,40 +218,41 @@ check("[file:" not in "".join(wire.bodies),
 check((repo / "report.md").exists(),
       "the agent's own copy is left where it wrote it, uncopied and unmoved")
 
-check(len(wire.room_ops("message")) == 1,
-      "one message in the room: the placeholder")
-check(wire.edited() == FILE_POINTER,
-      "edited into a pointer, because the reply itself travels the result path")
-check(not body.startswith(REPLIED),
-      "the result is NOT marked replied — a skip marker is terminal in the "
-      "grammar, and nothing would ever read past it to find the file")
+check(not wire.room_ops("message") and not wire.room_ops("edit"),
+      "the Worker posts and edits nothing itself: the broker delivers the reply")
+check(wire.last("/v1/results").get("status") == "completed",
+      "the result is `completed`, so the ledger records the task as responded")
 check(not wire.room_ops("react"),
       "and the Worker still places no reaction: that one is the broker's")
 
 
-print("\n-- the ladder, through the library: [REPLIED] completes the lease --")
+print("\n-- an answer is the result: the broker posts it, once --")
 
-# The other half of the seam, and the half that has to keep working: an answer
-# short enough to edit in goes *into the placeholder*, and the result body is
-# the terminal marker. A skip is terminal in the grammar, so the marker body
-# travels to `/v1/results` **verbatim** — H1's rule, and the one that stops a
-# lease expiring and the task being re-served for ever.
 wire, client, repo = bench()
 body = turn(wire, client, repo, "It is fine.")
-check(wire.room_ops("message")[:1] == [{"op": "message", "room_id": ROOM,
-                                        "body": PLACEHOLDER}],
-      "the placeholder is posted when the work starts")
-check(wire.edited().startswith("It is fine."),
-      "and edited into the answer when it ends — one message, not two")
-check(body.startswith(REPLIED), "the result body carries the terminal marker")
-check(wire.posted_body == body,
-      "which reaches /v1/results verbatim: a skip is still a POST, because a "
-      "skipped POST leaves the lease to expire and the task to come back (H1)")
+check(not wire.room_ops("message") and not wire.room_ops("edit"),
+      "no placeholder is posted and nothing is edited")
+check(wire.posted_body == "It is fine." and body == "It is fine.",
+      "the answer itself is the result body")
+check(wire.last("/v1/results").get("status") == "completed",
+      "with status `completed`")
 check(client.journal.inflight() == 0 and not client.journal.pending_results(),
       "and the lease is completed — nothing owed, nothing left to re-serve")
-check(not wire.media,
-      "with no upload attempted: a body nobody parses past names no file, and "
-      "this one genuinely named none")
+check(not wire.media, "with no upload attempted: the answer named no file")
+
+
+print("\n-- no reply: nothing posted, the ledger records no action --")
+
+wire, client, repo = bench()
+body = turn(wire, client, repo, "NO_REPLY")
+sent = wire.last("/v1/results")
+check(body == "" and sent.get("status") == "no_action_needed" and sent.get("no_send") is True,
+      "an exact NO_REPLY completes as `no_action_needed`")
+check(not wire.room_ops("message"), "and nothing reaches the room")
+wire, client, repo = bench()
+turn(wire, client, repo, "NO_REPLY, but here is why")
+check(wire.last("/v1/results").get("status") == "completed",
+      "NO_REPLY inside a longer reply is an answer, not a sentinel")
 
 
 print("\n-- an out-of-allowlist path is refused in-process --")
@@ -331,8 +324,6 @@ body = turn(wire, client, repo,
 check([m.get("filename") for m in wire.media] == ["report.md", "chart.png", "diff.patch"],
       "all three reach the room, in the order the agent named them")
 check(wire.posted_body.strip() == "Three things.", "under one reply, once")
-check(wire.edited() == FILE_POINTER_MANY.format(count=3),
-      "and the pointer says how many files follow")
 
 wire, client, repo = bench()
 for i in range(MAX_FILES + 3):
@@ -361,8 +352,8 @@ wire, client, repo = bench()
 task = deliver(wire, client, "task-empty")
 body = asyncio.run(handle_one(task, Scripted(Done(reason=COMPLETED, text="")),
                               str(repo), None, None, None, client=client))
-check(body.startswith(NO_SEND),
-      "a Turn that produced nothing at all is still a structured rejection")
+check(body == "" and wire.last("/v1/results").get("status") == "no_action_needed",
+      "a Turn that finished with nothing to say is a no action, not a rejection")
 
 
 print("\n-- a Worker with no room ops still delivers the file --")
@@ -509,19 +500,12 @@ check("[file:" not in reader,
       "a read-only run is not told how to produce something it cannot produce")
 
 
-print("\n-- the placeholder is not left promising a file that never came --")
+print("\n-- a file that never came is said in the reply itself --")
 
-# The live regression, from the room's point of view. The Ladder edits the
-# placeholder into "the reply and its file follow below" *before* the result is
-# posted; if the file then does not go, the person is looking at a promise. It
-# is kept by the refusal arriving in the same reply, which is why the refusal
-# is in the body rather than in a log.
 wire, client, repo = bench()
 body = turn(wire, client, repo, f"Here.\n\n[file: {tmp / 'private.key'}]")
-check(wire.edited() == FILE_POINTER,
-      "the placeholder still points below — the Ladder cannot know yet")
 check("attachment not sent" in wire.posted_body and "Here." in wire.posted_body,
-      "and what follows says so, in the reply the pointer pointed at")
+      "the refusal arrives in the same reply as the answer")
 
 
 print("\n" + ("PASS — outgoing files green" if fails == 0

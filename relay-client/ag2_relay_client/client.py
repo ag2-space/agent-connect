@@ -112,6 +112,9 @@ SOCKET_MARGIN_S = 10
 SIDE_TIMEOUT_S = 10.0
 #: The result POST. Longer, because it is the one call that matters.
 RESULT_TIMEOUT_S = 20.0
+#: How long an answer refused as a stale generation waits for its task to be
+#: re-served to this client before it is given up, said out loud.
+PARKED_TTL_S = 1800.0
 
 #: E1's interval. "At most every 60 s" — the gate is checked once per poll, so
 #: the real spacing is the first poll boundary at or past 60 s.
@@ -201,6 +204,11 @@ CAPABILITIES = ("task-ack", "heartbeat", "result-skip-markers", "reject")
 #: marker grammar (skip, redirect, dm-only, attach) is read — in the one place
 #: it is written down, `markers.py` — by `Outbound`, which `complete` runs.
 NO_SEND = "[no-send]"
+#: The result statuses core-api's activity ledger records (`POST /v1/results`).
+STATUS_COMPLETED = "completed"
+STATUS_NO_ACTION = "no_action_needed"
+STATUS_FAILED = "failed"
+OUTCOME_MAX = 200
 
 #: The dead-letter code for a task this client cannot even name.
 INVALID_TASK_SCHEMA = "INVALID_TASK_SCHEMA"
@@ -251,7 +259,7 @@ class RelayClient:
         "capabilities", "tasks", "media", "_room_ops", "_questions", "outbound",
         "_reconciler", "_live", "_presence",
         "_ack_disabled_until", "_ack_owed", "_intake_deadline",
-        "_result_retry_at", "_heartbeat_disabled", "_last_heartbeat",
+        "_result_retry_at", "_parked", "_heartbeat_disabled", "_last_heartbeat",
         "_deferred_auth", "_drain_lock", "_stop", "_thread",
     )
 
@@ -398,6 +406,9 @@ class RelayClient:
         #: it is tried again, which is what lets the drain move on to the answer
         #: behind it instead of stalling the whole queue on one id.
         self._result_retry_at: Dict[str, Tuple[Backoff, float]] = {}
+        #: Answers refused as `stale_execution_generation`, by when they were
+        #: parked: held, not retried, until a re-serve brings fresh fences.
+        self._parked: Dict[str, float] = {}
         self._heartbeat_disabled = False
         #: `None` is "never", for the same reason as above: with a monotonic
         #: clock whose origin is process start, a `0.0` sentinel makes the
@@ -839,7 +850,8 @@ class RelayClient:
             # dropping it instead would leave the lease to expire and the task
             # to come back for a third time.
             self.journal.record_result(
-                wire_id, {"id": wire_id, "body": NO_SEND, "no_send": True})
+                wire_id, {"id": wire_id, "body": NO_SEND, "no_send": True,
+                          "status": STATUS_NO_ACTION, **_fences(raw)})
             log.info("task %s was already answered — re-completing the lease, "
                      "not re-executing (attempt %s)", wire_id, task.attempt)
             return 0
@@ -864,13 +876,20 @@ class RelayClient:
         # cooldown: a re-serve is proof the lease is real and about to die
         # without it, and it happens at most once per visibility window per
         # task, so it can never become the hammering the cooldown is for.
+        fences = _fences(raw)
         if self.journal.is_pending(wire_id):
+            self.journal.refresh_fences(wire_id, fences)
+            if self._parked.pop(wire_id, None) is not None:
+                # The re-serve a parked answer was waiting for: post it now,
+                # under the new lease.
+                self._result_retry_at.pop(wire_id, None)
             self._owe_ack(wire_id, urgent=True)
             log.info("task %s already has an answer waiting to be POSTed — the "
                      "re-serve is re-acked so the new lease survives, and the "
                      "drain below completes it", wire_id)
             return 0
         if wire_id in self._live:
+            self.journal.refresh_fences(wire_id, fences)
             log.info("task %s is queued or in the consumer's hands — the "
                      "re-serve is re-acked so its new lease is not requeued "
                      "out from under a running Turn, and nothing is handed "
@@ -882,7 +901,7 @@ class RelayClient:
         # room sidecar is captured here because this is the only moment it is
         # known and a media answer produced after a restart still has to find
         # its room (F7).
-        self.journal.accept(wire_id, room=task.room_id)
+        self.journal.accept(wire_id, room=task.room_id, fences=fences)
         self._live.add(wire_id)
         if task.metadata_stripped:
             log.info("stripped unsigned room-ops metadata from task %s", wire_id)
@@ -1059,6 +1078,11 @@ class RelayClient:
                  base_dir: Optional[object] = None) -> PreparedResult:
         """Answer a task. The answer is durable before this returns.
 
+        The result carries `status: "completed"`, so the activity ledger records
+        the task as responded and the broker posts the body once. A body that
+        strips to nothing — only markers, or a skip marker — is still sent with
+        `no_send`, and completes as a deliberate silence.
+
         Delivery is this library's problem from here: the result is retained
         until `POST /v1/results` succeeds, across retries and across a restart,
         because that POST is what completes the lease. Dropping it on a
@@ -1105,6 +1129,10 @@ class RelayClient:
         # still has to be completed, so it is completed the way a deliberate
         # silence is — recorded, delivered to nobody.
         payload: Dict[str, Any] = {"id": wire_id, "body": prepared.body or NO_SEND}
+        if not prepared.skip and (prepared.body or prepared.uploaded):
+            payload["status"] = STATUS_COMPLETED
+        else:
+            payload["status"] = STATUS_NO_ACTION
         if prepared.skip or not prepared.body:
             # The flag *and* the marker in the body. Two clients have been
             # completing skipped leases against this broker for a year: sutando
@@ -1116,6 +1144,26 @@ class RelayClient:
             payload["no_send"] = True
         self._record_result(wire_id, payload)
         return prepared
+
+    def no_action(self, broker_id: str, outcome: str = "") -> None:
+        """Complete a task that needs no reply: nothing is posted, nobody is
+        mentioned, and the activity ledger records no action (`no_action_needed`).
+        `outcome` is an optional line for the owner's activity row."""
+        wire_id = self._require_wire_id(broker_id)
+        payload: Dict[str, Any] = {"id": wire_id, "status": STATUS_NO_ACTION,
+                                   "body": NO_SEND, "no_send": True}
+        if outcome.strip():
+            payload["outcome"] = outcome.strip()[:OUTCOME_MAX]
+        self._record_result(wire_id, payload)
+
+    def fail(self, broker_id: str, diagnostics: str = "") -> None:
+        """Complete a task the agent could not finish (`failed`). The broker posts
+        its one failure notice; nothing else is posted. `diagnostics` is archived
+        with the result, never shown in the room."""
+        wire_id = self._require_wire_id(broker_id)
+        body = f"{NO_SEND} {diagnostics}".strip() if diagnostics.strip() else NO_SEND
+        self._record_result(wire_id, {"id": wire_id, "status": STATUS_FAILED,
+                                      "body": body, "no_send": True})
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:
         """Dead-letter a task: terminal, never re-served, nothing posted.
@@ -1200,9 +1248,19 @@ class RelayClient:
                          "nothing is lost (F5)", self.result_budget,
                          len(owed) - index)
                 break
+            parked = self._parked.get(wire_id)
+            if parked is not None:
+                if time.monotonic() - parked < PARKED_TTL_S:
+                    continue  # waiting for a re-serve with fresh fences
+                log.warning("result for %s was refused as a stale generation and "
+                            "its task was not re-served within %.0fs — the answer "
+                            "is dropped", wire_id, PARKED_TTL_S)
+                self._settle_dropped(wire_id)
+                continue
             gate = self._result_retry_at.get(wire_id)
             if gate is not None and time.monotonic() < gate[1]:
                 continue  # this one is waiting out its own failure
+            payload = {**self.journal.fences_for(wire_id), **payload}
             try:
                 answer = self._http.post("/v1/results", payload,
                                          timeout=RESULT_TIMEOUT_S)
@@ -1211,6 +1269,22 @@ class RelayClient:
                 # for every id, so trying the next one is a wasted round trip.
                 self._defer_auth(exc)  # C8
                 break
+            except RelayHTTPError as exc:
+                code = _error_code_of(exc.body) if exc.status == 409 else ""
+                if code == "stale_execution_generation":
+                    # A newer serve exists. It usually comes back to this
+                    # client; the answer waits for it rather than being lost.
+                    log.warning("result for %s was refused as a stale generation — "
+                                "held until the task is re-served", wire_id)
+                    self._parked[wire_id] = time.monotonic()
+                    continue
+                if code in _TERMINAL_CODES:
+                    log.warning("result for %s was refused (%s): the task is "
+                                "closed, so the answer is dropped", wire_id, code)
+                    self._settle_dropped(wire_id)
+                    continue
+                self._retry_result_later(wire_id, _describe(exc))
+                continue
             except Exception as exc:  # noqa: BLE001 — F5: keep and retry
                 self._retry_result_later(wire_id, _describe(exc))
                 continue
@@ -1231,6 +1305,13 @@ class RelayClient:
                      " (the broker had it already)" if duplicate else "")
         return delivered
 
+    def _settle_dropped(self, wire_id: str) -> None:
+        self.journal.retire(wire_id)
+        self._live.discard(wire_id)
+        self._result_retry_at.pop(wire_id, None)
+        self._parked.pop(wire_id, None)
+        self.outbound.forget(wire_id)
+
     def _retry_result_later(self, wire_id: str, why: str) -> None:
         """Hold one result back for a while. The rest of the queue goes now."""
         ladder = (self._result_retry_at.get(wire_id) or (Backoff(), 0.0))[0]
@@ -1243,6 +1324,8 @@ class RelayClient:
     def _forget_stale_result_gates(self, owed_ids: set) -> None:
         for wire_id in [k for k in self._result_retry_at if k not in owed_ids]:
             self._result_retry_at.pop(wire_id, None)
+        for wire_id in [k for k in self._parked if k not in owed_ids]:
+            self._parked.pop(wire_id, None)
 
     # --- heartbeat (E1, E2, E3) --------------------------------------------
 
@@ -1488,6 +1571,40 @@ class RelayClient:
 #: the first one (`api/v1.py:461` answers `{"error": "not leased to you"}`);
 #: the rest are what the same message would be called by anything else.
 _ERROR_KEYS = ("error", "detail", "message", "reason", "title")
+
+
+def _fences(raw: Any) -> Dict[str, Any]:
+    """The lease fences a served task carries, for the result to echo back."""
+    out: Dict[str, Any] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    lease = raw.get("lease_id")
+    if isinstance(lease, str) and lease.strip() and len(lease) <= 200:
+        out["lease_id"] = lease.strip()
+    gen = raw.get("execution_generation")
+    if isinstance(gen, int) and not isinstance(gen, bool) and gen > 0:
+        out["execution_generation"] = gen
+    return out
+
+
+#: Ledger refusals that mean the task is closed: its answer can never land.
+_TERMINAL_CODES = ("task_already_terminal", "task_cancelled")
+
+
+def _error_code_of(body: Any) -> str:
+    """The broker's `error_code` (or `error`) field, exactly; "" when absent."""
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body or "{}")
+        except ValueError:
+            return ""
+    if not isinstance(body, Mapping):
+        return ""
+    for key in ("error_code", "error"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def _says_not_leased(body: Any) -> bool:

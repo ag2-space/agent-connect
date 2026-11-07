@@ -175,8 +175,10 @@ class Journal:
 
     # --- the three facts -------------------------------------------------
 
-    def accept(self, wire_id: str, room: str = "") -> None:
-        """Record an id as accepted, with the room it came from (E2, F7).
+    def accept(self, wire_id: str, room: str = "",
+               fences: Optional[Dict[str, Any]] = None) -> None:
+        """Record an id as accepted, with the room it came from (E2, F7) and the
+        lease fences the broker served it under (`lease_id`, `execution_generation`).
 
         Idempotent by design, and deliberately not a no-op on a re-accept: a
         task re-served after its lease expired arrives again with the same id,
@@ -190,10 +192,25 @@ class Journal:
                 return
             self._entries[wire_id] = {
                 "id": wire_id, "state": ACCEPTED, "room": room or "",
-                "ts": time.time(),
+                "fences": dict(fences or {}), "ts": time.time(),
             }
             self._entries.move_to_end(wire_id)
             self._save(wire_id)
+
+    def refresh_fences(self, wire_id: str, fences: Optional[Dict[str, Any]]) -> None:
+        """A re-serve leases the task again: the result must carry the new fences."""
+        with self._lock:
+            record = self._entries.get(wire_id)
+            if record is None or record.get("state") == DONE or not fences:
+                return
+            record["fences"] = dict(fences)
+            self._save(wire_id)
+
+    def fences_for(self, wire_id: str) -> Dict[str, Any]:
+        """The fences the latest serve carried; empty when unknown."""
+        with self._lock:
+            fences = (self._entries.get(wire_id) or {}).get("fences")
+            return dict(fences) if isinstance(fences, dict) else {}
 
     def record_result(self, wire_id: str, payload: Dict) -> None:
         """Attach the answer to an accepted id, durably, before it is POSTed.
@@ -231,6 +248,7 @@ class Journal:
             record["ts"] = time.time()
             record.pop("result", None)
             record.pop("room", None)
+            record.pop("fences", None)
             self._entries[wire_id] = record
             self._entries.move_to_end(wire_id)
             self._trim()

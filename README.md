@@ -116,9 +116,9 @@ cosmetic:**
 - **guest, on the ACP path** → **a polite refusal in the room**, and no run at
   all. ACP has no sandbox to fall back to — see the next section — so there is
   no read-only tier to offer, and offering one anyway would be a limit that only
-  looks like one. The refusal is a visible reply, not silence: it climbs the
-  same ladder as an answer, so the guest reads a sentence saying what happened
-  and that `trust` would change it.
+  looks like one. The refusal is a visible reply, not silence: it is posted the
+  same way as an answer, so the guest reads a sentence saying what happened and
+  what would change it.
 
 **You can lower a specific sender on your own machine.** The relay client's
 local `access.json` tier map is yours, and it is a **cap, not a re-tier**: the
@@ -152,11 +152,10 @@ different from every other adapter's, and weaker. Read this before enabling it.*
 - **Guest tasks are refused outright** and never reach ACP — the ACP agent is
   not even started. Shipping a read-only *tier* on top of a cooperative *policy*
   would be offering a limit that only looks like one. The refusal is **said in
-  the room**, as the reply to the message that asked: it takes over the same
-  `⏳ On it...` placeholder every other task gets, so it is one message rather
-  than a placeholder left hanging beside an apology, and it names both what would
-  change the answer (`trust @user`) and who has to be told — the concierge, by
-  full MXID, because an instruction whose recipient is missing is not one. A
+  the room**, as the reply to the message that asked, and it names what would
+  change the answer: Collaborator access in the room plus a place on this
+  agent's collaborators, or `trust @user` sent to the concierge, by full MXID,
+  because an instruction whose recipient is missing is not one. A
   guest who hears nothing cannot tell a refusal from a broken worker, and reports
   the wrong problem.
 
@@ -273,38 +272,33 @@ The bearer travels on the WebSocket handshake, is read fresh on every dial (so
 rotating it needs no restart), and lives in the same `0600` config file as your
 relay token. See `docs/adr/0004` for the reasoning, including what this costs.
 
-## The ladder: one message, from "on it" to the answer
+## Replies: one answer, posted by the broker
 
-A request used to be met with silence until the answer arrived — sometimes ten
-minutes of it. Now a placeholder appears as soon as the worker picks the task
-up, the same message shows generic activity ("Working…") as the agent works,
-and it is finally edited into the answer. **One message**: the room sees exactly
-one reply, without a routine tool-activity footer. Reported tool failures and
-permission-policy refusals remain visible as aggregate notices. Raw tool titles
-and permission details are not copied into progress or these notices: they can
-contain code, arguments and local paths. This governs reporter-generated text,
-not the content of the agent's own answer, adapter ending notes or explicit notices.
-Rejected no-send results retain bounded operator diagnostics in the archive only
-(last 50 events, at most 500 characters per event); these are never room replies.
+The worker posts no placeholder and edits nothing into an answer. s.space shows
+the request's status from core-api's activity ledger: queued, then working once
+the relay client acknowledges the task, then replied when the answer is posted.
+A turn ends in one result (`docs/adr/0002`, amended for 0.4.0):
 
-The shape is the relay's, not ours: the broker places the intake reaction, the
-worker posts the fleet-wide `⏳ On it...` copy and edits it, and closes the lease
-with `[REPLIED]` so nothing posts a second copy. The worker never speaks Matrix —
-every post and edit is a room op the relay performs as your agent identity, over
-the token you already have (`docs/adr/0002`).
+- **An answer** is completed with `status: "completed"`, and the broker posts it
+  once, as a reply to the request. Files it names are uploaded first.
+- **Nothing to say** (no text, or the agent replies exactly `NO_REPLY`) is
+  completed with `status: "no_action_needed"`: nothing is posted, nobody is
+  mentioned, and the activity ledger records no action. Agents are told to use
+  it for acknowledgements, thanks and FYIs, which keeps agent exchanges from
+  looping.
+- **A turn that produced nothing** and did not end normally is `failed`, and the
+  broker posts its one failure notice. If the adapter explained the failure (not
+  configured, not logged in), that explanation is the answer instead.
 
-The live editing on top of that two-step shape is agent-connect's own extension.
-Edits are driven by **tool activity, not text chunks**, and throttled to at most
-one per `AGENT_CONNECT_PROGRESS_THROTTLE` seconds. **The model's internal
-reasoning never reaches the room** — the chat carries answers, not
-thinking-out-loud. Set `AGENT_CONNECT_LIVE_PROGRESS=0` and you are back to the
-plain placeholder-then-answer shape, with nothing else changed. An answer too
-long to fit in an edit is not truncated: the placeholder becomes a short pointer
-and the answer arrives in full as its own message.
+Reported tool failures and permission refusals appear in the answer as aggregate
+lines. Raw tool titles and permission details never reach the room: they can
+contain code, arguments and local paths. Bounded operator diagnostics (last 50
+events, 500 characters each) go only into the archived result of a failed turn.
+**The model's internal reasoning never reaches the room.**
 
-Adapters that are not ACP get the placeholder and the final answer too, with
-nothing in between — they have no tool activity to report, and inventing some
-would put fiction in a room.
+The worker never speaks Matrix: notices it posts itself (a session reset, a reply
+withheld for review) are room ops the relay performs as your agent identity
+(`docs/adr/0002`).
 
 **Hand-offs are addressed by mxid.** In a room shared with another agent, the
 broker delivers a message to that agent only when the agent's full mxid is on
@@ -315,9 +309,8 @@ and the reply facts the broker sends with each task reach it in the preamble),
 and a message the worker posts is stamped for the room members whose mxids it
 names.
 
-If the worker holds no relay token, or the relay refuses a room op, the answer
-travels the way it always did — as the task result the relay client posts. The
-ladder degrades; it never eats the answer.
+If the relay refuses a room op for a notice, the notice leads the answer
+instead, so it is never lost.
 
 ## What the agent says unasked comes back to the room (ACP)
 
@@ -366,11 +359,10 @@ have no session to continue.
 
 ## Nothing is lost, and endings tell the truth
 
-**A message that arrives while the agent is busy is queued, and you are told
-so.** Only one turn at a time may be open on a session — the protocol's rule,
-not a choice — so a second message in the same room waits for the first. It
-waits *out loud*: a short "this one is queued and will be answered next" lands
-before the placeholder, and the answer follows when the earlier turn is done.
+**A message that arrives while the agent is busy is queued.** Only one turn at a
+time may be open on a session — the protocol's rule, not a choice — so a second
+message in the same room waits for the first, and s.space shows it as queued
+until its turn starts.
 Queueing is per session, so a room that is busy blocks nothing but itself and
 every other room keeps running.
 
@@ -803,8 +795,8 @@ rather than leaving an observer to wait out staleness, the worker turns it into
 an ordinary exit. That exit is raised at whatever bytecode the interpreter
 happens to be on, so a task result being written at that instant can be left
 truncated, where an unhandled `SIGTERM` would have killed the process between
-syscalls. The answer itself has already gone to the room up the ladder; what is
-at risk is one archived result file.
+syscalls. An answer already handed to the relay client is in its journal and is
+re-posted by the next run; what is at risk is one archived result file.
 
 
 ## Settings
@@ -830,14 +822,6 @@ table.
 | `AGENT_CONNECT_ATTACHMENT_MAX_BYTES` | how much of one attached file is read into a prompt. An attachment over this is reported in the room, never shrunk to fit. `0` means no limit | `10485760` (10 MB) |
 | `AGENT_CONNECT_EGRESS_ROOTS` | extra directories a file the agent produced may be sent to the room *from*, separated by `:`. The working directory (`AGENT_CONNECT_REPO`) is always one; this is for a worker whose agent writes somewhere else as well. Nothing outside these directories is ever uploaded, and the list is fixed when the worker starts | *(none)* |
 
-The ladder (see the section above):
-
-| Setting | What it does | Default |
-| --- | --- | --- |
-| `AGENT_CONNECT_LIVE_PROGRESS` | `0` turns live progress editing off and leaves the plain placeholder-then-answer ladder. **This is the one setting that retreats to the fleet-wide convention** | `1` |
-| `AGENT_CONNECT_PROGRESS_THROTTLE` | seconds between progress edits, however busy the turn is | `3.0` |
-| `AGENT_CONNECT_EDIT_CEILING` | characters an answer may have and still be edited into the placeholder; a longer one arrives as its own message | `4000` |
-
 Sessions — the conversation a room continues (ACP adapter only, see the section
 above):
 
@@ -859,7 +843,7 @@ ACP adapter (see the section above):
 | `AGENT_CONNECT_ACP_REMOTE_CWD` | the directory a **dialled** agent opens its sessions in. `session/new` requires one, so something is always sent; unset means "this worker's own directory", which is correct on loopback and wrong across hosts | *(unset)* |
 | `AGENT_CONNECT_ACP_ALLOW_REMOTE` | `1` to allow `AGENT_CONNECT_ACP_URL` to name a host other than loopback. Off by default because the Permission Policy resolves paths on *this* machine: against another host its answers are guesses shaped like a guarantee. A non-loopback URL must also be `wss://` — this setting accepts the policy's uncertainty, not an unencrypted bearer | *(unset)* |
 | `AGENT_CONNECT_ACP_MODE` | session mode id to request. Left alone by default: every bridge's own default already routes permission requests to the worker, and mode ids are the agent's to name | *(unset)* |
-| `AGENT_CONNECT_ACP_COLLABORATORS` | Matrix ids, comma or space separated, matched exactly and case-sensitively on the full id, that may use the ACP agent where the room grants them **Team — collaborator** (Agent Native). Both are required: the list only narrows what the room allows. **Once admitted, a listed sender has the agent's normal capabilities** (its tools, workspace and permission policy), so list only senders you would let act as you on this agent. Each gets its own Session per room, never the owner's, and the agent is told who asked in `_meta["ag2/requester"]` on `session/new` and every `session/prompt`. A listed sender's reply is checked before it is posted, unless you set `AGENT_CONNECT_UNCHECKED_COLLABORATORS=1` on this machine. The room's "Sensitive data filter" flag cannot turn the check off, because a room moderator can change it: a reply that matches a known secret format, or carries a file, is withheld and kept, owner-only, in `<workspace>/withheld/` on this machine. The owner is asked privately, in their DM with the agent (which must have exactly the agent and the owner as members), with the reply shown with known secret formats masked and **Post it** / **Discard**; the question and its masked excerpt stay in that DM's history. Files named in the reply are read when it is released; the room hears only that it was withheld for the owner's review. When no private DM question can be asked, the room message says how to act instead: reply `release` or `discard` to it (or `release <review id>`), which only a sender the broker attests as owner can do, and the reply must be exactly that word. Either way the reply is posted only if the stored record (its text, room, working directory and expiry) is unchanged, and only an answer the owner gave counts. Reviews expire after 24 hours, and a Worker restart drops pending ones. A `[channel:]` redirect is withheld and cannot be released. The check matches known formats only. A collaborator's own Turn cannot post with `_ag2/notify`, and while any collaborator is listed, every `_ag2/notify` the agent sends is checked the same way and may only go to a room this Worker has an owner Session in; one that fails is withheld and logged. The agent's own tools still can: a listed sender can steer it, for example, into changing and running one of the owner's scheduled tasks, whose outcome is posted unchecked. Typical use: your own other agents, e.g. `@you-other.agent:s.space` | *(unset)* |
+| `AGENT_CONNECT_ACP_COLLABORATORS` | Matrix ids, comma or space separated, matched exactly and case-sensitively on the full id, that may use the ACP agent where the room grants them **Team — collaborator** (Agent Native). Both are required: the list only narrows what the room allows. **Once admitted, a listed sender has the agent's normal capabilities** (its tools, workspace and permission policy), so list only senders you would let act as you on this agent. Each gets its own Session per room, never the owner's, and the agent is told who asked in `_meta["ag2/requester"]` on `session/new` and every `session/prompt`. A listed sender's reply is checked before it is posted, unless you set `AGENT_CONNECT_UNCHECKED_COLLABORATORS=1` on this machine. The room's "Sensitive data filter" flag cannot turn the check off, because a room moderator can change it: a reply that matches a known secret format, or carries a file, is withheld and kept, owner-only, in `<workspace>/withheld/` on this machine. The owner is asked privately, in their DM with the agent (which must have exactly the agent and the owner as members), with the reply shown with known secret formats masked and **Post it** / **Discard**; the question and its masked excerpt stay in that DM's history. Files named in the reply are read when it is released; the room hears only that it was withheld for the owner's review. When no private DM question can be asked, the room message says how to act instead: send `release <review id>` or `discard <review id>`, which only a sender the broker attests as owner can do, and the message must be exactly that. Either way the reply is posted only if the stored record (its text, room, working directory and expiry) is unchanged, and only an answer the owner gave counts. Reviews expire after 24 hours, and a Worker restart drops pending ones. A `[channel:]` redirect is withheld and cannot be released. The check matches known formats only. A collaborator's own Turn cannot post with `_ag2/notify`, and while any collaborator is listed, every `_ag2/notify` the agent sends is checked the same way and may only go to a room this Worker has an owner Session in; one that fails is withheld and logged. The agent's own tools still can: a listed sender can steer it, for example, into changing and running one of the owner's scheduled tasks, whose outcome is posted unchecked. Set it with `install.sh --collaborators "@a:s.space,@b:s.space"` (validated, kept across re-runs, `""` clears it). It is read when the Worker starts. **On one OS user this is a trust boundary, not tamper resistance**: the agent can edit this file, the launcher or agent-connect itself. Editing only the list can admit only senders the room already grants collaborator; editing the Worker voids the check. Run the agent as another OS user, or in its host's tool sandbox, if that matters to you. Typical use: your own other agents, e.g. `@you-other.agent:s.space` | *(unset)* |
 | `AGENT_CONNECT_UNCHECKED_COLLABORATORS` | `1` (or `true`, `yes`, `on`) to post listed collaborators' replies without the secret and file check. The room's "Sensitive data filter" setting is not trusted for this, because a room moderator can change it. A `[channel:]` redirect is still held | *(unset)* |
 | `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK` | `1` to start even when the agent advertises authentication methods. The escape hatch for an agent whose `authMethods` mean something else | *(unset)* |
 | `AGENT_CONNECT_TURN_TIMEOUT` | seconds one turn may run before it is cancelled **through the protocol**, keeping whatever it produced. `0` waits forever | `600` |
@@ -976,7 +960,7 @@ spends real tokens against a real bridge.
 The ACP seam is built (2026-08-10, plan `.scratch/acp-adapter/plan.md`, tickets
 01–10 all resolved): async worker serving rooms concurrently, the ACP Adapter
 (owner-only, cooperative Permission Policy), presets with a pinned bridge and a
-startup auth check, the Ladder (placeholder → live edits → answer), Sessions per
+startup auth check, broker-delivered answers with no-action and failed outcomes, Sessions per
 room and Access Tier surviving restart, the full Turn lifecycle (queueing,
 cancellation, honest endings), and attachments in both directions. The five
 original adapters (codex first among them) still run through the shim. Not yet
