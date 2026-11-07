@@ -79,9 +79,12 @@ only the owner, can write an agent's card. Only the owner can, on their machine,
 `AGENT_CONNECT_UNCHECKED_COLLABORATORS`. The flag is still passed to the agent.
 A reply matching a known secret format, carrying a `[file:]`, or failing the scan is
 held. It is stored owner-only in the Worker's workspace (`agent_connect.withheld`), and
-the room is told how the owner can act: reply `release` or `discard` to the withheld
-message. Only a sender the broker attests as owner can, and only if the stored copy is
-unchanged (an HMAC keyed in the Worker process). No Sutando or other service is needed. A `[channel:]`
+the owner is asked privately, with AG2 Space's `room.question.ask` in their DM with the
+agent, whether to post it. When that DM cannot be used, the room message says how to act
+instead: reply `release` or `discard` to it, which only an owner-attested sender can do.
+The reply is posted only if the stored copy is unchanged (an HMAC keyed in the Worker
+process). An action the Permission Policy cannot allow is put to the owner the same way
+(Allow/Deny), for owner and collaborator Turns alike, replacing the Sutando HITL seam. A `[channel:]`
 redirect is held whatever the setting says. The detector matches known formats only, as sparrow's does, so it is a
 backstop, not containment. A collaborator's own Turn neither offers nor posts
 `_ag2/notify`. The agent may queue a notification and send it later on a listener or an

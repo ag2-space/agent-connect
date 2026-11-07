@@ -116,8 +116,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import os
 import sys
+import uuid
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -126,7 +128,7 @@ from typing import AsyncIterator, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from .. import attachments as att
-from .. import hitl_seam
+from .. import questions as owner_questions
 from .. import result_guard
 from ..result_guard import asked_by
 from .. import outgoing
@@ -617,6 +619,41 @@ def destination_meta(ctx: TurnContext) -> dict:
     }
 
 
+#: The owner's two answers to an action the Policy cannot allow.
+APPROVAL_OPTIONS = (("allow", "Allow"), ("deny", "Deny"))
+#: Said in the room while the Turn waits for the owner.
+AWAITING_APPROVAL = ("🔐 agent-connect: waiting for the owner to approve an action. "
+                     "They have been asked privately.")
+
+
+def allow_option(request) -> str:
+    """The request's own allow option id, preferring once over always; "" if none."""
+    options = [o for o in (getattr(request, "options", None) or []) if isinstance(o, dict)]
+    for kind in ("allow_once", "allow_always"):
+        for option in options:
+            if option.get("kind") == kind:
+                return str(option.get("optionId") or option.get("option_id") or "")
+    return ""
+
+
+def approval_prompt(ctx: TurnContext, decision, request, requester: str) -> str:
+    """The private question: what the agent wants, where, and for whom."""
+    tool = getattr(request, "tool_call", None)
+    tool = tool if isinstance(tool, dict) else {}
+    lines = [f"The agent wants to {decision.title}.",
+             f"Not allowed automatically: {decision.reason}."]
+    if decision.paths:
+        lines.append("Paths: " + ", ".join(decision.paths))
+    raw = tool.get("rawInput")
+    if raw:
+        lines.append("Details: " + json.dumps(raw, default=str)[:800])
+    lines.append(f"Room: {ctx.room_name or ctx.room}")
+    lines.append(f"Asked by {requester}, a collaborator, not you." if requester
+                 else "This is your own turn.")
+    lines.append("Allow it?")
+    return "\n".join(lines)
+
+
 #: Posted in place of an unsolicited message the collaborator check held.
 NOTIFY_WITHHELD = ("🔒 agent-connect: a message from the agent was withheld because it may "
                    "contain sensitive data. The Worker log has the reason.")
@@ -1059,8 +1096,14 @@ class AcpAdapter:
         #: None drops such notifications, which is what a Worker without Room
         #: Ops can honestly do.
         self._notifier = None
+        #: Private questions to the owner; None refuses what the Policy cannot allow.
+        self._questions = None
         #: Rooms an owner Turn ran in during this process (`owner_rooms`).
         self._owner_rooms: set = set()
+
+    def set_questions(self, questions) -> None:
+        """Where an action the Policy cannot allow is put to the owner (`agent_connect.questions`)."""
+        self._questions = questions
 
     def set_notifier(self, post) -> None:
         """Where a message the ACP Agent sends unasked goes: `post(destination, text)`."""
@@ -1345,10 +1388,10 @@ class AcpAdapter:
                 # story is that the turn ran out of time.
                 return None
             decision = policy.decide(request)
-            hitl_ws = hitl_seam.configured()
             requester = asked_by(ctx)
             who = {"asked_by": requester} if requester else {}
-            if decision.allowed or hitl_ws is None:
+            allow = allow_option(request)
+            if decision.allowed or self._questions is None or not allow:
                 queue.put_nowait(
                     PermissionAsked(
                         title=decision.title,
@@ -1360,23 +1403,29 @@ class AcpAdapter:
                 return decision.option_id
 
             async def ask_the_human():
-                # The Policy could not allow it; the owner decides from a chat
-                # card. The core awaits this coroutine; a timeout is the reject.
-                chosen = await hitl_seam.escalate(
-                    request, session="|".join(key), workspace=hitl_ws,
-                    timeout=hitl_seam.timeout_s(),
-                    asked_by=requester,
-                )
-                allowed = chosen is not None and chosen != decision.option_id
+                # The Policy could not allow it: the owner is asked privately,
+                # in their DM with the agent. Unasked, a timeout or "deny" is
+                # the reject; only the owner's "allow" lets it through.
+                questions = self._questions
+                question = await questions.ask(
+                    approval_prompt(ctx, decision, request, requester),
+                    APPROVAL_OPTIONS, expires_in_s=int(owner_questions.timeout_s()) + 60,
+                    operation_id=f"approval-{uuid.uuid4().hex}")
+                chosen = ""
+                if question:
+                    queue.put_nowait(Notice(text=AWAITING_APPROVAL))
+                    chosen = await questions.wait(question, owner_questions.timeout_s())
+                allowed = chosen == "allow"
                 queue.put_nowait(
                     PermissionAsked(
                         title=decision.title,
                         allowed=allowed,
-                        reason="owner allowed via card" if allowed else f"{decision.reason}; owner did not allow",
-                        detail={"paths": list(decision.paths), "hitl": True, **who},
+                        reason=("owner allowed" if allowed
+                                else f"{decision.reason}; owner did not allow"),
+                        detail={"paths": list(decision.paths), "asked_owner": bool(question), **who},
                     )
                 )
-                return chosen if chosen is not None else decision.option_id
+                return allow if allowed else decision.option_id
 
             return ask_the_human()
 

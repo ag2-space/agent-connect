@@ -2,6 +2,7 @@
 import _bootstrap  # noqa: F401
 
 import asyncio
+import uuid
 from types import SimpleNamespace
 
 from agent_connect.adapters.acp import COLLABORATORS_ENV, REFUSAL, AcpAdapter, admitted
@@ -219,31 +220,35 @@ with tempfile.TemporaryDirectory() as tmp:
     check(owned.owner_rooms() == {"!owned:s.space"},
           "owner rooms come from the Session map's owner keys only")
 
-# --- card guards cannot collide across Sessions -------------------------------
-from agent_connect import hitl_seam
-tc = SimpleNamespace(tool_call={"toolCallId": "t1"}, options=[])
-g1 = hitl_seam.guard_for(tc, "!r:s.space|collaborator:@x_y:s.space")
-g2 = hitl_seam.guard_for(tc, "!r:s.space|collaborator:@x=y:s.space")
-check(g1 != g2, "two Sessions that fold to the same text keep distinct guards")
-check(hitl_seam.guard_for(SimpleNamespace(tool_call={"toolCallId": "t2"}, options=[]), "s")
-      != hitl_seam.guard_for(tc, "s"), "the tool call id is part of the guard")
-long_a = hitl_seam.guard_for(tc, "!r|collaborator:@" + "a" * 200 + "1:s.space")
-long_b = hitl_seam.guard_for(tc, "!r|collaborator:@" + "a" * 200 + "2:s.space")
-check(long_a != long_b and len(long_a) <= 120, "and long ones differ after truncation, within 120")
-
-# --- an escalation card names a collaborator, and never the owner -----------
+# --- an action the Policy cannot allow is put to the owner privately -------
 from types import SimpleNamespace as NS
 
-from agent_connect import hitl_seam
-from agent_connect.adapters import acp as acp_module
-from agent_connect.events import PermissionAsked
+from agent_connect.adapters.acp import AWAITING_APPROVAL, allow_option
+from agent_connect.events import Notice, PermissionAsked
+from agent_connect.questions import OwnerQuestions
 
-request = NS(tool_call={"toolCallId": "t1", "title": "write /etc/x"},
-             options=[{"optionId": "allow", "name": "Allow", "kind": "allow_once"}])
-card = hitl_seam.event_for(request, "s", "Bob\n(@bob:s.space)")
-check("asked by Bob (@bob:s.space), a collaborator" in card["prompt"] and "\n" not in card["prompt"],
-      "a card for a collaborator names them, on one line")
-check("asked by" not in hitl_seam.event_for(request, "s")["prompt"], "an owner's card names nobody")
+
+class FakeSync:
+    """The relay client's `questions`: records asks, answers with `choice`."""
+
+    def __init__(self, choice, private=True):
+        self.choice, self.private, self.asked = choice, private, []
+
+    def ask(self, prompt, options, *, expires_in_s, operation_id):
+        self.asked.append((prompt, tuple(options), operation_id))
+        return f"q{len(self.asked)}" if self.private else None
+
+    def inspect(self, question_id):
+        if self.choice is None:
+            return NS(status="pending", option="", revision="1")
+        return NS(status="answered", option=self.choice, revision="2")
+
+
+check(allow_option(NS(options=[{"optionId": "a2", "kind": "allow_always"},
+                               {"optionId": "a1", "kind": "allow_once"}])) == "a1",
+      "allow once is preferred over allow always")
+check(allow_option(NS(options=[{"optionId": "r", "kind": "reject_once"}])) == "",
+      "a request with no allow option cannot be allowed")
 
 with tempfile.TemporaryDirectory() as tmp:
     base = Path(tmp)
@@ -256,47 +261,64 @@ with tempfile.TemporaryDirectory() as tmp:
                      "rawInput": {"path": "/etc/x"}, "locations": [{"path": "/etc/x"}]},
         "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
                     {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]}]}}))
-    adapter = AcpAdapter(command=[sys.executable, FAKE, str(script)],
-                         store=SessionStore(base / "sessions.json"))
-    cards = []
-    real_write = hitl_seam._write_atomic
 
-    def capture(path, body):
-        if body.get("kind") == "permission":
-            cards.append(body["prompt"])
-        real_write(path, body)
-
-    hitl_seam._write_atomic = capture
-    os.environ[hitl_seam.WORKSPACE_ENV] = str(base / "hitl")
-    os.environ[hitl_seam.TIMEOUT_ENV] = "0.2"
-    os.environ[COLLABORATORS_ENV] = AGENT
-    try:
-        def run_turn(c):
+    def run_turn(c, sync):
+        adapter = AcpAdapter(command=[sys.executable, FAKE, str(script)],
+                             store=SessionStore(base / f"s-{uuid.uuid4().hex}.json"))
+        adapter.set_questions(OwnerQuestions(sync) if sync is not None else None)
+        report = base / "report.json"
+        os.environ["FAKE_ACP_REPORT"] = str(report)
+        os.environ["AGENT_CONNECT_APPROVAL_TIMEOUT"] = "3"
+        os.environ[COLLABORATORS_ENV] = AGENT
+        try:
             async def go():
                 return [e async for e in adapter.turn(c)]
-            return asyncio.run(asyncio.wait_for(go(), timeout=30))
+            events = asyncio.run(asyncio.wait_for(go(), timeout=30))
+        finally:
+            for name in ("FAKE_ACP_REPORT", "AGENT_CONNECT_APPROVAL_TIMEOUT", COLLABORATORS_ENV):
+                os.environ.pop(name, None)
+        answer = json.loads(report.read_text())["permissions"][0]["answer"]
+        return events, json.dumps(answer)
 
-        collab = run_turn(TurnContext(prompt="hi", room="!r:s.space", cwd=str(repo),
-                                      access_tier=GUEST, requested_access_tier="team",
-                                      collaborator=True, user_id=AGENT, sender_name="cc-backend"))
-        owner = run_turn(TurnContext(prompt="hi", room="!r:s.space", cwd=str(repo),
-                                     access_tier=OWNER, user_id="@mark:s.space"))
-    finally:
-        hitl_seam._write_atomic = real_write
-        os.environ.pop(hitl_seam.WORKSPACE_ENV, None)
-        os.environ.pop(hitl_seam.TIMEOUT_ENV, None)
-        os.environ.pop(COLLABORATORS_ENV, None)
+    collab_ctx = TurnContext(prompt="hi", room="!r:s.space", room_name="OpenClaw Setup", cwd=str(repo),
+                             access_tier=GUEST, requested_access_tier="team",
+                             collaborator=True, user_id=AGENT, sender_name="cc-backend")
+    owner_ctx = TurnContext(prompt="hi", room="!r:s.space", cwd=str(repo),
+                            access_tier=OWNER, user_id="@mark:s.space")
 
-    check(len(cards) == 2, f"both out-of-directory writes were escalated ({len(cards)})")
-    check(bool(cards) and f'asked by {AGENT} ("cc-backend"), a collaborator' in cards[0],
-          "the collaborator's escalation card names them")
-    check(len(cards) == 2 and "asked by" not in cards[1], "the owner's does not")
-    asks = [e for e in collab if isinstance(e, PermissionAsked)]
-    check(bool(asks) and asks[0].detail.get("asked_by") == f'{AGENT} ("cc-backend")',
-          "and the collaborator's PermissionAsked carries who asked")
-    owner_asks = [e for e in owner if isinstance(e, PermissionAsked)]
-    check(bool(owner_asks) and "asked_by" not in owner_asks[0].detail,
-          "the owner's PermissionAsked does not")
+    allowing = FakeSync("allow")
+    events, answer = run_turn(collab_ctx, allowing)
+    prompt = allowing.asked[0][0] if allowing.asked else ""
+    check(bool(allowing.asked) and allowing.asked[0][1] == (("allow", "Allow"), ("deny", "Deny")),
+          "the owner is asked privately, with Allow and Deny")
+    check("write /etc/x" in prompt and "/etc/x" in prompt and "OpenClaw Setup" in prompt
+          and f'{AGENT} ("cc-backend"), a collaborator, not you' in prompt,
+          "the question says what, where, in which room, and which collaborator asked")
+    check('"allow"' in answer, "the owner's Allow lets the action through")
+    check(any(isinstance(e, Notice) and e.text == AWAITING_APPROVAL for e in events),
+          "the room is told the Turn is waiting for the owner, without the details")
+    asks = [e for e in events if isinstance(e, PermissionAsked)]
+    check(bool(asks) and asks[0].allowed and asks[0].detail.get("asked_by") == f'{AGENT} ("cc-backend")',
+          "and PermissionAsked records the allow and who asked")
+
+    events, answer = run_turn(owner_ctx, FakeSync("deny"))
+    check('"reject"' in answer, "Deny refuses it")
+    owner_asks = [e for e in events if isinstance(e, PermissionAsked)]
+    check(bool(owner_asks) and not owner_asks[0].allowed and "asked_by" not in owner_asks[0].detail,
+          "the owner's own refusal names nobody")
+
+    pending = FakeSync(None)
+    events, answer = run_turn(owner_ctx, pending)
+    check('"reject"' in answer, "no answer before the timeout refuses it")
+    check("This is your own turn." in pending.asked[0][0], "the owner's question says it is their turn")
+
+    events, answer = run_turn(owner_ctx, FakeSync("allow", private=False))
+    check('"reject"' in answer and not any(isinstance(e, Notice) and e.text == AWAITING_APPROVAL
+                                           for e in events),
+          "with no private DM to ask in, it is refused and nobody is told to wait")
+
+    events, answer = run_turn(owner_ctx, None)
+    check('"reject"' in answer, "with no questions at all, the Policy's refusal stands")
 
 # --- a display name cannot impersonate on the card ----------------------------
 from agent_connect.adapters.acp import asked_by

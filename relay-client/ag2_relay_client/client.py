@@ -80,6 +80,7 @@ from .envelope import Task, parse_task
 from .journal import Journal, Reconciler
 from .media import MediaIngress, MediaStore
 from .outbound import MAX_FILES, Outbound, PreparedResult
+from .questions import OwnerQuestions
 from .resolver import BoundedResolver
 from .roomops import COOLDOWN_S as ROOM_OPS_COOLDOWN_S
 from .roomops import RoomOps
@@ -247,7 +248,7 @@ class RelayClient:
         "poll_wait", "socket_margin", "heartbeat_interval", "ack_cooldown",
         "auth_recheck_interval", "guard", "standby_recheck", "idle_gap",
         "result_budget", "intake_budget", "tier", "client_name", "provider",
-        "capabilities", "tasks", "media", "_room_ops", "outbound",
+        "capabilities", "tasks", "media", "_room_ops", "_questions", "outbound",
         "_reconciler", "_live", "_presence",
         "_ack_disabled_until", "_ack_owed", "_intake_deadline",
         "_result_retry_at", "_heartbeat_disabled", "_last_heartbeat",
@@ -265,7 +266,7 @@ class RelayClient:
     #: `client.outbound = Outbound(RoomOps(http, EgressAllowlist(["/"])))` and a
     #: `[file:]` marker uploads anything on the machine. A seal with a door in
     #: it is not a seal.
-    _SEALED = frozenset({"_http", "_room_ops", "outbound"})
+    _SEALED = frozenset({"_http", "_room_ops", "_questions", "outbound"})
 
     def __init__(
         self,
@@ -372,6 +373,8 @@ class RelayClient:
         #: uploads, the F6 ledger that keeps a retried result POST from putting
         #: the same file in the room twice.
         self.outbound = Outbound(self._room_ops, max_files=max_files)
+        #: Private questions to this agent's owner, over the agent's MCP access.
+        self._questions = OwnerQuestions(self._http)
 
         self._reconciler = Reconciler(self.journal)
         #: Ids accepted by *this* run. The journal knows which ids are owed an
@@ -436,6 +439,15 @@ class RelayClient:
         with `[REPLIED]`.
         """
         return self._room_ops
+
+    @property
+    def questions(self) -> OwnerQuestions:
+        """Ask this agent's owner a private multiple-choice question.
+
+        Asked only in the owner's DM with this agent, after its membership is
+        checked; see `ag2_relay_client.questions`. Every failure is `None`.
+        """
+        return self._questions
 
     # --- lifecycle ---------------------------------------------------------
 

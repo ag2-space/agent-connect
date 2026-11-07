@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from agent_connect import hitl_seam, result_guard
+from agent_connect import result_guard
 from agent_connect.events import Done, MessageChunk, TurnContext
 from types import SimpleNamespace
 
@@ -203,6 +203,98 @@ check("All done." in "\n".join(ops.edits) + body and not list(held_dir.glob("wr_
       "a clean collaborator reply is posted without review")
 ops, body = run_turn(owner, secret_reply)
 check(SAMPLES["GitHub token"] in "\n".join(ops.edits) + body, "the owner's reply is never held")
+# --- the owner is asked privately when a DM question can be asked ------------
+from agent_connect.questions import OwnerQuestions
+
+
+class Sync:
+    def __init__(self):
+        self.asked, self.answers = [], {}
+
+    def ask(self, prompt, options, *, expires_in_s, operation_id):
+        self.asked.append((prompt, tuple(options), operation_id, expires_in_s))
+        return f"q{len(self.asked)}"
+
+    def inspect(self, question_id):
+        status, option = self.answers.get(question_id, ("pending", ""))
+        return SimpleNamespace(status=status, option=option, revision="1")
+
+
+class AskingOps(Ops):
+    def __init__(self):
+        super().__init__()
+        self.sync = Sync()
+        self.questions = OwnerQuestions(self.sync)
+        self.uploads = []
+
+    async def upload(self, room, path, base_dir=None):
+        self.uploads.append((room, path))
+        return SimpleNamespace(ok=True, reason="")
+
+
+for leftover in held_dir.glob("wr_*.json"):
+    leftover.unlink()
+asking = AskingOps()
+reply = "the key is " + SAMPLES["GitHub token"] + "\n[file: report.pdf]"
+ops, body = run_turn(ctx(room_name="OpenClaw Setup", sender_name="cc"), reply, ops=asking)
+room_text = "\n".join(ops.edits + ops.messages) + body
+prompt, options, op_id, expires = asking.sync.asked[0]
+check(SAMPLES["GitHub token"] in prompt and "OpenClaw Setup" in prompt and "@cc:s.space" in prompt,
+      "the owner's private question shows the reply, the room and the collaborator")
+check(options == (("release", "Post it to the room"), ("discard", "Discard it"))
+      and expires == withheld.TTL_S and op_id.startswith("wr_"),
+      "with Post it / Discard, a 24-hour expiry, and the review id as the operation id")
+check("asked privately" in room_text and SAMPLES["GitHub token"] not in room_text
+      and "`release`" not in room_text, "the room only hears that the owner was asked privately")
+
+asyncio.run(withheld.check_answers(asking))
+check(len(list(held_dir.glob("wr_*.json"))) == 1 and not asking.uploads,
+      "while the question is pending, nothing is posted")
+asking.sync.answers["q1"] = ("answered", "release")
+asyncio.run(withheld.check_answers(asking))
+posted = asking.messages[-1] if asking.messages else ""
+check(SAMPLES["GitHub token"] in posted and withheld.RELEASED_NOTE in posted and "[file:" not in posted,
+      "Post it publishes the exact text, without the marker")
+check(asking.uploads == [("!r:s.space", "report.pdf")], "and sends its file")
+check(not list(held_dir.glob("wr_*.json")), "and the stored copy is deleted")
+
+ops, body = run_turn(ctx(), secret_reply, ops=asking)
+asking.sync.answers["q2"] = ("answered", "discard")
+before = len(asking.messages)
+asyncio.run(withheld.check_answers(asking))
+check(len(asking.messages) == before and not list(held_dir.glob("wr_*.json")),
+      "Discard posts nothing and deletes it")
+
+ops, body = run_turn(ctx(), secret_reply, ops=asking)
+asking.sync.answers["q3"] = ("expired", "")
+asyncio.run(withheld.check_answers(asking))
+check(not list(held_dir.glob("wr_*.json")), "an expired question drops the review")
+
+ops, body = run_turn(ctx(), secret_reply, ops=asking)
+path = next(held_dir.glob("wr_*.json"))
+record = json.loads(path.read_text())
+record["body"] = "swapped by the agent"
+path.write_text(json.dumps(record))
+asking.sync.answers["q4"] = ("answered", "release")
+before = len(asking.messages)
+asyncio.run(withheld.check_answers(asking))
+check(len(asking.messages) == before, "a copy changed on disk is never posted, even when released")
+
+
+class NoDm(AskingOps):
+    def __init__(self):
+        super().__init__()
+        self.sync.ask = lambda *a, **k: None
+        self.questions = OwnerQuestions(self.sync)
+
+
+ops, body = run_turn(ctx(), secret_reply, ops=NoDm())
+check("`release`" in "\n".join(ops.edits) + body,
+      "with no private DM to ask in, the room message says how to release it instead")
+for leftover in held_dir.glob("wr_*.json"):
+    leftover.unlink()
+
+
 # --- notes, notices, zero-width, stale releases --------------------------------
 
 
@@ -244,8 +336,6 @@ for value in ("0", "false", "2", "y", "enable", "@a:b", "\uff11", "1\u200b"):
 check(not result_guard.verdict(ctx(), SAMPLES["GitHub token"],
                                env={result_guard.UNCHECKED_ENV: "yes"}).hold, "'yes' turns it off")
 check("a'b" in result_guard.asked_by(ctx(sender_name='a"b')), "a quote in a display name is replaced")
-card = hitl_seam.event_for(NS_REQ, "s", "x\u202ey")
-check("\u202e" not in card["prompt"], "the card strips a bidi override itself")
 check(result_guard.notify_verdict("[channel: !x:s.space]\nhi", "!r:s.space", {"!r:s.space"},
                                   env={result_guard.UNCHECKED_ENV: "1"}).hold,
       "a redirected notification is held even with scanning off")

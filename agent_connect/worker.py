@@ -517,6 +517,8 @@ def start_listener_link(adapter, ops) -> Optional[asyncio.Task]:
             print(f"agent-connect: could not post to {destination}: {exc}", file=sys.stderr)
 
     adapter.set_notifier(post)
+    if hasattr(adapter, "set_questions"):
+        adapter.set_questions(getattr(ops, "questions", None))
     try:
         endpoint = adapter.endpoint()
     except Exception:  # noqa: BLE001 — a misconfigured endpoint is the Turn's to report
@@ -648,6 +650,7 @@ async def serve(
     # standing link so that can arrive between Turns too.
     withheld.sweep()  # reviews a previous Worker held cannot be verified
     link = start_listener_link(adapter, ops)
+    watcher = asyncio.ensure_future(withheld.watch(ops)) if ops is not None else None
     try:
         while True:
             task = await inbound.get()
@@ -670,6 +673,8 @@ async def serve(
         stop.set()
         if link is not None:
             link.cancel()
+        if watcher is not None:
+            watcher.cancel()
         if heartbeat is not None:
             heartbeat.cancel()
 

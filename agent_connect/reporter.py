@@ -316,10 +316,11 @@ class TurnReporter:
         if held.hold:
             review = None
             if "a redirect to another room" not in held.why:
-                review = withheld.hold(ctx.room, answer, held.why)
+                review = withheld.hold(ctx.room, answer, held.why, cwd=ctx.cwd)
             if review is None:
                 return await self.finish(WITHHELD, "", reason)
-            body = await self.finish(withheld.review_message(review, held.why), "", reason)
+            asked = await self._ask_owner(ctx, review, answer, held.why)
+            body = await self.finish(withheld.review_message(review, held.why, asked), "", reason)
             if self.event_id:
                 withheld.bind_event(review, self.event_id)
             return body
@@ -436,6 +437,19 @@ class TurnReporter:
         return "\n\n".join(parts)
 
     # -- internals ----------------------------------------------------------
+
+    async def _ask_owner(self, ctx: TurnContext, review: str, answer: str, why) -> bool:
+        """Ask the owner privately whether to post a held reply; False if it can't be asked."""
+        questions = getattr(self.ops, "questions", None)
+        if questions is None:
+            return False
+        prompt = withheld.owner_prompt(review, answer, why, result_guard.asked_by(ctx),
+                                       ctx.room_name or ctx.room)
+        question = await questions.ask(prompt, withheld.OPTIONS, expires_in_s=withheld.TTL_S,
+                                       operation_id=review)
+        if question:
+            withheld.bind_question(review, question)
+        return bool(question)
 
     async def notice(self, text: str, keep: bool = True) -> bool:
         """Tell the room something about the run, as its own message.
