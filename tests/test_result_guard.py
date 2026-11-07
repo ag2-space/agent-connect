@@ -60,11 +60,13 @@ check(result_guard.verdict(ctx(), "see [file: /tmp/x.png]").why == ("a file, whi
       "a file holds the reply")
 check(result_guard.verdict(ctx(), "[channel: !other:s.space]\nhi").hold,
       "a redirect holds the reply")
-check(result_guard.verdict(ctx(sensitive_data_filter=False), "[channel: !other:s.space]\nhi").hold,
-      "a redirect holds it even with the filter off")
-off = ctx(sensitive_data_filter=False)
-check(not result_guard.verdict(off, SAMPLES["GitHub token"] + " [file: /tmp/x]").hold,
-      "with the room's filter off, secrets and files pass")
+UNCHECKED = {result_guard.UNCHECKED_ENV: "1"}
+check(result_guard.verdict(ctx(), "[channel: !other:s.space]\nhi", env=UNCHECKED).hold,
+      "a redirect holds it even when the owner turned scanning off")
+check(not result_guard.verdict(ctx(), SAMPLES["GitHub token"] + " [file: /tmp/x]", env=UNCHECKED).hold,
+      "with the owner's opt-out, secrets and files pass")
+check(result_guard.verdict(ctx(sensitive_data_filter=False), SAMPLES["GitHub token"], env={}).hold,
+      "the room's filter flag alone cannot turn the check off")
 
 
 def broken(_):

@@ -73,12 +73,13 @@ is the agent's to enforce. To let it, the Worker sends `_meta["ag2/requester"]` 
 all from the broker's attestation and never from message text. Each collaborator gets
 a Session per (room, sender), so collaborators never share history with each other or
 with the owner. Separate history does not separate files, memory or credentials.
-With the room's sensitive data filter on (the default, sent as `sensitive_data_filter`),
-a collaborator's reply is checked before the Ladder posts it (`agent_connect.result_guard`).
+A collaborator's reply is checked before the Ladder posts it (`agent_connect.result_guard`).
+The room's `sensitive_data_filter` flag cannot switch the check off: a room moderator, not
+only the owner, can write an agent's card. Only the owner can, on their machine, with
+`AGENT_CONNECT_UNCHECKED_COLLABORATORS`. The flag is still passed to the agent.
 A reply matching a known secret format, carrying a `[file:]`, or failing the scan is
 held, and is posted only if the owner releases it from an approval card. A `[channel:]`
-redirect is held whatever the filter says. With the filter off, the owner has accepted
-unchecked replies. The detector matches known formats only, as sparrow's does, so it is a
+redirect is held whatever the setting says. The detector matches known formats only, as sparrow's does, so it is a
 backstop, not containment. A collaborator's own Turn neither offers nor posts
 `_ag2/notify`. The agent's own tools are outside this: a listed sender can steer it into,
 for example, changing and running one of the owner's scheduled tasks, whose outcome is

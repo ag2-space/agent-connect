@@ -5,9 +5,12 @@ files and credentials, so a collaborator's reply is checked before it reaches
 the room. A reply is held for the owner when it carries:
 
 - a `[channel:]` redirect, always: it moves the reply somewhere the sender chose;
-- with the room's sensitive data filter on (the default): a `[file:]`, which
-  cannot be scanned, or text matching a known secret format. A scan that fails
-  holds the reply too.
+- unless the owner set `AGENT_CONNECT_UNCHECKED_COLLABORATORS` on this machine:
+  a `[file:]`, which cannot be scanned, or text matching a known secret format.
+  A scan that fails holds the reply too.
+
+The room's `sensitive_data_filter` flag is not trusted to turn the check off: a
+room moderator, not only the owner, can write it.
 
 A held reply is posted only if the owner releases it from an approval card. No
 card configured, a timeout or "Discard" means it is never posted. The detector
@@ -15,12 +18,13 @@ matches known secret formats only; it is a backstop, not containment.
 """
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 
 from ag2_relay_client import markers
 
@@ -28,6 +32,8 @@ from . import hitl_seam
 from .events import TurnContext
 
 OWNER = "owner"
+#: The owner's own opt-out from scanning collaborator replies, on this machine.
+UNCHECKED_ENV = "AGENT_CONNECT_UNCHECKED_COLLABORATORS"
 
 #: Known secret formats, from Sutando's `chat_secret_filter` fallback list.
 PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
@@ -72,7 +78,13 @@ class Verdict:
     why: Tuple[str, ...] = ()
 
 
-def verdict(ctx: TurnContext, body: str, scan=secret_types) -> Verdict:
+def scanning(env: Optional[Mapping[str, str]] = None) -> bool:
+    env = os.environ if env is None else env
+    return (env.get(UNCHECKED_ENV) or "").strip().lower() not in ("1", "true", "yes", "on")
+
+
+def verdict(ctx: TurnContext, body: str, scan=secret_types,
+            env: Optional[Mapping[str, str]] = None) -> Verdict:
     """Whether a collaborator's reply must wait for the owner, and why."""
     if not guarded(ctx):
         return Verdict(False)
@@ -80,7 +92,7 @@ def verdict(ctx: TurnContext, body: str, scan=secret_types) -> Verdict:
     kinds = {action.kind for action in markers.parse(body or "").actions}
     if "redirect" in kinds:
         why.append("a redirect to another room")
-    if ctx.sensitive_data_filter:
+    if scanning(env):
         if "attach" in kinds:
             why.append("a file, which cannot be scanned")
         try:
