@@ -24,17 +24,17 @@ keywords = ["ag2space", "codex", "matrix", "agent", "bridge"]
 # disease its drift tests already treat (ADR 0001). It is stdlib-only, so this
 # adds no dependency tree.
 #
-# Floored at relay-client-v0.1.1: this worker imports markers.mxids_in, which
-# 0.1.0 lacks. Published since relay-client-v0.1.0, so the floor is a real resolution
+# Floored at relay-client-v0.2.0: this worker uses client.questions (owner
+# questions, 0.2.0) and markers.mxids_in (0.1.1). Published since relay-client-v0.1.0, so the floor is a real resolution
 # and not a promise: until that tag the name existed nowhere and `pip install`
-# ended at `No matching distribution found`. Capped below 0.2 for the same
+# ended at `No matching distribution found`. Capped below 0.3 for the same
 # reason the ACP SDK is capped below 1.0 — a 0.x library may move its surface
 # in a minor, and the two distributions release from this one repository on
 # separate tags, so nothing but this cap stops an old worker from resolving a
 # library it was never built against.
 dependencies = [
     "agent-client-protocol>=0.12,<1.0",
-    "ag2-relay-client>=0.1.1,<0.2",
+    "ag2-relay-client>=0.2.0,<0.3",
 ]
 
 [tool.uv.sources]

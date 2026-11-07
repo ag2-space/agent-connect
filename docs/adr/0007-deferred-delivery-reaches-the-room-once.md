@@ -256,7 +256,8 @@ paths, by design.
     answer Retry;
   - uploads judged against an allowlist rooted at one binding's `export_dir`.
 
-  Released as relay client 0.2.0, then agent-connect 0.3.0 with that minimum.
+  Released as the next relay client minor, then the next agent-connect minor with that
+  minimum.
 - **Agents** that want it: declare `ag2/deliver`, send it only to a client that declared it,
   write deliverable files to `export_dir`, keep a durable queue, and treat only a result
   covering every part as delivered.
@@ -327,7 +328,8 @@ paths, by design.
   - keyed 200 without the echo: recorded as posted, Delivered, declaration withdrawn;
   - a non-ASCII `id`: one key, whatever its JSON escaping;
   - `worker-id` deleted, unreadable or changed while `deliveries.json` exists: delivery not
-    enabled, no new id minted; an in-progress entry resumes under its stored worker id;
+    enabled, no new id minted, and nothing runs, in-progress entries included, until the id
+    is restored; with the id intact, an in-progress entry resumes under its stored worker id;
   - relay 409 `running`: Retry, and room ops in other rooms keep working;
   - keys for `id="x1", part=0` and `id="x", part=10` differ;
   - simultaneous deliveries to two rooms: each lands in its own room only;
