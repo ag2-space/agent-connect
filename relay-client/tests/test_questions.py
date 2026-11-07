@@ -171,6 +171,24 @@ with FakeBroker(base_path="") as broker:
     finally:
         mcp.close()
 
+# --- privacy is checked again on every ask, and must be exactly the two ---------
+with FakeBroker(base_path="") as broker:
+    mcp = Mcp()
+    try:
+        scene(broker, mcp)
+        q = make(broker)
+        check(q.owner() == Owner(OWNER, DM), "private at first")
+        broker.on("POST", "/v1/room", json={"members": [{"user_id": m} for m in
+                                                        (AGENT, OWNER, "@late:s.space")]})
+        check(q.ask("p", [("a", "A")], expires_in_s=60, operation_id="o2") is None,
+              "someone joining after the owner was cached stops the next ask")
+        broker.on("POST", "/v1/room", json={"members": [{"user_id": AGENT}]})
+        check(q.ask("p", [("a", "A")], expires_in_s=60, operation_id="o3") is None,
+              "and a DM the owner has left is not the owner's DM")
+    finally:
+        mcp.close()
+
+
 # --- discovery rules -------------------------------------------------------------
 for label, bad in (("another origin", "https://evil.example" + MINT_PATH),
                    ("another path", None)):

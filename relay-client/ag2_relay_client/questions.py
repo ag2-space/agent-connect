@@ -117,6 +117,8 @@ class OwnerQuestions:
             owner = self._owner_cached()
             if owner is None or not owner.dm_room:
                 return None
+            if not self._private(owner.dm_room, self._agent_id(), owner.mxid):
+                return None
             answer = self._action("room.action.execute", owner.dm_room, "room.question.ask", {
                 "prompt": (prompt or "")[:PROMPT_MAX],
                 "options": [{"id": oid, "label": label} for oid, label in options],
@@ -190,7 +192,9 @@ class OwnerQuestions:
         if not isinstance(rows, list) or (isinstance(answer, dict) and answer.get("error")):
             return False
         members = {r.get("user_id") for r in rows if isinstance(r, dict)}
-        return bool(members) and members <= {agent, owner}
+        # Exactly the two: the relay lists joined members only, so a pending
+        # invite cannot be seen; asking checks again every time.
+        return members == {agent, owner}
 
     def _agent_id(self) -> str:
         if not self._agent:

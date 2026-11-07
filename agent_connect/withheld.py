@@ -33,6 +33,10 @@ DIR_NAME = "withheld"
 TTL_S = 24 * 3600
 OWNER = "owner"
 _KEY = secrets.token_bytes(32)
+#: Which question and which room message belong to a review. In memory only, so
+#: the agent, which can write the workspace, cannot point a review elsewhere.
+_QUESTION: dict = {}
+_EVENT: dict = {}
 #: Which Worker process held a review; another process's cannot be verified.
 _PROCESS = secrets.token_hex(8)
 _COMMAND = re.compile(r"^\s*(release|discard)(?:\s+(wr_[0-9a-f]{16}))?\s*[.!]?\s*$", re.IGNORECASE)
@@ -59,8 +63,7 @@ def hold(room: str, body: str, why, env: Optional[Mapping[str, str]] = None,
     now = time.time() if now is None else now
     review_id = "wr_" + secrets.token_hex(8)
     record = {"review_id": review_id, "room": room, "body": body, "why": list(why),
-              "created_at": now, "expires_at": now + TTL_S, "event_id": "",
-              "question_id": "", "cwd": cwd,
+              "created_at": now, "expires_at": now + TTL_S, "cwd": cwd,
               "process": _PROCESS, "seal": _seal(review_id, room, body)}
     try:
         _write(directory(env) / f"{review_id}.json", record)
@@ -70,34 +73,28 @@ def hold(room: str, body: str, why, env: Optional[Mapping[str, str]] = None,
 
 
 def bind_event(review_id: str, event_id: str, env: Optional[Mapping[str, str]] = None) -> None:
-    """Record which room message announced the review, so a reply to it can release."""
-    _update(review_id, env, event_id=event_id)
+    """Remember which room message announced the review, so a reply to it can release."""
+    _EVENT[review_id] = event_id
 
 
 def bind_question(review_id: str, question_id: str, env: Optional[Mapping[str, str]] = None) -> None:
-    _update(review_id, env, question_id=question_id)
-
-
-def _update(review_id: str, env, **fields) -> None:
-    path = directory(env) / f"{review_id}.json"
-    try:
-        record = json.loads(path.read_text())
-        record.update(fields)
-        _write(path, record)
-    except (OSError, ValueError):
-        pass
+    _QUESTION[review_id] = question_id
 
 
 OPTIONS = (("release", "Post it to the room"), ("discard", "Discard it"))
 
 
 def owner_prompt(review_id: str, body: str, why, asked_by: str, room: str) -> str:
-    """The private question: what was held, why, and the reply itself."""
+    """The private question: what was held, why, and the reply with secrets masked."""
+    from .result_guard import mask
+
     head = (f"A reply to {asked_by} in {room} was withheld ({review_id}): it contained "
-            f"{', '.join(why)}. Post it to the room?\n\nThe reply:\n\n")
+            f"{', '.join(why)}. Post it to the room?\n\nThe reply, with secrets masked "
+            f"(Post it sends the original):\n\n")
+    body = mask(body)
     room_left = 2000 - len(head)
     if len(body) > room_left:
-        tail = f"\n\n… (cut; the whole reply is in {directory() / (review_id + '.json')})"
+        tail = f"\n\n… (cut; the whole reply is in the Worker's workspace, withheld/{review_id}.json)"
         body = body[: max(0, room_left - len(tail))] + tail
     return head + body
 
@@ -107,10 +104,10 @@ def review_message(review_id: str, why, asked: bool = False) -> str:
     if asked:
         return (f"🔒 agent-connect: this reply was withheld for the owner's review ({review_id}). "
                 f"The owner has been asked privately whether to post it. It expires in 24 hours.")
-    where = directory() / f"{review_id}.json"
     return (
         f"🔒 agent-connect: this reply was withheld for the owner's review ({review_id}).\n\n"
-        f"Owner: read it on the Worker's machine in `{where}`, then reply to this message "
+        f"Owner: read it on the Worker's machine, in the Worker's workspace under "
+        f"`withheld/{review_id}.json`, then reply to this message "
         f"with `release` to post it or `discard` to delete it. It expires in 24 hours."
     )
 
@@ -131,14 +128,20 @@ async def check_answers(ops, env: Optional[Mapping[str, str]] = None) -> None:
     if questions is None:
         return
     sweep(env)
-    for path in _entries(env):
+    for review_id, question_id in list(_QUESTION.items()):
+        path = directory(env) / f"{review_id}.json"
         try:
             record = json.loads(path.read_text())
         except (OSError, ValueError):
+            _QUESTION.pop(review_id, None)
             continue
-        if not record.get("question_id"):
+        if record.get("review_id") != review_id:
+            _QUESTION.pop(review_id, None)
+            _remove(path)
             continue
-        status, option = await questions.answer(record["question_id"])
+        status, option = await questions.answer(question_id)
+        if status in ("expired", "cancelled", "answered"):
+            _QUESTION.pop(review_id, None)
         if status in ("expired", "cancelled") or (status == "answered" and option != "release"):
             _remove(path)
         elif status == "answered":
@@ -199,6 +202,8 @@ def decide(ctx, env: Optional[Mapping[str, str]] = None,
         known = named or reply_to in _announced(env) or getattr(ctx, "reply_to_me", False)
         return Decision(NOT_FOUND) if known else None
     _remove(path)
+    _EVENT.pop(record["review_id"], None)
+    _QUESTION.pop(record["review_id"], None)
     if verb == "discard":
         return Decision(DISCARDED)
     if not hmac.compare_digest(record.get("seal", ""),
@@ -221,13 +226,7 @@ def sweep(env: Optional[Mapping[str, str]] = None, now: Optional[float] = None) 
 
 
 def _announced(env) -> set:
-    found = set()
-    for path in _entries(env):
-        try:
-            found.add(json.loads(path.read_text()).get("event_id", ""))
-        except (OSError, ValueError):
-            pass
-    return found - {""}
+    return set(_EVENT.values()) - {""}
 
 
 def _find(room: str, named: Optional[str], reply_to: str, env):
@@ -238,8 +237,11 @@ def _find(room: str, named: Optional[str], reply_to: str, env):
             continue
         if record.get("room") != room:
             continue
-        if (named and record.get("review_id") == named) or \
-                (not named and reply_to and record.get("event_id") == reply_to):
+        review = record.get("review_id")
+        if review != path.stem:
+            continue
+        if (named and review == named) or \
+                (not named and reply_to and _EVENT.get(review) == reply_to):
             return record, path
     return None, None
 

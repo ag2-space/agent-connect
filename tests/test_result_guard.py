@@ -152,8 +152,8 @@ check(oct(held_dir.stat().st_mode & 0o777) == "0o700" and oct(files[0].stat().st
 check(files[0].name.split(".")[0] in room_text, "the message names the review id")
 
 review_id = files[0].name.split(".")[0]
-check(json.loads(files[0].read_text())["event_id"] == "$placeholder",
-      "the review is bound to the room message that announced it")
+check(withheld._EVENT.get(review_id) == "$placeholder" and "event_id" not in json.loads(files[0].read_text()),
+      "the review is bound to the room message that announced it, in memory, not on disk")
 
 
 def as_ctx(text, **kw):
@@ -239,8 +239,10 @@ reply = "the key is " + SAMPLES["GitHub token"] + "\n[file: report.pdf]"
 ops, body = run_turn(ctx(room_name="OpenClaw Setup", sender_name="cc"), reply, ops=asking)
 room_text = "\n".join(ops.edits + ops.messages) + body
 prompt, options, op_id, expires = asking.sync.asked[0]
-check(SAMPLES["GitHub token"] in prompt and "OpenClaw Setup" in prompt and "@cc:s.space" in prompt,
-      "the owner's private question shows the reply, the room and the collaborator")
+check(SAMPLES["GitHub token"] not in prompt and "[GitHub token]" in prompt and "the key is" in prompt
+      and "OpenClaw Setup" in prompt and "@cc:s.space" in prompt,
+      "the owner's private question shows the reply with secrets masked, the room and the collaborator")
+check(str(Path(workspace)) not in prompt, "and no local path")
 check(options == (("release", "Post it to the room"), ("discard", "Discard it"))
       and expires == withheld.TTL_S and op_id.startswith("wr_"),
       "with Post it / Discard, a 24-hour expiry, and the review id as the operation id")
@@ -280,6 +282,19 @@ before = len(asking.messages)
 asyncio.run(withheld.check_answers(asking))
 check(len(asking.messages) == before, "a copy changed on disk is never posted, even when released")
 
+# The agent cannot point a held review at a question the owner already released.
+for leftover in held_dir.glob("wr_*.json"):
+    leftover.unlink()
+ops, body = run_turn(ctx(), secret_reply, ops=asking)
+victim = next(held_dir.glob("wr_*.json"))
+record = json.loads(victim.read_text())
+record["question_id"] = "q1"  # an old question the owner released
+victim.write_text(json.dumps(record))
+before = len(asking.messages)
+asyncio.run(withheld.check_answers(asking))
+check(len(asking.messages) == before and victim.exists(),
+      "rewriting a review's question id on disk releases nothing")
+
 
 class NoDm(AskingOps):
     def __init__(self):
@@ -289,8 +304,9 @@ class NoDm(AskingOps):
 
 
 ops, body = run_turn(ctx(), secret_reply, ops=NoDm())
-check("`release`" in "\n".join(ops.edits) + body,
-      "with no private DM to ask in, the room message says how to release it instead")
+fallback = "\n".join(ops.edits) + body
+check("`release`" in fallback and str(Path(workspace)) not in fallback,
+      "with no private DM to ask in, the room message says how to release it, without the local path")
 for leftover in held_dir.glob("wr_*.json"):
     leftover.unlink()
 

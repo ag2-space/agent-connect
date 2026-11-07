@@ -63,6 +63,14 @@ def secret_types(text: str) -> Tuple[str, ...]:
     return tuple(name for name, pattern in PATTERNS if pattern.search(text))
 
 
+def mask(text: str) -> str:
+    """`text` with every known secret format replaced by its name in brackets."""
+    text = "".join(c for c in (text or "") if unicodedata.category(c) != "Cf")
+    for name, pattern in PATTERNS:
+        text = pattern.sub(f"[{name}]", text)
+    return text
+
+
 def guarded(ctx: TurnContext) -> bool:
     return ctx.access_tier != OWNER and ctx.collaborator
 
