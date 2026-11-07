@@ -50,3 +50,48 @@ honest onboarding promise.
 - The broker's `WORKER-PROTOCOL.md` remains the single normative description of the
   wire field; no mirrored ADR on the backend.
 - Cutover is atomic — the broker has always sent the field; no compatibility shim.
+
+## Amendment: listed Team collaborators under ACP
+
+The broker sends Team as `access_tier: guest` with `requested_access_tier: team` and
+`collaborator: true`. In a private room with no Agent Native card this is the default
+for every member, so the flag alone cannot mean "the owner chose this sender".
+
+The ACP adapter therefore admits a non-owner only when both hold:
+
+- the broker attested `requested_access_tier: team` and the exact boolean
+  `collaborator: true`; and
+- the sender's Matrix id is in the Worker's `AGENT_CONNECT_ACP_COLLABORATORS`.
+
+The list can only narrow what the room grants, never widen it, so the rule above
+(local settings lower, never raise) still holds. The list narrows **who** is admitted,
+not **what** they can do: once admitted, a sender has the agent's normal capabilities.
+agent-connect cannot confine an ACP agent, so a narrower tool policy for collaborators
+is the agent's to enforce. To let it, the Worker sends `_meta["ag2/requester"]` on
+`session/new` and every `session/prompt`: `user_id`, `access_tier`,
+`requested_access_tier`, `collaborator` and `admitted_as` (`owner` or `collaborator`),
+all from the broker's attestation and never from message text. Each collaborator gets
+a Session per (room, sender), so collaborators never share history with each other or
+with the owner. Separate history does not separate files, memory or credentials.
+A collaborator's reply is checked before the Ladder posts it (`agent_connect.result_guard`).
+The room's `sensitive_data_filter` flag cannot switch the check off: a room moderator, not
+only the owner, can write an agent's card. Only the owner can, on their machine, with
+`AGENT_CONNECT_UNCHECKED_COLLABORATORS`. The flag is still passed to the agent.
+A reply matching a known secret format, carrying a `[file:]`, or failing the scan is
+held. It is stored owner-only in the Worker's workspace (`agent_connect.withheld`), and
+the owner is asked privately, with AG2 Space's `room.question.ask` in their DM with the
+agent, whether to post it. When that DM cannot be used, the room message says how to act
+instead: reply `release` or `discard` to it, which only an owner-attested sender can do.
+The reply is posted only if the stored copy is unchanged (an HMAC keyed in the Worker
+process). An action the Permission Policy cannot allow is put to the owner the same way
+(Allow/Deny), for owner and collaborator Turns alike, replacing the Sutando HITL seam. A `[channel:]`
+redirect is held whatever the setting says. The detector matches known formats only, as sparrow's does, so it is a
+backstop, not containment. A collaborator's own Turn neither offers nor posts
+`_ag2/notify`. The agent may queue a notification and send it later on a listener or an
+owner's Turn, and the Worker cannot tell which Turn caused it. So while any collaborator is
+listed, every `_ag2/notify` goes through the same check and may only target a room with an
+owner Session; one that fails is withheld and logged. The agent's own tools are outside this: a listed sender can steer it into,
+for example, changing and running one of the owner's scheduled tasks, whose outcome is
+posted unchecked. Scoping such tools by requester belongs to the agent. Everyone else is refused as
+before. This matches sparrow's per-adapter `--allow-collaborator` opt-in, narrowed to
+named senders because the room default cannot be told apart from an owner's choice.

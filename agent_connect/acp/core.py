@@ -586,7 +586,8 @@ class AcpClient:
             self._connection.set_session_mode(session_id=session_id, mode_id=mode_id)
         )
 
-    async def prompt(self, session_id: str, prompt: Any) -> TurnResult:
+    async def prompt(self, session_id: str, prompt: Any,
+                     meta: Optional[dict] = None) -> TurnResult:
         """Run one Turn on a Session and wait for it to stop.
 
         `prompt` may be a string, one content block, or a list of them. Only one
@@ -598,7 +599,8 @@ class AcpClient:
         self._turn_updates = collected
         try:
             response = await self._guard(
-                self._connection.prompt(session_id=session_id, prompt=blocks)
+                self._connection.prompt(session_id=session_id, prompt=blocks,
+                                        **(meta or {}))
             )
         finally:
             self._turn_updates = None

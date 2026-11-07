@@ -12,7 +12,9 @@ ACP has no such thing. The Local Agent performs its own file access and the only
 lever left is answering its `session/request_permission` calls by policy — which
 binds an agent that asks and does nothing whatsoever to one that does not.
 Rather than ship a cooperative imitation of a guarantee that used to be real,
-a guest's Task is refused at the top of `turn` and never reaches ACP. It is
+a guest's Task is refused at the top of `turn` and never reaches ACP. The one
+exception is a sender the owner lists in `AGENT_CONNECT_ACP_COLLABORATORS`, and
+only where the broker attested Team with `collaborator: true`. It is
 refused **out loud**: the refusal is the Turn's answer, so it climbs the Ladder
 like any other and the room reads a sentence rather than watching a placeholder
 that never resolves. Silence is indistinguishable from breakage, and a guest who
@@ -20,9 +22,10 @@ cannot tell the two apart reports the wrong bug.
 
 That refusal is in exactly one place, deliberately: lifting it later (once there
 is real confinement around the bridge process) is a single change, and there is
-no second path into this Adapter that could forget it. It reads `ctx.access_tier`
-and nothing else — the tier the broker attested, settled by the Worker into
-`owner` or `guest` before the Turn was built (`docs/adr/0003`) and not something
+no second path into this Adapter that could forget it (`admitted`). It reads
+`ctx.access_tier`, `ctx.collaborator` and `ctx.user_id`, all as the broker
+attested them and settled by the Worker before the Turn was built
+(`docs/adr/0003`), and not something
 the sender can write: a duplicated `access_tier` header already fails closed.
 
 **Naming an agent is enough; a command is always allowed to win.** The ordinary
@@ -113,16 +116,21 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import os
+import sys
+import uuid
 import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from typing import AsyncIterator, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from .. import attachments as att
-from .. import hitl_seam
+from .. import questions as owner_questions
+from .. import result_guard
+from ..result_guard import asked_by
 from .. import outgoing
 from ..acp.core import (
     AcpAgentGone,
@@ -178,6 +186,8 @@ ALLOW_REMOTE_ENV = "AGENT_CONNECT_ACP_ALLOW_REMOTE"
 #: The directory to open Sessions in on the *dialled* Agent's machine.
 REMOTE_CWD_ENV = "AGENT_CONNECT_ACP_REMOTE_CWD"
 SKIP_AUTH_ENV = "AGENT_CONNECT_ACP_SKIP_AUTH_CHECK"
+#: Senders the owner lets use this agent where the room grants them Team.
+COLLABORATORS_ENV = "AGENT_CONNECT_ACP_COLLABORATORS"
 TIMEOUT_ENV = "AGENT_CONNECT_TURN_TIMEOUT"
 
 #: How long one Turn may run before it is cancelled through the protocol. Ten
@@ -323,12 +333,42 @@ REFUSAL = (
     "registered the agent.\n\n"
     "Nothing is wrong with your message. My owner can `trust` you, and then I "
     "will answer it — but that grants owner tier, which is their own level of "
-    "access on every agent they own, not a guest pass to this room.\n\n"
+    "access on every agent they own, not a guest pass to this room. Where this "
+    "room gives you Team access, my owner can instead allow you on this agent "
+    "alone.\n\n"
     "Where it has to be said: in a direct message to the concierge, "
     "`{concierge}`. Sent anywhere else, `trust @user` is not a command at all — "
     "in this room, or in a direct message to me, I read it as an ordinary "
     "question and answer it as one."
 )
+
+
+def allowed_collaborators(env: Optional[Mapping[str, str]] = None) -> frozenset:
+    """The Matrix ids in `AGENT_CONNECT_ACP_COLLABORATORS`, comma or space separated."""
+    env = os.environ if env is None else env
+    raw = (env.get(COLLABORATORS_ENV) or "").replace(",", " ")
+    for item in raw.split():
+        if not item.startswith("@") and item not in _REPORTED_ENTRIES:
+            _REPORTED_ENTRIES.add(item)
+            print(f"agent-connect: ignoring {COLLABORATORS_ENV} entry {item!r}: "
+                  f"not a Matrix id", file=sys.stderr)
+    return frozenset(item for item in raw.split() if item.startswith("@"))
+
+
+_REPORTED_ENTRIES: set = set()
+
+
+def admitted(ctx: TurnContext, env: Optional[Mapping[str, str]] = None) -> bool:
+    """Owner, or a listed sender the room granted Team with collaborator."""
+    if ctx.access_tier == OWNER:
+        return True
+    return ctx.collaborator and bool(ctx.user_id) and ctx.user_id in allowed_collaborators(env)
+
+
+def _logged(exc) -> str:
+    """Write an error to the Worker log and say so, for a room that must not see it."""
+    print(f"agent-connect: could not restore a collaborator's Session: {exc}", file=sys.stderr)
+    return "details are in the Worker log"
 
 
 def refusal(ctx: TurnContext) -> str:
@@ -563,14 +603,93 @@ DESTINATION_META_KEY = "ag2/destination"
 
 
 def destination_meta(ctx: TurnContext) -> dict:
-    """The `session/new` metadata for this Turn's room, or `{}` for a roomless Task."""
-    if not ctx.room:
+    """The `session/new` metadata for this Turn's room, or `{}` for a roomless Task.
+
+    A collaborator's Session gets none: `_ag2/notify` posts unchecked, and a
+    collaborator's words reach the room only through `result_guard`.
+    """
+    if not ctx.room or ctx.access_tier != OWNER:
         return {}
     return {
         DESTINATION_META_KEY: {
             "chat_id": ctx.room,
             "room_name": ctx.room_name,
             "access_tier": ctx.access_tier,
+        }
+    }
+
+
+#: The owner's two answers to an action the Policy cannot allow.
+APPROVAL_OPTIONS = (("allow", "Allow"), ("deny", "Deny"))
+#: Said in the room while the Turn waits for the owner.
+AWAITING_APPROVAL = ("🔐 agent-connect: waiting for the owner to approve an action. "
+                     "They have been asked privately.")
+
+
+def allow_option(request) -> str:
+    """The request's own allow option id, preferring once over always; "" if none."""
+    options = [o for o in (getattr(request, "options", None) or []) if isinstance(o, dict)]
+    for kind in ("allow_once", "allow_always"):
+        for option in options:
+            if option.get("kind") == kind:
+                return str(option.get("optionId") or option.get("option_id") or "")
+    return ""
+
+
+#: How much of the agent's raw input the question shows, split between its start and end.
+DETAILS_MAX = 1000
+
+
+def _details(raw) -> str:
+    """The agent's raw input, secrets masked, never cut silently."""
+    text = result_guard.mask(json.dumps(raw, default=str))
+    if len(text) <= DETAILS_MAX:
+        return text
+    half = DETAILS_MAX // 2
+    return f"{text[:half]} […{len(text) - 2 * half} characters cut…] {text[-half:]}"
+
+
+def approval_prompt(ctx: TurnContext, decision, request, requester: str) -> str:
+    """The private question. What agent-connect itself knows comes first; the agent's
+    own description is labelled as such, and its input is masked and never cut silently."""
+    tool = getattr(request, "tool_call", None)
+    tool = tool if isinstance(tool, dict) else {}
+    lines = ["The agent is asking to do something agent-connect cannot allow by itself.",
+             f"Kind of action: {tool.get('kind') or 'unknown'}",
+             f"Why it needs you: {decision.reason}"]
+    if decision.paths:
+        lines.append("Paths it touches: " + ", ".join(decision.paths))
+    raw = tool.get("rawInput")
+    if raw:
+        lines.append("Exact input: " + _details(raw))
+    lines.append("The agent's own description (it wrote this): "
+                 + result_guard.mask(" ".join(str(decision.title).split()))[:200])
+    lines.append(f"Room: {ctx.room_name or ctx.room}")
+    lines.append(f"Asked by {requester}, a collaborator, not you." if requester
+                 else "This is your own turn.")
+    lines.append("Allow it?")
+    return "\n".join(lines)
+
+
+#: Posted in place of an unsolicited message the collaborator check held.
+NOTIFY_WITHHELD = ("🔒 agent-connect: a message from the agent was withheld because it may "
+                   "contain sensitive data. The Worker log has the reason.")
+
+#: The `_meta` key on `session/new` and every `session/prompt` saying who asked.
+#: Set by the Worker from the broker's attestation, never from message text.
+REQUESTER_META_KEY = "ag2/requester"
+
+
+def requester_meta(ctx: TurnContext) -> dict:
+    """Who this Turn is for and why it was admitted (`admitted`)."""
+    return {
+        REQUESTER_META_KEY: {
+            "user_id": ctx.user_id,
+            "access_tier": ctx.access_tier,
+            "requested_access_tier": ctx.requested_access_tier,
+            "collaborator": ctx.collaborator,
+            "sensitive_data_filter": ctx.sensitive_data_filter,
+            "admitted_as": "owner" if ctx.access_tier == OWNER else "collaborator",
         }
     }
 
@@ -994,6 +1113,14 @@ class AcpAdapter:
         #: None drops such notifications, which is what a Worker without Room
         #: Ops can honestly do.
         self._notifier = None
+        #: Private questions to the owner; None refuses what the Policy cannot allow.
+        self._questions = None
+        #: Rooms an owner Turn ran in during this process (`owner_rooms`).
+        self._owner_rooms: set = set()
+
+    def set_questions(self, questions) -> None:
+        """Where an action the Policy cannot allow is put to the owner (`agent_connect.questions`)."""
+        self._questions = questions
 
     def set_notifier(self, post) -> None:
         """Where a message the ACP Agent sends unasked goes: `post(destination, text)`."""
@@ -1006,12 +1133,41 @@ class AcpAdapter:
         must not be handed what the agent queued for a Client that can post it."""
         return receiver_meta() if self._notifier is not None else None
 
+    async def _ignore_notification(self, notification) -> None:
+        """A collaborator's Turn: nothing the agent sends unasked is posted from it."""
+
+    def owner_rooms(self) -> set:
+        """Rooms this Worker has run an owner Turn in, from its Session map."""
+        try:
+            keys = self.store().keys()
+        except Exception:  # noqa: BLE001 — no readable map means no known rooms
+            keys = []
+        return {room for room, tier in keys if tier == OWNER} | self._owner_rooms
+
     async def _on_notification(self, notification) -> None:
-        if self._notifier is None:
-            return
         message = room_message(notification)
         if message is not None:
-            await self._notifier(*message)
+            await self.post_unasked(*message)
+
+    async def post_unasked(self, destination: str, text: str) -> None:
+        """Post what the agent said unasked, on a Turn's dial or the Listener Link.
+
+        While collaborators are listed, the Turn that caused it is unknowable, so
+        it is checked like a collaborator's reply and may only go to a room with an
+        owner Session. A held one is logged, and its room, if an owner room, is
+        told that something was withheld."""
+        if self._notifier is None:
+            return
+        if allowed_collaborators():
+            rooms = self.owner_rooms()
+            held = result_guard.notify_verdict(text, destination, rooms)
+            if held.hold:
+                print(f"agent-connect: withheld a notification to {destination}: "
+                      f"it contained {', '.join(held.why)}", file=sys.stderr)
+                if destination in rooms:
+                    await self._notifier(destination, NOTIFY_WITHHELD)
+                return
+        await self._notifier(destination, text)
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<AcpAdapter {self._url or self._command or 'from ' + COMMAND_ENV}>"
@@ -1184,9 +1340,11 @@ class AcpAdapter:
     async def turn(self, ctx: TurnContext) -> AsyncIterator[TurnEvent]:
         """One Turn: refuse, or run it over ACP and report what happened."""
         # --- the whole non-owner restriction, in one place -----------------
-        if ctx.access_tier != OWNER:
+        if not admitted(ctx):
             yield Done(reason=REFUSED, text=refusal(ctx))
             return
+        if ctx.access_tier == OWNER and ctx.room:
+            self._owner_rooms.add(ctx.room)
 
         try:
             endpoint = self.endpoint()
@@ -1247,34 +1405,44 @@ class AcpAdapter:
                 # story is that the turn ran out of time.
                 return None
             decision = policy.decide(request)
-            hitl_ws = hitl_seam.configured()
-            if decision.allowed or hitl_ws is None:
+            requester = asked_by(ctx)
+            who = {"asked_by": requester} if requester else {}
+            allow = allow_option(request)
+            if decision.allowed or self._questions is None or not allow:
                 queue.put_nowait(
                     PermissionAsked(
                         title=decision.title,
                         allowed=decision.allowed,
                         reason=decision.reason,
-                        detail={"paths": list(decision.paths)},
+                        detail={"paths": list(decision.paths), **who},
                     )
                 )
                 return decision.option_id
 
             async def ask_the_human():
-                # The Policy could not allow it; the owner decides from a chat
-                # card. The core awaits this coroutine; a timeout is the reject.
-                chosen = await hitl_seam.escalate(
-                    request, session=key, workspace=hitl_ws, timeout=hitl_seam.timeout_s()
-                )
-                allowed = chosen is not None and chosen != decision.option_id
+                # The Policy could not allow it: the owner is asked privately,
+                # in their DM with the agent. Unasked, a timeout or "deny" is
+                # the reject; only the owner's "allow" lets it through.
+                questions = self._questions
+                question = await questions.ask(
+                    approval_prompt(ctx, decision, request, requester),
+                    APPROVAL_OPTIONS, expires_in_s=int(owner_questions.timeout_s()) + 60,
+                    operation_id=f"approval-{uuid.uuid4().hex}")
+                chosen = ""
+                if question:
+                    queue.put_nowait(Notice(text=AWAITING_APPROVAL))
+                    chosen = await questions.wait(question, owner_questions.timeout_s())
+                allowed = chosen == "allow"
                 queue.put_nowait(
                     PermissionAsked(
                         title=decision.title,
                         allowed=allowed,
-                        reason="owner allowed via card" if allowed else f"{decision.reason}; owner did not allow",
-                        detail={"paths": list(decision.paths), "hitl": True},
+                        reason=("owner allowed" if allowed
+                                else f"{decision.reason}; owner did not allow"),
+                        detail={"paths": list(decision.paths), "asked_owner": bool(question), **who},
                     )
                 )
-                return chosen if chosen is not None else decision.option_id
+                return allow if allowed else decision.option_id
 
             return ask_the_human()
 
@@ -1295,9 +1463,13 @@ class AcpAdapter:
                 cwd=cwd,
                 on_update=on_update,
                 permission_handler=on_permission,
-                on_notification=self._on_notification,
+                # Only an owner's Turn may carry `_ag2/notify`: it posts
+                # unchecked, to any destination the agent names.
+                on_notification=(self._on_notification if ctx.access_tier == OWNER
+                                 else self._ignore_notification),
             ) as client:
-                agent = await client.initialize(meta=self._receiver_meta())
+                agent = await client.initialize(
+                    meta=self._receiver_meta() if ctx.access_tier == OWNER else None)
                 live.client = client
                 # Muted from before the Session is touched until the prompt is
                 # sent. Not merely "during `load_session`": the boundary that
@@ -1319,11 +1491,13 @@ class AcpAdapter:
                         except SessionResumeRefused as exc:
                             queue.put_nowait(
                                 Notice(text=RESET.format(
-                                    why=WHY_REFUSED.format(detail=exc)))
+                                    why=WHY_REFUSED.format(
+                                        detail=exc if ctx.access_tier == OWNER
+                                        else _logged(exc))))
                             )
                     if not session_id:
                         session_id = await client.new_session(
-                            cwd=session_cwd, meta=destination_meta(ctx)
+                            cwd=session_cwd, meta={**destination_meta(ctx), **requester_meta(ctx)}
                         )
                         turns = 0
                     mode = self.mode()
@@ -1352,7 +1526,7 @@ class AcpAdapter:
                 blocks, problems = prompt_blocks(ctx, agent, att.max_bytes())
                 if problems:
                     queue.put_nowait(Notice(text=unread_notice(problems, agent)))
-                return await client.prompt(session_id, blocks)
+                return await client.prompt(session_id, blocks, meta=requester_meta(ctx))
 
         seconds = self.timeout()
         work = asyncio.ensure_future(run())

@@ -58,10 +58,12 @@ class RoomOps:
     every answer the timeout.
     """
 
-    def __init__(self, ops):
+    def __init__(self, ops, questions=None):
         #: The library's. Everything about the wire — the URL, the bearer, the
         #: User-Agent, the retries, the cooldown — is on the other side of it.
         self.ops = ops
+        #: Private questions to the owner (`agent_connect.questions`), or None.
+        self.questions = questions
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<RoomOps {self.ops!r}>"
@@ -95,6 +97,10 @@ class RoomOps:
         if not await in_daemon_thread(self.ops.edit, room, event_id, body):
             raise RoomOpError("the relay did not edit the message")
 
+    async def upload(self, room: str, path: str, base_dir: Optional[str] = None):
+        """Send an allowlisted file to the room; the library's `UploadResult`."""
+        return await in_daemon_thread(self.ops.upload, room, path, None, base_dir)
+
 
 def room_ops_for(client) -> Optional[RoomOps]:
     """The Ladder's Room Ops, taken off the Relay Client the Worker built.
@@ -109,5 +115,7 @@ def room_ops_for(client) -> Optional[RoomOps]:
     and then the answer travels whole in the Task's result, as it did before the
     Ladder existed.
     """
+    from .questions import questions_for
+
     ops = getattr(client, "room_ops", None)
-    return RoomOps(ops) if ops is not None else None
+    return RoomOps(ops, questions_for(client)) if ops is not None else None

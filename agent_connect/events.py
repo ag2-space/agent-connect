@@ -120,12 +120,17 @@ class TurnContext:
     room: str = ""
     room_name: str = ""
     access_tier: str = "guest"
+    #: The broker's `requested_access_tier` and exact `collaborator`, verbatim.
+    requested_access_tier: str = ""
+    collaborator: bool = False
+    sensitive_data_filter: bool = True
     sender_name: str = ""
     user_id: str = ""
     source_message_id: str = ""
     addressed_to: str = ""
     reply_to_me: bool = False
     reply_to_sender: str = ""
+    reply_to_event: str = ""
     room_members: Tuple[str, ...] = ()
     room_member_count: int = 0
     sandbox: str = "read-only"
@@ -139,9 +144,14 @@ class TurnContext:
         Never the room alone — a Session carries a permission mode, and a Tier
         must not inherit another Tier's. A Task the relay wrote without a room
         identifier gets a key of its own rather than sharing one with every
-        other roomless Task, which would serialise unrelated work.
+        other roomless Task, which would serialise unrelated work. A
+        non-owner collaborator gets a Session of their own per room, so two
+        collaborators never share history.
         """
-        return (self.room or f"task:{self.task_id}", self.access_tier)
+        room = self.room or f"task:{self.task_id}"
+        if self.access_tier != "owner" and self.collaborator and self.user_id:
+            return (room, f"collaborator:{self.user_id}")
+        return (room, self.access_tier)
 
 
 @dataclass(frozen=True)

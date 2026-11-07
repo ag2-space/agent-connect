@@ -91,7 +91,7 @@ so a fake that was told to die mid-Turn still reports what it saw. Shape:
       "sessions":    [ {"method": "session/new"|"session/load",
                         "cwd": ..., "sessionId": ..., "params": <raw>} ],
       "modes":       [ {"sessionId": ..., "modeId": ...} ],
-      "prompts":     [ {"sessionId": ..., "prompt": [<content blocks>]} ],
+      "prompts":     [ {"sessionId": ..., "prompt": [<content blocks>], "_meta": ...} ],
       "permissions": [ {"sessionId": ..., "options": [...],
                         "answer": <the Client's RequestPermissionResponse>} ],
       "cancelled":   [ <sessionId>, ... ],
@@ -350,7 +350,8 @@ class FakeAcpAgent:
             )
         self._cancel_event(session_id).clear()
         self.report["prompts"].append(
-            {"sessionId": session_id, "prompt": params.get("prompt")}
+            {"sessionId": session_id, "prompt": params.get("prompt"),
+             "_meta": params.get("_meta")}
         )
         self._flush_report()
         turn = (

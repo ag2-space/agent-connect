@@ -64,6 +64,8 @@ USER_AGENT = "sutando-gateway-client/1.0"
 #: to its `wait` — a socket timeout below the long-poll window would turn every
 #: idle poll into an error.
 DEFAULT_TIMEOUT_S = 20.0
+#: Largest JSON answer `request_url` reads; the MCP side has no streaming need.
+_JSON_CAP = 1 << 20
 
 
 class RelayHTTPError(Exception):
@@ -264,6 +266,55 @@ class RelayHTTP:
                 status, raw, url,
                 f"answer from {redact_url(url)} was not JSON: {raw[:200]}"
             ) from None
+
+    def request_url(
+        self,
+        method: str,
+        url: str,
+        bearer: str,
+        payload: Optional[Mapping[str, Any]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """One JSON request to an absolute URL, carrying exactly `bearer`.
+
+        For the MCP side (`ag2_relay_client.questions`): the mint and the MCP
+        endpoint are named by discovery, and the MCP endpoint takes a different
+        token. The relay bearer is never added here; a caller that sends it
+        passes it, after checking the URL. No redirect is followed. Errors as
+        `request`.
+        """
+        data = json.dumps(payload).encode() if payload is not None else (
+            b"" if method.upper() == "POST" else None)
+        request = urllib.request.Request(url, data=data, method=method.upper())
+        request.add_header("User-Agent", self.user_agent)
+        request.add_header("Accept", "application/json")
+        if payload is not None:
+            request.add_header("Content-Type", "application/json")
+        if bearer:
+            request.add_header("Authorization", f"Bearer {bearer}")
+        for name, value in (headers or {}).items():
+            request.add_header(name, value)
+        try:
+            deadline = self.timeout if timeout is None else timeout
+            with self._opener.open(request, timeout=deadline) as response:
+                status = getattr(response, "status", 200)
+                raw = (response.read(_JSON_CAP + 1) or b"")
+        except urllib.error.HTTPError as exc:
+            body = _drain(exc)
+            if exc.code in (401, 403):
+                raise AuthRejected(exc.code, body, url) from None
+            raise RelayHTTPError(exc.code, body, url) from None
+        if len(raw) > _JSON_CAP:
+            raise ResponseTooLarge(_JSON_CAP)
+        text = raw.decode("utf-8", "replace").strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise RelayHTTPError(status, text[:200], url,
+                                 f"answer from {redact_url(url)} was not JSON") from None
 
     def fetch(self, url: str, cap: int, timeout: Optional[float] = None) -> Fetched:
         """GET an absolute URL for its bytes, deciding for itself about the bearer.

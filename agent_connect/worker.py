@@ -60,6 +60,7 @@ from typing import List, Optional, Tuple
 from ag2_relay_client.status import DISPLACED, FATAL
 
 from . import attachments as att
+from . import withheld
 from . import relay as relay_client
 from .adapters import get as get_adapter
 from .config import CONFIG_ENV, DEFAULT_PATH, ConfigError
@@ -148,11 +149,21 @@ def attested_tier(raw: str) -> str:
     may guess at, and that is not a hypothetical: sutando writes
     `access_tier: team` on a task from a negotiated collaborator, and it arrives
     here. It is read as `guest`, like everything else that is not `owner` —
-    read-only under codex and refused under ACP. The demotion is deliberate and
+    read-only under codex and refused under ACP unless the owner lists the
+    sender (`attested_collaborator`, `AGENT_CONNECT_ACP_COLLABORATORS`). The demotion is deliberate and
     recorded in `docs/adr/0003`; a tier this side cannot verify is a tier this
     side does not get to interpret.
     """
     return OWNER if (raw or "").strip() == OWNER else GUEST
+
+
+def attested_collaborator(task) -> bool:
+    """Team with the exact boolean `collaborator: true`, as the broker sent it."""
+    return requested_tier(task) == "team" and getattr(task, "collaborator", False) is True
+
+
+def requested_tier(task) -> str:
+    return (getattr(task, "requested_access_tier", "") or "").strip()
 
 
 def task_attachments(task) -> Tuple[Attachment, ...]:
@@ -197,7 +208,7 @@ def turn_context(task, repo: str) -> TurnContext:
     """Build the context one Turn travels with, from a delivered Task.
 
     The Access Tier is settled here, and everything downstream — the Sandbox,
-    the Session key, the ACP Adapter's owner-only check — reads the settled
+    the Session key, the ACP Adapter's admission check — reads the settled
     value rather than the attestation. It comes from `access_tier` as the broker
     attested it and from nothing else the sender can write; `attested_tier` then
     reduces it to the two values that cross the wire, so no consumer has to
@@ -233,12 +244,16 @@ def turn_context(task, repo: str) -> TurnContext:
         room=task.room_id,
         room_name=task.room_name,
         access_tier=tier,
+        requested_access_tier=requested_tier(task),
+        collaborator=attested_collaborator(task),
+        sensitive_data_filter=getattr(task, "sensitive_data_filter", True) is not False,
         sender_name=task.sender_name,
         user_id=task.user_id,
         source_message_id=task.source_message_id,
         addressed_to=task.addressed_to,
         reply_to_me=task.reply_to_me,
         reply_to_sender=task.reply_to_sender,
+        reply_to_event=getattr(task, "reply_to_event", "") or "",
         room_members=task.room_members,
         room_member_count=task.room_member_count,
         sandbox=tier_to_sandbox(tier),
@@ -320,6 +335,11 @@ async def process_one(
     ctx = turn_context(task, repo)
     if not ctx.prompt:
         return ""
+    # The owner releasing or discarding a held collaborator reply. It never
+    # reaches the agent; the answer is the released reply or a short note.
+    decision = withheld.decide(ctx)
+    if decision is not None:
+        return decision.body
     reporter = TurnReporter(ops, settings)
 
     async def announce(turn) -> None:
@@ -497,6 +517,8 @@ def start_listener_link(adapter, ops) -> Optional[asyncio.Task]:
             print(f"agent-connect: could not post to {destination}: {exc}", file=sys.stderr)
 
     adapter.set_notifier(post)
+    if hasattr(adapter, "set_questions"):
+        adapter.set_questions(getattr(ops, "questions", None))
     try:
         endpoint = adapter.endpoint()
     except Exception:  # noqa: BLE001 — a misconfigured endpoint is the Turn's to report
@@ -505,8 +527,10 @@ def start_listener_link(adapter, ops) -> Optional[asyncio.Task]:
         return None
     from .link import keep_link
 
+    # The adapter's own entry point, so the link gets the same collaborator check.
+    gated = getattr(adapter, "post_unasked", post)
     return asyncio.ensure_future(
-        keep_link(endpoint.url, post, token=endpoint.token,
+        keep_link(endpoint.url, gated, token=endpoint.token,
                   cookie_store=getattr(adapter, "_cookies", None))
     )
 
@@ -624,7 +648,9 @@ async def serve(
     # What the agent says unasked (a scheduled task's outcome) is posted to the room
     # it names, through the same Room Ops as everything else; a dialled Agent gets a
     # standing link so that can arrive between Turns too.
+    withheld.sweep()  # reviews a previous Worker held cannot be verified
     link = start_listener_link(adapter, ops)
+    watcher = asyncio.ensure_future(withheld.watch(ops)) if ops is not None else None
     try:
         while True:
             task = await inbound.get()
@@ -647,6 +673,8 @@ async def serve(
         stop.set()
         if link is not None:
             link.cancel()
+        if watcher is not None:
+            watcher.cancel()
         if heartbeat is not None:
             heartbeat.cancel()
 

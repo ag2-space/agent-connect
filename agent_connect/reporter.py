@@ -87,6 +87,7 @@ from .events import (
     TurnContext,
     final_text,
 )
+from . import result_guard, withheld
 from .outgoing import named_files
 from .roomops import RoomOpError
 
@@ -144,6 +145,10 @@ STOP_LINES = {
 #: failure — nothing went wrong, so no broker notice is coming, and the room
 #: would otherwise be left watching the placeholder for ever.
 SILENT = "✅ agent-connect: the agent finished without an answer to give."
+#: A notice on a collaborator's Turn that the guard would have held.
+NOTICE_WITHHELD = "🔒 agent-connect: a notice about this turn was withheld because it may contain sensitive data."
+#: A collaborator's reply that cannot be released: a redirect, or one that could not be stored.
+WITHHELD = "🔒 agent-connect: this reply was withheld and cannot be released."
 
 DEFAULT_THROTTLE = 3.0
 DEFAULT_CEILING = 4000
@@ -293,6 +298,7 @@ class TurnReporter:
 
     async def run(self, adapter, ctx: TurnContext) -> str:
         """One whole Turn: placeholder, live edits, answer, result body."""
+        self._ctx = ctx
         await self.start(ctx)
         chunks: List[str] = []
         done: Optional[Done] = None
@@ -303,11 +309,22 @@ class TurnReporter:
                 done = event
             else:
                 await self.on_event(event)
-        return await self.finish(
-            final_text(done, chunks),
-            done.note if done else "",
-            done.reason if done else COMPLETED,
-        )
+        answer = final_text(done, chunks)
+        note = done.note if done else ""
+        reason = done.reason if done else COMPLETED
+        held = result_guard.verdict(ctx, f"{answer}\n{note}")
+        if held.hold:
+            review = None
+            if "a redirect to another room" not in held.why:
+                review = withheld.hold(ctx.room, answer, held.why, cwd=ctx.cwd)
+            if review is None:
+                return await self.finish(WITHHELD, "", reason)
+            asked = await self._ask_owner(ctx, review, answer, held.why)
+            body = await self.finish(withheld.review_message(review, held.why, asked), "", reason)
+            if self.event_id:
+                withheld.bind_event(review, self.event_id)
+            return body
+        return await self.finish(answer, note, reason)
 
     async def on_event(self, event) -> None:
         """Count outcomes and signal generic activity without exposing tool metadata.
@@ -421,6 +438,19 @@ class TurnReporter:
 
     # -- internals ----------------------------------------------------------
 
+    async def _ask_owner(self, ctx: TurnContext, review: str, answer: str, why) -> bool:
+        """Ask the owner privately whether to post a held reply; False if it can't be asked."""
+        questions = getattr(self.ops, "questions", None)
+        if questions is None:
+            return False
+        prompt = withheld.owner_prompt(review, answer, why, result_guard.asked_by(ctx),
+                                       ctx.room_name or ctx.room)
+        question = await questions.ask(prompt, withheld.OPTIONS, expires_in_s=withheld.TTL_S,
+                                       operation_id=review)
+        if question:
+            withheld.bind_question(review, question)
+        return bool(question)
+
     async def notice(self, text: str, keep: bool = True) -> bool:
         """Tell the room something about the run, as its own message.
 
@@ -443,6 +473,10 @@ class TurnReporter:
         text = (text or "").strip()
         if not text:
             return False
+        ctx = getattr(self, "_ctx", None)
+        if ctx is not None and result_guard.verdict(ctx, text).hold:
+            # A notice can carry the agent's own words (a refused resume, say).
+            text = NOTICE_WITHHELD
         if self.ops is not None and self._room and getattr(self.ops, "available", True):
             try:
                 # Stamped for whoever it names: an announcement that hands a

@@ -326,6 +326,28 @@ the cooldown: the reply goes through `/v1/results`, whose render path chunks it.
 And this client never reacts to a message it was served — the broker places the
 intake reaction, and a second one is the room seeing double.
 
+## Owner questions
+
+A private multiple-choice question to this agent's owner, and its answer:
+
+```python
+q = client.questions
+qid = q.ask("Post this reply?", [("release", "Post it"), ("discard", "Discard")],
+            expires_in_s=86400, operation_id="wr_1")   # None if it cannot be asked privately
+answer = q.inspect(qid)   # Answer(status, option, revision); status pending|answered|expired|cancelled|held
+```
+
+AG2 Space questions are room-visible, so a question is asked only in the owner's
+DM with the agent (`owner_dm_room` from `/v1/agents`), and only after its members
+are checked to be the agent and the owner alone. It is targeted at the owner, who
+alone may answer, with no free text. The Actions (`room.question.ask`,
+`room.question.inspect`) are core Actions, reached as sparrow reaches them:
+`GET /v1/mcp/discovery`, then the relay bearer is exchanged at the relay's own
+`/api/v1/mcp/agent-access-tokens` for a short-lived MCP access token, then one
+`tools/call` on the discovered MCP endpoint. The relay bearer goes only to the
+relay's origin; the access token is cached until a minute before it expires, and
+a `429` from the mint pauses minting for 60 s. Every failure answers `None`.
+
 ## Sending a file
 
 Egress is **paths only**, and the roots are fixed when the client is built:
