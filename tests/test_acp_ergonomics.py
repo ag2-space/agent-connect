@@ -292,7 +292,7 @@ check(started, "and starts normally when the Local Agent is logged in")
 async def one_turn(adapter, prompt="hello"):
     ctx = TurnContext(prompt=prompt, task_id="t1", room="!r", access_tier="owner",
                       cwd=os.getcwd())
-    return await worker.run_turn(adapter, ctx)
+    return (await worker.run_turn(adapter, ctx)).body
 
 
 with Env(**{AGENT_ENV: "claude", COMMAND_ENV: None}):

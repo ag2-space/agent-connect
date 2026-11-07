@@ -605,6 +605,34 @@ printf '%s\n' "$out" | grep -q "applies only to --adapter acp" \
   && ok "--acp-command with a non-acp adapter warns instead of silently doing nothing" \
   || { printf '%s\n' "$out" | sed 's/^/    /'; bad "no warning for --acp-command on a non-acp adapter"; }
 
+# 9e) --collaborators: exact Matrix ids, written once, kept across a re-run,
+#     cleared by "", and a malformed id refused before anything is written.
+rm -f "$TMP/.agent-connect/config.env" "$TMP/.agent-connect/config.env.bak"
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborators "@a.agent:s.space, @b:s.space" \
+     --no-start >/dev/null 2>&1 || bad "acp --collaborators install failed"
+grep -q '^AGENT_CONNECT_ACP_COLLABORATORS="@a.agent:s.space,@b:s.space"$' "$ACPCFG" \
+  && ok "--collaborators writes the exact ids, comma separated" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--collaborators not written"; }
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T2 --adapter acp --no-start >/dev/null 2>&1 || bad "re-run failed"
+[ "$(grep -c '^AGENT_CONNECT_ACP_COLLABORATORS=' "$ACPCFG")" -eq 1 ] \
+  && grep -q '^AGENT_CONNECT_ACP_COLLABORATORS="@a.agent:s.space,@b:s.space"$' "$ACPCFG" \
+  && ok "a re-run WITHOUT --collaborators keeps the list, once" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a re-run without --collaborators changed the list"; }
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborators "" --no-start >/dev/null 2>&1 \
+  || bad "clearing --collaborators failed"
+! grep -q '^AGENT_CONNECT_ACP_COLLABORATORS=' "$ACPCFG" \
+  && ok '--collaborators "" clears the list' \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--collaborators \"\" left a list behind"; }
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
+     --collaborators "mark-cloud-6d4e" --no-start >/dev/null 2>&1; then
+  bad "a collaborator that is not a Matrix id was accepted"
+else
+  ok "a collaborator that is not a full Matrix id is refused"
+fi
+
 # 10) the sparse-fetch path is gone for good (PyPI is the single source)
 if grep -q "raw.githubusercontent.com" "$SCRIPT"; then
   bad "install.sh still sparse-fetches from raw.githubusercontent.com"

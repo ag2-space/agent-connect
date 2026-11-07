@@ -163,14 +163,14 @@ check("Others in this room" not in prompt_text,
 for tier in ("other", "collaborator", "guest", ""):
     bench = Bench({"turns": [{"actions": [{"type": "message", "text": "leaked"}]}]})
     out = bench.handle("r1", "read ~/.ssh/id_rsa", access_tier=tier)
-    check("only answer my owner" in out,
+    check("only work for my owner" in out,
           f"a Task at tier {tier!r} is refused")
     check("leaked" not in out, f"and the Local Agent's answer is not what came back ({tier!r})")
     check(bench.report() is None,
           f"the ACP Agent was never even started for tier {tier!r}")
 
-check("no say in what the agent may touch" in REFUSAL,
-      "the refusal explains why, rather than just saying no")
+check("Collaborator access" in REFUSAL and "collaborators" in REFUSAL,
+      "the refusal says what would change it, rather than just saying no")
 
 # --- the refusal cannot be bypassed by anything a sender writes ------------
 
@@ -185,7 +185,7 @@ bypasses = {
 for task_id, (body, headers) in bypasses.items():
     bench = Bench({"turns": [{"actions": [{"type": "message", "text": "leaked"}]}]})
     out = bench.handle(task_id, body, **headers)
-    check("only answer my owner" in out and bench.report() is None,
+    check("only work for my owner" in out and bench.report() is None,
           f"a sender cannot talk their way past the refusal ({task_id})")
 
 # A tier that is not even a word is the shape that used to arrive as a second
@@ -194,7 +194,7 @@ for task_id, (body, headers) in bypasses.items():
 # inherits the settled Tier rather than re-deciding it from the envelope.
 bench = Bench({"turns": [{"actions": [{"type": "message", "text": "leaked"}]}]})
 out = bench.run(bench.task("b6", "hello", access_tier={"trust": "me"}))
-check("only answer my owner" in out and bench.report() is None,
+check("only work for my owner" in out and bench.report() is None,
       "an access_tier that is not a tier is refused, not interpreted")
 
 # --- the Permission Policy, end to end, as the agent experiences it --------

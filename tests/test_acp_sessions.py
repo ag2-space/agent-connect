@@ -33,7 +33,6 @@ from pathlib import Path
 try:
     from agent_connect.adapters.acp import AcpAdapter
     from agent_connect.events import TurnContext
-    from agent_connect.reporter import PLACEHOLDER, REPLIED, LadderSettings
     from agent_connect.sessions import (
         SessionRecord,
         SessionSettings,
@@ -41,7 +40,7 @@ try:
         store_path,
         workspace_dir,
     )
-    from _taskqueue import room_ops_at
+    from _taskqueue import FakeClient, room_ops_at
     from _taskqueue import task as queued_task
     from agent_connect.worker import handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
@@ -139,6 +138,7 @@ class Bench:
         self.store_path = self.base / "sessions.json"
         self.settings = settings or SessionSettings()
         self.set_script(script or ANSWERS)
+        self.client = FakeClient()
         self.restart()
 
     def set_script(self, script: dict) -> None:
@@ -159,7 +159,7 @@ class Bench:
         try:
             return asyncio.run(asyncio.wait_for(
                 handle_one(task, self.adapter, str(cwd or self.repo),
-                           None, ops, LadderSettings(throttle=0.0)),
+                           None, ops, client=self.client),
                 timeout=30,
             ))
         finally:
@@ -242,7 +242,7 @@ check(store.get((ROOM_A, "owner")).session_id == "owner-session",
 
 before = bench.sessions()
 out = bench.handle("t1", "read the owner's context", room=ROOM_A, tier="other")
-check("only answer my owner" in out, "a non-owner Task in that room is refused")
+check("only work for my owner" in out, "a non-owner Task in that room is refused")
 check(bench.report("t1") is None,
       "the ACP Agent is never started for it, so no Session of any kind is opened")
 check(bench.sessions() == before,
@@ -278,11 +278,9 @@ bench.set_script({"sessionPrefix": "replay", "loadSessionReplay": REPLAY, **ANSW
 relay = FakeRelay()
 out = bench.handle("r2", "carry on", ops=relay.ops_client)
 check(bench.opened("r2") == ["session/load"], "the Session was resumed (so there WAS a replay)")
-check(len(relay.ops) == 2,
-      "and the room received exactly two ops — the placeholder and the answer — "
+check(not relay.ops,
+      "and the Worker posted nothing into the room "
       f"despite {len(REPLAY)} replayed updates (got {len(relay.ops)})")
-check([o["op"] for o in relay.ops] == ["message", "edit"],
-      "one message and one edit: no progress edit was driven by replayed history")
 check(not relay.of("react"), "and no reaction, here as anywhere")
 check("OLD-TRANSCRIPT-LINE" not in relay.bodies()
       and "OLD-TOOL-0" not in relay.bodies()
@@ -290,8 +288,8 @@ check("OLD-TRANSCRIPT-LINE" not in relay.bodies()
       "not one word of the old transcript reached the room")
 check("OLD-TRANSCRIPT-LINE" not in out and "OLD-TOOL-0" not in out,
       "nor the result — replayed history is not this Turn's answer either")
-check("answered" in relay.ops[-1]["body"] and out.startswith(REPLIED),
-      "while the live answer arrives exactly as it would have")
+check("answered" in out and bench.client.answer("r2") == out,
+      "while the live answer is completed exactly as it would have been")
 relay.stop()
 
 # The control: the same events, live, are anything but silent. Without it the
@@ -303,10 +301,10 @@ bench.set_script({"sessionPrefix": "replay",
                       for i in range(6)] + [{"type": "message", "text": "answered"}],
                       "stopReason": "end_turn"}})
 relay = FakeRelay()
-bench.handle("r3", "do live work", ops=relay.ops_client)
-check(len(relay.ops) > 2 and "Working…" in relay.bodies() and "LIVE-TOOL-" not in relay.bodies(),
-      "the same activity happening live DOES reach the room — suppression is "
-      "the resumption's, not a Ladder that never worked")
+live = bench.handle("r3", "do live work", ops=relay.ops_client)
+check("answered" in live and not relay.ops and "LIVE-TOOL-" not in live,
+      "the same activity live posts nothing either, and its answer is completed "
+      "without tool titles — the answer path works, so the silence above is real")
 relay.stop()
 
 
@@ -322,14 +320,15 @@ out = bench.handle("f2", "carry on", ops=relay.ops_client)
 check(bench.opened("f2") == ["session/load", "session/new"],
       "a refused resumption opens a fresh Session instead of failing the request")
 check("answered" in out, "and the person gets their answer")
-check(len(relay.of("message")) == 2, "the room is told, in a message of its own")
-notice = relay.of("message")[1]["body"]
+check(len(relay.of("message")) == 1, "the room is told, in a message of its own")
+notice = relay.of("message")[0]["body"] if relay.of("message") else ""
 check("fresh conversation" in notice and "no longer have the earlier context" in notice,
       "which says the context was reset, in plain words")
 check("session expired" in notice,
       "and carries what the agent said, so an operator can tell why")
-check(PLACEHOLDER not in relay.ops[-1]["body"] and "answered" in relay.ops[-1]["body"],
-      "the placeholder was still edited into the answer, not into the announcement")
+check("fresh conversation" not in out and bench.client.answer("f2") == out
+      and not relay.of("edit"),
+      "and the answer is completed on its own, separate from the announcement")
 check(bench.sessions()[0]["session_id"] == "refuse-1"
       and bench.sessions()[0]["turns"] == 1,
       "and the map now holds the fresh Session, one Turn old")
@@ -345,7 +344,7 @@ check("session/load" not in bench.report("g2")["methods"],
       "an agent that never advertised resumption is not asked to resume")
 check(bench.opened("g2") == ["session/new"] and "answered" in out,
       "the Task is answered from a fresh Session all the same")
-check("fresh conversation" in relay.of("message")[1]["body"],
+check("fresh conversation" in relay.of("message")[0]["body"],
       "and the room is told, by the same route")
 relay.stop()
 
@@ -360,8 +359,8 @@ check(bench.opened("h2") == ["session/new"],
       "a Session past its Turn budget is retired, not resumed")
 check("session/load" not in bench.report("h2")["methods"],
       "and the retired one is not even asked — the budget is the Worker's to keep")
-check(len(relay.of("message")) == 2, "retirement is announced in the room")
-check("budget of 1 turns" in relay.of("message")[1]["body"],
+check(len(relay.of("message")) == 1, "retirement is announced in the room, as its own message")
+check("budget of 1 turns" in relay.of("message")[0]["body"],
       "naming the budget it reached, so it is predictable rather than mysterious")
 relay.stop()
 
@@ -370,7 +369,7 @@ bench.handle("i1", "one")
 relay = FakeRelay()
 bench.handle("i2", "two", ops=relay.ops_client)
 check(bench.opened("i2") == ["session/new"], "an idle Session is retired too")
-check("idle for" in relay.of("message")[1]["body"],
+check("idle for" in relay.of("message")[0]["body"],
       "and the room is told it was idleness that ended it")
 relay.stop()
 
@@ -390,7 +389,7 @@ check(bench.opened("k1") == bench.opened("k2") == ["session/new"],
       "with memory off every Task opens its own Session, as before Sessions existed")
 check(not bench.store_path.exists(),
       "and nothing is written to disk — the setting is a real off switch")
-check(len(relay.of("message")) == 1,
+check(not relay.of("message"),
       "with nothing to announce: a Worker that never remembers is not forgetting")
 relay.stop()
 
@@ -407,7 +406,7 @@ check(bench.opened("m2") == ["session/new"],
       "a Task from a differently-configured Worker gets a new Session, not a wrong one")
 check(bench.report("m2")["sessions"][0]["cwd"] == str(elsewhere),
       "opened in the directory this Task actually runs in")
-check("working directory changed" in relay.of("message")[1]["body"],
+check("working directory changed" in relay.of("message")[0]["body"],
       "and the room is told why it started over")
 relay.stop()
 

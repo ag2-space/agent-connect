@@ -135,6 +135,10 @@ class FakeClient:
         self.completed: list = []
         #: `(id, error_code)` in the order the Worker rejected them.
         self.rejected: list = []
+        #: `(id, outcome)` for Tasks completed with no reply.
+        self.no_actions: list = []
+        #: `(id, diagnostics)` for Tasks completed as failed.
+        self.failed: list = []
         #: `(id, base_dir)` — what a relative attachment path is read against.
         self.base_dirs: list = []
         #: Whatever `on_status` was given, so a test can drive the hook itself.
@@ -169,7 +173,8 @@ class FakeClient:
     @property
     def answered(self) -> set:
         """Every id that left the Worker, however it left."""
-        return {i for i, _ in self.completed} | {i for i, _ in self.rejected}
+        return ({i for i, _ in self.completed} | {i for i, _ in self.rejected}
+                | {i for i, _ in self.no_actions} | {i for i, _ in self.failed})
 
     # -- what the Worker does to it -----------------------------------------
 
@@ -203,6 +208,14 @@ class FakeClient:
             raise ValueError(f"refusing an empty result for {wire_id}")
         self.base_dirs.append((wire_id, base_dir))
         self.completed.append((wire_id, body))
+
+    def no_action(self, broker_id: str, outcome: str = "") -> None:
+        """Completed with nothing to post (`no_action_needed`)."""
+        self.no_actions.append((self._wire_id(broker_id), outcome))
+
+    def fail(self, broker_id: str, diagnostics: str = "") -> None:
+        """Completed as `failed`: the broker posts its notice."""
+        self.failed.append((self._wire_id(broker_id), diagnostics))
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:
         # Coerced, as the real one coerces it: free text degrades to the schema

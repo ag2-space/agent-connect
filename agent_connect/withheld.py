@@ -4,8 +4,8 @@ A held reply is written to `<workspace>/withheld/<review id>.json`, owner-only,
 on the owner's machine, where the Worker runs, and the owner is asked privately,
 in their DM with the agent, whether to post it (`agent_connect.questions`); the
 question shows the reply. `watch` acts on the answer. When no private question
-can be asked, the room message says how to act instead: reply `release` or
-`discard` to it, or `release <review id>`. A room release is honoured only when
+can be asked, the room message says how to act instead: `release <review id>`
+or `discard <review id>`. A room release is honoured only when
 the broker attests the sender as `owner` and names a review held for this room.
 Either way the stored reply must be unchanged.
 
@@ -34,10 +34,9 @@ DIR_NAME = "withheld"
 TTL_S = 24 * 3600
 OWNER = "owner"
 _KEY = secrets.token_bytes(32)
-#: Which question and which room message belong to a review. In memory only, so
-#: the agent, which can write the workspace, cannot point a review elsewhere.
+#: Which question belongs to a review. In memory only, so the agent, which can
+#: write the workspace, cannot point a review elsewhere.
 _QUESTION: dict = {}
-_EVENT: dict = {}
 #: Which Worker process held a review; another process's cannot be verified.
 _PROCESS = secrets.token_hex(8)
 _COMMAND = re.compile(r"^\s*(release|discard)(?:\s+(wr_[0-9a-f]{16}))?\s*[.!]?\s*$", re.IGNORECASE)
@@ -79,11 +78,6 @@ def hold(room: str, body: str, why, env: Optional[Mapping[str, str]] = None,
     return review_id
 
 
-def bind_event(review_id: str, event_id: str, env: Optional[Mapping[str, str]] = None) -> None:
-    """Remember which room message announced the review, so a reply to it can release."""
-    _EVENT[review_id] = event_id
-
-
 def bind_question(review_id: str, question_id: str, env: Optional[Mapping[str, str]] = None) -> None:
     _QUESTION[review_id] = question_id
 
@@ -114,8 +108,8 @@ def review_message(review_id: str, why, asked: bool = False) -> str:
     return (
         f"🔒 agent-connect: this reply was withheld for the owner's review ({review_id}).\n\n"
         f"Owner: read it on the Worker's machine, in the Worker's workspace under "
-        f"`withheld/{review_id}.json`, then reply to this message "
-        f"with `release` to post it or `discard` to delete it. It expires in 24 hours."
+        f"`withheld/{review_id}.json`, then send `release {review_id}` to post it or "
+        f"`discard {review_id}` to delete it. It expires in 24 hours."
     )
 
 
@@ -213,17 +207,13 @@ def decide(ctx, env: Optional[Mapping[str, str]] = None,
     if parsed is None:
         return None
     verb, named = parsed
-    reply_to = getattr(ctx, "reply_to_event", "")
-    if not named and not reply_to:
+    if not named:
         return None
     sweep(env, now)
-    record, path = _find(ctx.room, named, reply_to, env)
+    record, path = _find(ctx.room, named, env)
     if record is None:
-        # Only claimed when it plainly names a review; otherwise it is the agent's.
-        known = named or reply_to in _announced(env)
-        return Decision(NOT_FOUND) if known else None
+        return Decision(NOT_FOUND)
     _remove(path)
-    # The message stays known, so a second reply to it is answered, not passed on.
     _QUESTION.pop(record["review_id"], None)
     if verb == "discard":
         return Decision(DISCARDED)
@@ -245,11 +235,7 @@ def sweep(env: Optional[Mapping[str, str]] = None, now: Optional[float] = None) 
             _remove(path)
 
 
-def _announced(env) -> set:
-    return set(_EVENT.values()) - {""}
-
-
-def _find(room: str, named: Optional[str], reply_to: str, env):
+def _find(room: str, named: str, env):
     for path in _entries(env):
         try:
             record = json.loads(path.read_text())
@@ -260,8 +246,7 @@ def _find(room: str, named: Optional[str], reply_to: str, env):
         review = record.get("review_id")
         if review != path.stem:
             continue
-        if (named and review == named) or \
-                (not named and reply_to and _EVENT.get(review) == reply_to):
+        if review == named:
             return record, path
     return None, None
 

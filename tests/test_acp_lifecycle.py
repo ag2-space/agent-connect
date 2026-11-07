@@ -11,8 +11,8 @@ Two observables, as everywhere in this feature:
   received is the difference between cancelling a Turn and killing a process,
   and `permissions[].answer` is how the Client's answer to an outstanding
   permission request is read from outside the Worker.
-* **What the room received and what was written as the result** — a partial
-  answer with the interruption stated, or a `[no-send]` rejection with nothing
+* **What the room received and how the relay client was told** — a partial
+  answer with the interruption stated (`complete`), or `fail` with nothing
   posted at all.
 
 Requires the `agent-client-protocol` package (see `docs/adr/0001`).
@@ -35,9 +35,8 @@ from pathlib import Path
 try:
     from agent_connect.adapters import acp as acp_adapter
     from agent_connect.adapters.acp import DEFAULT_TIMEOUT, TIMEOUT_ENV, AcpAdapter
-    from agent_connect.reporter import NO_SEND, PLACEHOLDER, REPLIED, LadderSettings
     from agent_connect.sessions import SessionSettings, SessionStore
-    from _taskqueue import room_ops_at
+    from _taskqueue import FakeClient, room_ops_at
     from _taskqueue import task as queued_task
     from agent_connect.worker import handle_one, process_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
@@ -127,6 +126,7 @@ class Bench:
         self.timeout = timeout
         self.settings = settings or SessionSettings()
         self.adapter = self.adapter_for("unused")
+        self.client = FakeClient()
 
     def set_script(self, script: dict) -> None:
         self.script_path.write_text(json.dumps(script))
@@ -151,9 +151,13 @@ class Bench:
         self.adapter = self.adapter_for(task_id)
         return asyncio.run(asyncio.wait_for(
             handle_one(task, self.adapter, str(self.repo),
-                       None, ops, LadderSettings(throttle=0.0)),
+                       None, ops, client=self.client),
             timeout=timeout,
         ))
+
+    def failure(self, task_id: str) -> str:
+        """The archived diagnostics a `fail` carried, or ""."""
+        return next((d for i, d in self.client.failed if i == f"task-{task_id}"), "")
 
     def report(self, task_id: str):
         path = self.reports / f"{task_id}.json"
@@ -185,27 +189,24 @@ check("half an answer" in out,
       "what the agent produced before the deadline is NOT thrown away")
 check("ran past its" in out and "deadline" in out,
       "and the interruption is stated plainly, so a partial answer is not read as whole")
-check(out.startswith(REPLIED), "it is a reply like any other: one message, delivered")
-check("half an answer" in relay.ops[-1]["body"]
-      and "deadline" in relay.ops[-1]["body"],
-      "the room's one message carries both the partial answer and the interruption")
-check(len(relay.of("message")) == 1, "still exactly one message posted")
+check(bench.client.answer("task-t1") == out,
+      "it is a reply like any other: completed, for the broker to post")
+check(not relay.of("message") and not relay.of("edit"),
+      "and the Worker posts and edits nothing itself")
 relay.stop()
 
 
-print("\n-- a deadline that produced nothing is a structured rejection --")
+print("\n-- a deadline that produced nothing is a failure --")
 
 bench = Bench({"defaultTurn": {"actions": [{"type": "sleep", "seconds": 30}],
                                "stopReason": "end_turn"}}, timeout=0.5)
 relay = FakeRelay()
 out = bench.handle("t2", "think about it forever", ops=relay.ops_client)
-check(out.startswith(NO_SEND),
-      f"a timeout with no output writes {NO_SEND}: the broker posts the failure notice")
-check("timeout" in out, "the reason is in the archived result")
-check(not relay.of("edit"),
-      "and the Worker edits nothing into the room — no competing apology")
-check(relay.of("message")[-1]["body"] == PLACEHOLDER,
-      "the placeholder is left as it stood")
+check(out == "" and bench.failure("t2"),
+      "a timeout with no output is `fail`: the broker posts the failure notice")
+check("timeout" in bench.failure("t2"), "the reason is in the archived result")
+check(not relay.of("message") and not relay.of("edit"),
+      "and the Worker posts nothing into the room — no competing apology")
 check("session/cancel" in bench.report("t2")["methods"],
       "the Turn was still ended through the protocol, empty or not")
 relay.stop()
@@ -233,9 +234,10 @@ async def _two_rooms():
 
 
 timed_out, survivor = asyncio.run(asyncio.wait_for(_two_rooms(), timeout=60))
+timed_out, survivor = timed_out.body, survivor.body
 check("half an answer" in timed_out and "deadline" in timed_out,
       "the room that ran long gets its partial answer and its interruption")
-check("answered" in survivor and not survivor.startswith(NO_SEND),
+check("answered" in survivor,
       "the other room's Turn finished normally, in the same Worker, at the same time")
 check(fast.report("f1")["cancelled"] == [],
       "and its own agent was never asked to cancel anything")
@@ -299,12 +301,14 @@ print("\n-- the Local Agent dying is survived, and the conversation is kept --")
 bench = Bench({"defaultTurn": {"actions": [{"type": "exit", "code": 3}]}})
 relay = FakeRelay()
 out = bench.handle("d1", "do something fatal", ops=relay.ops_client)
-check(out.startswith(NO_SEND),
-      "a bridge that died with nothing to show is a structured rejection")
-check("code 3" in out, "with the exit code kept, because an operator needs it")
-check("resume it" in out,
+said = out or bench.failure("d1")
+check(said and len(bench.client.completed) + len(bench.client.failed) == 1,
+      "a bridge that died is answered once, through the relay client")
+check("code 3" in said, "with the exit code kept, because an operator needs it")
+check("resume it" in said,
       "and the conversation is marked for resumption rather than written off")
-check(not relay.of("edit"), "the room gets no failure message from the Worker")
+check(not relay.of("message") and not relay.of("edit"),
+      "the Worker posts nothing into the room itself")
 relay.stop()
 
 check(bench.sessions() and bench.sessions()[0]["room"] == ROOM_A,

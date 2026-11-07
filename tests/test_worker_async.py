@@ -179,7 +179,7 @@ errs = ShimAdapter("codex-ish", SyncStub(output="agent-connect: codex timed out 
 out = asyncio.run(process_one(task("x1", "do it", room="!e:ag2.space"),
                               errs, "/repo"))
 check(
-    out == "agent-connect: codex timed out after 600s.",
+    out.body == "agent-connect: codex timed out after 600s.",
     "an Adapter's own error text reaches the answer unchanged",
 )
 

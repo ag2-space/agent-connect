@@ -197,8 +197,9 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
 
     client.complete("task-1", "the answer")
     posted = broker.took("POST", "/v1/results")
-    check(len(posted) == 1 and posted[0].json == {"id": "task-1", "body": "the answer"},
-          "complete() POSTs the documented result shape")
+    check(len(posted) == 1 and posted[0].json == {"id": "task-1", "body": "the answer",
+                                                  "status": "completed"},
+          "complete() POSTs the documented result shape, status included")
     check(client.journal.is_done("task-1"), "and a successful POST retires the id")
     check(client.inflight() == [], "which empties the in-flight ledger")
     check(client.journal.room_for("task-1") == "",
@@ -279,7 +280,8 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     second.poll_once()
 
     delivered = broker.took("POST", "/v1/results")
-    check(delivered and delivered[0].json == {"id": "task-1", "body": "the answer"},
+    check(delivered and delivered[0].json == {"id": "task-1", "body": "the answer",
+                                              "status": "completed"},
           "which it re-completes upstream — the user's answer, not a placeholder")
     check(second.next_task(timeout=0.1) is None,
           "and the task is never re-executed: the consumer never sees it (F3)")

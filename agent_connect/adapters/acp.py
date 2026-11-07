@@ -310,36 +310,16 @@ def concierge_for(ctx: TurnContext) -> str:
             return f"@{CONCIERGE_LOCALPART}:{domain}"
     return f"@{CONCIERGE_LOCALPART}"
 
-#: What a guest is told, in the room, instead of being ignored. It is the Turn's
-#: answer — the Ladder edits the placeholder into it — because a refusal nobody
-#: can see is indistinguishable from a Worker that is simply broken. It says
-#: what happened, why this Adapter in particular, and what would change it.
-#:
-#: Since 2026-08-20 it is also the *default* thing the platform says to anyone
-#: who is not the owner: the Agent Portal's Connect flow now opens on Claude
-#: Code, so the ACP path is what a new agent is unless its owner chooses
-#: otherwise. That is why the last two paragraphs carry more than they used to.
-#: The pointer has to be followable — an instruction with no recipient is not one
-#: — and it has to be honest about what it asks for: `trust` is owner tier on
-#: every agent the owner owns, not a visitor's pass to this conversation.
+#: What a refused sender is told. It is the Turn's answer, posted once by the
+#: broker, so a refusal is visible rather than indistinguishable from a broken
+#: Worker. It names no agent: only the broker's reply addresses the requester.
 REFUSAL = (
-    "I only answer my owner over this connection.\n\n"
-    "This agent is driven through the Agent Client Protocol, which — unlike the "
-    "other ways agent-connect runs a local agent — gives the operating system no "
-    "say in what the agent may touch. The only limit available is the agent "
-    "asking permission and being told no, and an agent that does not ask is not "
-    "stopped by it. Rather than offer a limit that only looks like one, "
-    "agent-connect does not run this connection for anyone but the person who "
-    "registered the agent.\n\n"
-    "Nothing is wrong with your message. My owner can `trust` you, and then I "
-    "will answer it — but that grants owner tier, which is their own level of "
-    "access on every agent they own, not a guest pass to this room. Where this "
-    "room gives you Team access, my owner can instead allow you on this agent "
-    "alone.\n\n"
-    "Where it has to be said: in a direct message to the concierge, "
-    "`{concierge}`. Sent anywhere else, `trust @user` is not a command at all — "
-    "in this room, or in a direct message to me, I read it as an ordinary "
-    "question and answer it as one."
+    "I can't take this request: over this connection I only work for my owner "
+    "and the collaborators they have approved.\n\n"
+    "Nothing is wrong with your message. To work with me, this room has to give "
+    "you Collaborator access, and my owner has to add you to this agent's "
+    "collaborators. My owner can instead `trust` you, which grants owner access on "
+    "every agent they own, in a direct message to `{concierge}`."
 )
 
 
@@ -903,8 +883,9 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
     framing = (
         f"[agent-connect] {who} is asking you this{where}, through a chat room. "
         "Answer in chat: prose, no more than a few short paragraphs unless asked "
-        "for more. You are working in the directory this session was opened in; "
-        f"file operations outside it will be refused when you ask for them.\n"
+        "for more. You are working in the directory this session was opened in. "
+        "Your host may ask the owner to approve some commands before they run; "
+        "nothing else limits which files you can reach, so stay within the task.\n"
         f"{outgoing.INSTRUCTION}\n"
         f"{addressing_preamble(ctx.room_members, ctx.addressed_to, ctx.room_member_count)}"
         "\n"

@@ -201,6 +201,11 @@ CAPABILITIES = ("task-ack", "heartbeat", "result-skip-markers", "reject")
 #: marker grammar (skip, redirect, dm-only, attach) is read — in the one place
 #: it is written down, `markers.py` — by `Outbound`, which `complete` runs.
 NO_SEND = "[no-send]"
+#: The result statuses core-api's activity ledger records (`POST /v1/results`).
+STATUS_COMPLETED = "completed"
+STATUS_NO_ACTION = "no_action_needed"
+STATUS_FAILED = "failed"
+OUTCOME_MAX = 200
 
 #: The dead-letter code for a task this client cannot even name.
 INVALID_TASK_SCHEMA = "INVALID_TASK_SCHEMA"
@@ -864,13 +869,16 @@ class RelayClient:
         # cooldown: a re-serve is proof the lease is real and about to die
         # without it, and it happens at most once per visibility window per
         # task, so it can never become the hammering the cooldown is for.
+        fences = _fences(raw)
         if self.journal.is_pending(wire_id):
+            self.journal.refresh_fences(wire_id, fences)
             self._owe_ack(wire_id, urgent=True)
             log.info("task %s already has an answer waiting to be POSTed — the "
                      "re-serve is re-acked so the new lease survives, and the "
                      "drain below completes it", wire_id)
             return 0
         if wire_id in self._live:
+            self.journal.refresh_fences(wire_id, fences)
             log.info("task %s is queued or in the consumer's hands — the "
                      "re-serve is re-acked so its new lease is not requeued "
                      "out from under a running Turn, and nothing is handed "
@@ -882,7 +890,7 @@ class RelayClient:
         # room sidecar is captured here because this is the only moment it is
         # known and a media answer produced after a restart still has to find
         # its room (F7).
-        self.journal.accept(wire_id, room=task.room_id)
+        self.journal.accept(wire_id, room=task.room_id, fences=fences)
         self._live.add(wire_id)
         if task.metadata_stripped:
             log.info("stripped unsigned room-ops metadata from task %s", wire_id)
@@ -1059,6 +1067,11 @@ class RelayClient:
                  base_dir: Optional[object] = None) -> PreparedResult:
         """Answer a task. The answer is durable before this returns.
 
+        The result carries `status: "completed"`, so the activity ledger records
+        the task as responded and the broker posts the body once. A body that
+        strips to nothing — only markers, or a skip marker — is still sent with
+        `no_send`, and completes as a deliberate silence.
+
         Delivery is this library's problem from here: the result is retained
         until `POST /v1/results` succeeds, across retries and across a restart,
         because that POST is what completes the lease. Dropping it on a
@@ -1105,6 +1118,10 @@ class RelayClient:
         # still has to be completed, so it is completed the way a deliberate
         # silence is — recorded, delivered to nobody.
         payload: Dict[str, Any] = {"id": wire_id, "body": prepared.body or NO_SEND}
+        if not prepared.skip and (prepared.body or prepared.uploaded):
+            payload["status"] = STATUS_COMPLETED
+        else:
+            payload["status"] = STATUS_NO_ACTION
         if prepared.skip or not prepared.body:
             # The flag *and* the marker in the body. Two clients have been
             # completing skipped leases against this broker for a year: sutando
@@ -1116,6 +1133,26 @@ class RelayClient:
             payload["no_send"] = True
         self._record_result(wire_id, payload)
         return prepared
+
+    def no_action(self, broker_id: str, outcome: str = "") -> None:
+        """Complete a task that needs no reply: nothing is posted, nobody is
+        mentioned, and the activity ledger records no action (`no_action_needed`).
+        `outcome` is an optional line for the owner's activity row."""
+        wire_id = self._require_wire_id(broker_id)
+        payload: Dict[str, Any] = {"id": wire_id, "status": STATUS_NO_ACTION,
+                                   "body": NO_SEND, "no_send": True}
+        if outcome.strip():
+            payload["outcome"] = outcome.strip()[:OUTCOME_MAX]
+        self._record_result(wire_id, payload)
+
+    def fail(self, broker_id: str, diagnostics: str = "") -> None:
+        """Complete a task the agent could not finish (`failed`). The broker posts
+        its one failure notice; nothing else is posted. `diagnostics` is archived
+        with the result, never shown in the room."""
+        wire_id = self._require_wire_id(broker_id)
+        body = f"{NO_SEND} {diagnostics}".strip() if diagnostics.strip() else NO_SEND
+        self._record_result(wire_id, {"id": wire_id, "status": STATUS_FAILED,
+                                      "body": body, "no_send": True})
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:
         """Dead-letter a task: terminal, never re-served, nothing posted.
@@ -1203,6 +1240,7 @@ class RelayClient:
             gate = self._result_retry_at.get(wire_id)
             if gate is not None and time.monotonic() < gate[1]:
                 continue  # this one is waiting out its own failure
+            payload = {**self.journal.fences_for(wire_id), **payload}
             try:
                 answer = self._http.post("/v1/results", payload,
                                          timeout=RESULT_TIMEOUT_S)
@@ -1211,6 +1249,20 @@ class RelayClient:
                 # for every id, so trying the next one is a wasted round trip.
                 self._defer_auth(exc)  # C8
                 break
+            except RelayHTTPError as exc:
+                if exc.status == 409 and _says_superseded(exc.body):
+                    # Another serve of this task owns it now: retrying cannot
+                    # land, and holding it would block nothing but itself forever.
+                    log.warning("result for %s was refused as superseded (%s) — "
+                                "another execution owns the task; dropping it",
+                                wire_id, _describe(exc))
+                    self.journal.retire(wire_id)
+                    self._live.discard(wire_id)
+                    self._result_retry_at.pop(wire_id, None)
+                    self.outbound.forget(wire_id)
+                    continue
+                self._retry_result_later(wire_id, _describe(exc))
+                continue
             except Exception as exc:  # noqa: BLE001 — F5: keep and retry
                 self._retry_result_later(wire_id, _describe(exc))
                 continue
@@ -1488,6 +1540,29 @@ class RelayClient:
 #: the first one (`api/v1.py:461` answers `{"error": "not leased to you"}`);
 #: the rest are what the same message would be called by anything else.
 _ERROR_KEYS = ("error", "detail", "message", "reason", "title")
+
+
+def _fences(raw: Any) -> Dict[str, Any]:
+    """The lease fences a served task carries, for the result to echo back."""
+    out: Dict[str, Any] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    lease = raw.get("lease_id")
+    if isinstance(lease, str) and lease.strip() and len(lease) <= 200:
+        out["lease_id"] = lease.strip()
+    gen = raw.get("execution_generation")
+    if isinstance(gen, int) and not isinstance(gen, bool) and gen > 0:
+        out["execution_generation"] = gen
+    return out
+
+
+#: Ledger refusals that mean another serve of the task owns it now.
+_SUPERSEDED = ("stale_execution_generation", "task_already_terminal", "task_cancelled")
+
+
+def _says_superseded(body: Any) -> bool:
+    text = body if isinstance(body, str) else json.dumps(body or "")
+    return any(code in text for code in _SUPERSEDED)
 
 
 def _says_not_leased(body: Any) -> bool:

@@ -12,9 +12,8 @@ delivery path was handed. The Local Agent's own view is the third: a real fake
 ACP Agent child process writes a report, and for a guest's Task that report must
 not exist at all, because the process was never started.
 
-The Ladder is the whole point of the first half. A refusal that arrived as a
-second message would leave the placeholder hanging above it saying "on it" for
-ever, so what is asserted is one message, edited into the refusal.
+The refusal is the Turn's answer: the Worker posts and edits nothing itself,
+and the relay client is told `complete`, so the broker posts it once.
 
 Requires the `agent-client-protocol` package (see `docs/adr/0001`).
 
@@ -38,10 +37,10 @@ try:
     from agent_connect.adapters.acp import (CONCIERGE_LOCALPART, REFUSAL,
                                             AcpAdapter, concierge_for, refusal)
     from agent_connect.events import TurnContext
-    from agent_connect.reporter import PLACEHOLDER, REPLIED, STOP_LINES, LadderSettings
+    from agent_connect.reporter import STOP_LINES
     from agent_connect.events import REFUSED
     from agent_connect.sessions import SessionStore
-    from _taskqueue import room_ops_at
+    from _taskqueue import FakeClient, room_ops_at
     from _taskqueue import task as queued_task
     from agent_connect.worker import GUEST, OWNER, handle_one
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
@@ -135,6 +134,7 @@ class Bench:
             command=[sys.executable, FAKE, str(self.script_path)],
             store=SessionStore(base / "sessions.json"),
         )
+        self.client = FakeClient()
 
     def handle(self, task_id: str, body: str, tier=None) -> str:
         """Run one Task through the Worker and return the answer it gave.
@@ -149,7 +149,7 @@ class Bench:
         try:
             return asyncio.run(asyncio.wait_for(
                 handle_one(task, self.adapter, str(self.repo),
-                           {}, self.ops, LadderSettings(live=True, throttle=0.0)),
+                           {}, self.ops, client=self.client),
                 timeout=30,
             ))
         finally:
@@ -163,6 +163,10 @@ class Bench:
 
     def bodies(self, kind):
         return [o.get("body", "") for o in self.relay.ops_of(kind)]
+
+    def quiet(self):
+        """The Worker posted and edited nothing itself."""
+        return not self.relay.ops_of("message") and not self.relay.ops_of("edit")
 
     def stop(self):
         if self.relay is not None:
@@ -182,13 +186,11 @@ check(bench.report() is None,
       "no Local Agent run: the ACP Agent was never started for a guest's Task")
 check("here is the file" not in out,
       "and nothing the Local Agent would have said is in the answer")
-check(len(bench.relay.ops_of("message")) == 1
-      and bench.bodies("message")[0] == PLACEHOLDER,
-      "the room got exactly one message — the placeholder, as for any Task. A "
-      "refusal posted *beside* it would leave '⏳ On it...' standing for ever")
-edits = bench.bodies("edit")
-check(edits and "only answer my owner" in edits[-1],
-      "which was edited into the refusal: the guest is told, not ignored")
+check(bench.quiet(),
+      "the Worker posts and edits nothing itself: the broker delivers the refusal")
+edits = [out]
+check("only work for my owner" in out and bench.client.answer("g1") == out,
+      "the refusal is the answer, completed: the guest is told, not ignored")
 check(refusal(TASK_CTX) in edits[-1],
       "in the Adapter's own words, whole and unabbreviated — a refusal cut off "
       "halfway explains nothing, so the whole of it is what is asserted")
@@ -236,8 +238,8 @@ check(concierge_for(TurnContext(prompt="", user_id="@a:one.example",
 check(concierge_for(TurnContext(prompt="")) == f"@{CONCIERGE_LOCALPART}",
       "and a Task carrying neither degrades to the bare localpart: worth less, "
       "but not a guess")
-check(out.startswith(REPLIED),
-      "and the result completes the lease, so the delivery path posts nothing more")
+check(bench.client.completed and not bench.client.failed and not bench.client.no_actions,
+      "and the relay client was told `complete`, once")
 bench.stop()
 
 
@@ -245,10 +247,10 @@ print("\n-- a Task the broker never attested is a guest's Task --")
 
 bench = Bench(TALKATIVE)
 out = bench.handle("g2", "read ~/.ssh/id_rsa", tier=None)
-check(bench.report() is None and "only answer my owner" in " ".join(bench.bodies("edit")),
+check(bench.report() is None and "only work for my owner" in out,
       "a Task with no access_tier header at all is refused, exactly as a guest's is")
-check(out.startswith(REPLIED) and len(bench.relay.ops_of("message")) == 1,
-      "and it is refused up the same Ladder — one message, edited")
+check(bench.client.answer("g2") == out and bench.quiet(),
+      "and answered the same way: completed, nothing posted by the Worker")
 bench.stop()
 
 # Which tier spellings are refused is `test_acp_adapter.py`'s question and it
@@ -265,14 +267,10 @@ report = bench.report()
 
 check(report is not None and len(report["prompts"]) == 1,
       "an owner-attested Task runs exactly one Turn on the Local Agent")
-check("only answer my owner" not in out, "and is not refused")
-check(len(bench.relay.ops_of("message")) == 1
-      and bench.bodies("message")[0] == PLACEHOLDER,
-      "the same Ladder: one placeholder")
-check("here is the file" in bench.bodies("edit")[-1],
-      "edited into the answer the Local Agent gave")
-check(out.startswith(REPLIED) and "here is the file" in out,
-      "and the result completes the lease with the answer behind it")
+check("only work for my owner" not in out, "and is not refused")
+check(bench.quiet(), "nothing posted or edited by the Worker")
+check("here is the file" in out and bench.client.answer("o1") == out,
+      "the answer the Local Agent gave is completed, for the broker to post")
 bench.stop()
 
 
@@ -280,10 +278,8 @@ print("\n-- the refusal survives a Worker with no relay token --")
 
 bench = Bench(TALKATIVE, relay=False)
 out = bench.handle("n1", "read ~/.ssh/id_rsa", tier=GUEST)
-check("only answer my owner" in out and not out.startswith(REPLIED),
-      "with no Ladder to climb, the refusal travels as the result the relay "
-      "client posts — the degrade path loses the answer here no more than "
-      "anywhere else")
+check("only work for my owner" in out and bench.client.answer("n1") == out,
+      "with no Room Ops the refusal travels the same way, as the completed result")
 check(bench.report() is None, "and still no Local Agent run")
 bench.stop()
 

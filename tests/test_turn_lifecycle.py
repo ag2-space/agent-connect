@@ -1,15 +1,15 @@
 """Tests for what happens when a Turn does not simply produce an answer.
 
 Three situations, all asserted the way the outside world sees them — the Room
-Ops a **real local HTTP relay** recorded, and the body the Task was completed
+Ops a **real local HTTP relay** recorded, and the outcome the Task was answered
 with. Nothing here asserts on which internal object called which.
 
-* **A message arriving while the Session is busy** is queued, and the person is
-  told so before the wait rather than after it.
+* **A message arriving while the Session is busy** waits its turn. s.space's
+  queued indicator shows that; the Worker posts nothing about it.
 * **A Turn that stopped short** carries an explicit line saying so, whatever it
   managed to produce.
-* **A Turn that produced nothing** is a structured rejection: `[no-send]`, no
-  edit, and no failure message from the Worker — the broker owns that one.
+* **A Turn that produced nothing** is `FAILED_OUTCOME`: nothing posted or
+  edited by the Worker — the broker posts the one failure notice.
 
 The Adapters are stubs emitting the event vocabulary, so this runs under bare
 `python3`. Cancellation through the ACP protocol — the other half of this
@@ -41,12 +41,9 @@ from agent_connect.events import (
 )
 from agent_connect.pending import PendingTurn, SessionQueue, queue_for
 from agent_connect.reporter import (
-    NO_SEND,
-    PLACEHOLDER,
-    QUEUED,
-    REPLIED,
+    ANSWERED,
+    FAILED_OUTCOME,
     STOP_LINES,
-    LadderSettings,
     TurnReporter,
 )
 from _taskqueue import FakeClient, room_ops_at, task
@@ -164,7 +161,7 @@ async def settle(seconds=0.3):
     await asyncio.sleep(seconds)
 
 
-print("\n-- a second message is queued, announced, and answered afterwards --")
+print("\n-- a second message waits its turn, silently, and is answered afterwards --")
 
 
 async def _queueing():
@@ -178,8 +175,7 @@ async def _queueing():
     sessions = {}
     running = [
         asyncio.ensure_future(
-            handle_one(one, adapter, "/repo", sessions, ops,
-                       LadderSettings(throttle=0.0), client=client)
+            handle_one(one, adapter, "/repo", sessions, ops, client=client)
         )
         for one in delivered
     ]
@@ -203,18 +199,8 @@ check("task-q1" in mid["started"] and "task-q3" in mid["started"],
 check(mid["peak"] == 2,
       f"two rooms ran at once and the queue is per Session (peak {mid['peak']})")
 
-announcements = [o for o in mid["ops"]
-                 if o.get("op") == "message" and "queued" in o.get("body", "")]
-check(len(announcements) == 1,
-      f"the queued Task is announced, once (got {len(announcements)})")
-check(announcements and announcements[0]["room_id"] == ROOM_A,
-      "in the room that is waiting, and only there")
-check(all("queued" not in o.get("body", "") for o in relay.of("edit")),
-      "as its own message — never by editing someone else's placeholder")
-check(len(relay.of("message", ROOM_A)) == 3,
-      "room A sees three messages: two placeholders and the one announcement")
-check(len(relay.of("message", ROOM_B)) == 1,
-      "and the other room sees only its own placeholder — nothing about the queue")
+check(not mid["ops"] and not relay.ops,
+      "nothing is posted about the wait — no queued notice, no placeholder")
 
 check(adapter.started[-1] == "task-q2"
       and adapter.started.index("task-q1") < adapter.started.index("task-q2"),
@@ -222,60 +208,16 @@ check(adapter.started[-1] == "task-q2"
 check(adapter.peak <= 2, "and never two Turns at once on the one Session")
 for tid in ("task-q1", "task-q2", "task-q3"):
     check(f"answer for {tid}" in (client.answer(tid) or ""), f"{tid} was answered")
-check("queued" not in client.answer("task-q2"),
-      "and the queue announcement is not repeated in the answer it preceded")
 relay.stop()
-
-
-print("\n-- the announcement comes before the placeholder, not after --")
-
-
-async def _order():
-    relay, ops = relay_ops()
-    reporter = TurnReporter(ops, LadderSettings(throttle=0.0))
-    ctx = ctx_for()
-    await reporter.queued(ctx, ahead=1)
-    body = await reporter.run(
-        Scripted(MessageChunk(text="here it is"),
-                 Done(reason=COMPLETED, text="here it is")),
-        ctx,
-    )
-    return relay, body
-
-
-relay, body = asyncio.run(_order())
-check(relay.ops[0]["op"] == "message" and "queued" in relay.ops[0]["body"],
-      "the room hears it is queued first")
-check(relay.ops[1]["op"] == "message" and relay.ops[1]["body"] == PLACEHOLDER,
-      "then the placeholder for its own answer")
-check(relay.ops[-1]["op"] == "edit" and "here it is" in relay.ops[-1]["body"],
-      "then the answer, edited into that placeholder as usual")
-check(body.startswith(REPLIED), "and the reply completes the lease as usual")
-relay.stop()
-
-# A wait nobody could be told about is not carried out to the answer instead:
-# "your message is queued", read next to the answer, is noise.
-
-
-async def _no_relay():
-    reporter = TurnReporter(None, LadderSettings())
-    ctx = ctx_for()
-    await reporter.queued(ctx, ahead=1)
-    return await reporter.run(
-        Scripted(MessageChunk(text="hi"), Done(reason=COMPLETED, text="hi")), ctx)
-
-
-body = asyncio.run(_no_relay())
-check("queued" not in body and "hi" in body,
-      "with no relay the queue announcement is dropped rather than stapled to the answer")
 
 
 print("\n-- a Turn that stopped short always says so --")
 
 
-def run_turn_events(*events, ops=None, settings=None):
-    reporter = TurnReporter(ops, settings or LadderSettings(throttle=0.0))
-    return asyncio.run(reporter.run(Scripted(*events), ctx_for())), reporter
+def run_turn_events(*events, ops=None):
+    reporter = TurnReporter(ops)
+    outcome = asyncio.run(reporter.run(Scripted(*events), ctx_for()))
+    return outcome.body, outcome
 
 
 relay, ops = relay_ops()
@@ -288,11 +230,8 @@ body, _ = run_turn_events(
 check("half an answer" in body, "a timeout keeps what the agent had produced")
 check("ran past its 5-second deadline" in body,
       "and states the interruption alongside it")
-check("half an answer" in relay.ops[-1]["body"]
-      and "ran past its 5-second deadline" in relay.ops[-1]["body"],
-      "the room gets both, in the one message it was already reading")
-check(body.startswith(REPLIED),
-      "it is a real reply: delivered, and the lease completed")
+check(not relay.ops, "the Worker posts nothing itself: the broker delivers the reply")
+check(_.kind == ANSWERED, "it is a real reply: answered, and the lease completed")
 relay.stop()
 
 body, _ = run_turn_events(
@@ -321,73 +260,60 @@ check(STOP_LINES[FAILED] in body,
       "and a reason nobody here has heard of is still not silence")
 
 
-print("\n-- a Turn that produced nothing is a structured rejection --")
+print("\n-- a Turn that produced nothing is FAILED_OUTCOME --")
 
 
 async def _rejection(done):
     relay, ops = relay_ops()
-    # Live progress off, so that "nothing was edited" is about the ending
-    # rather than about a progress edit that legitimately happened earlier.
-    reporter = TurnReporter(ops, LadderSettings(live=False))
-    body = await reporter.run(Scripted(ToolStarted(tool_id="a", title="Read x.py"), done),
-                              ctx_for())
-    return relay, body, reporter
+    reporter = TurnReporter(ops)
+    outcome = await reporter.run(
+        Scripted(ToolStarted(tool_id="a", title="Read x.py"), done), ctx_for())
+    await settle(0.1)
+    return relay, outcome
 
 
-relay, body, reporter = asyncio.run(_rejection(Done(reason=REFUSED, text="")))
-check(body.startswith(NO_SEND),
-      f"the result body starts with {NO_SEND}, which the relay client archives "
-      "and delivers nowhere")
-check(reporter.rejected, "and the reporter says the Turn was rejected")
-check("refused" in body, "the reason is in the body, for whoever reads the archive")
-check(not relay.of("edit"),
-      "nothing was edited into the room: no Worker-authored failure message")
-check(relay.of("message") and relay.of("message")[-1]["body"] == PLACEHOLDER,
-      "the placeholder is left exactly as it was — the broker's notice is the reply")
-check(REPLIED not in body,
-      "and the lease is NOT completed as replied, because nothing was replied")
+relay, outcome = asyncio.run(_rejection(Done(reason=REFUSED, text="")))
+check(outcome.kind == FAILED_OUTCOME, "an empty refusal is FAILED_OUTCOME")
+check("refused" in outcome.body, "the reason is in the body, for whoever reads the archive")
+check(not relay.ops, "nothing was posted or edited: no Worker-authored failure message")
 relay.stop()
 
-relay, body, _ = asyncio.run(_rejection(
-    Done(reason=TIMEOUT, text="",
-         note="⏱ agent-connect: it had produced nothing by then.")))
-check(body.startswith(NO_SEND) and "produced nothing" in body,
-      "an empty timeout is the same rejection, carrying what the Adapter said")
-check(not relay.of("edit"), "and still edits nothing into the room")
+relay, outcome = asyncio.run(_rejection(Done(reason=FAILED, text="")))
+check(outcome.kind == FAILED_OUTCOME and "Read x.py" in outcome.body
+      and "Operator diagnostics" in outcome.body,
+      "operator diagnostics are retained only in the archived failure")
+check(not relay.ops, "and still nothing reaches the room")
 relay.stop()
 
-relay, body, _ = asyncio.run(_rejection(
+relay, outcome = asyncio.run(_rejection(
     Done(reason=FAILED, text="", note="agent-connect: the ACP Agent exited (code 3)")))
-check(body.startswith(NO_SEND) and "code 3" in body,
-      "a bridge that died is a rejection too, with the exit code kept for the operator")
-check("Read x.py" in body and "Operator diagnostics" in body,
-      "operator diagnostics are retained only in archived rejected results")
+check(outcome.kind == ANSWERED and "code 3" in outcome.body,
+      "a failure the Adapter explained is answered with the explanation")
 relay.stop()
 
-body = asyncio.run(
-    TurnReporter(None, LadderSettings()).run(
-        Scripted(Done(reason=REFUSED, text="")), ctx_for()))
-check(body.startswith(NO_SEND),
-      "with no relay at all it is still a rejection — the marker is what carries it")
+outcome = asyncio.run(
+    TurnReporter(None).run(Scripted(Done(reason=REFUSED, text="")), ctx_for()))
+check(outcome.kind == FAILED_OUTCOME,
+      "with no relay at all it is still FAILED_OUTCOME")
 
-body = asyncio.run(
-    TurnReporter(None, LadderSettings()).run(
-        Scripted(Done(reason=REFUSED, text="I only answer my owner.")), ctx_for()))
-check(not body.startswith(NO_SEND) and "I only answer my owner." in body,
-      "a refusal that DID say something is delivered: the rejection is about "
-      "having nothing to say, not about the reason")
+outcome = asyncio.run(
+    TurnReporter(None).run(
+        Scripted(Done(reason=REFUSED, text="I only work for my owner.")), ctx_for()))
+check(outcome.kind == ANSWERED and "I only work for my owner." in outcome.body,
+      "a refusal that DID say something is delivered: failure is about having "
+      "nothing to say, not about the reason")
 
-# An announcement that never reached the room is not lost inside a rejection.
+
 async def _unposted_rejection():
-    reporter = TurnReporter(None, LadderSettings())
+    reporter = TurnReporter(None)
     return await reporter.run(
         Scripted(Notice(text="🧠 the context was reset"), Done(reason=FAILED, text="")),
         ctx_for())
 
 
-body = asyncio.run(_unposted_rejection())
-check("the context was reset" in body,
-      "an announcement the room never got is archived with the rejection, not dropped")
+outcome = asyncio.run(_unposted_rejection())
+check("the context was reset" in outcome.body,
+      "an announcement the room never got is archived with the failure, not dropped")
 
 
 print("\n-- the pending-Turn structure --")

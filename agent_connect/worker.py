@@ -69,7 +69,7 @@ from .config import load as load_config
 from .events import Attachment, TurnContext
 from .pending import queue_for
 from .offthread import in_daemon_thread  # noqa: F401 — re-exported
-from .reporter import LadderSettings, TurnReporter
+from .reporter import ANSWERED, FAILED_OUTCOME, NO_ACTION_OUTCOME, Outcome, TurnReporter
 from .roomops import room_ops_for
 from .sandbox import sandbox_preamble, tier_to_sandbox  # noqa: F401 — re-exported
 from .sessions import workspace_dir
@@ -158,8 +158,10 @@ def attested_tier(raw: str) -> str:
 
 
 def attested_collaborator(task) -> bool:
-    """Team with the exact boolean `collaborator: true`, as the broker sent it."""
-    return requested_tier(task) == "team" and getattr(task, "collaborator", False) is True
+    """Team, in `access_tier` or `requested_access_tier`, with the exact boolean
+    `collaborator: true`, as the broker sent it (sparrow's `broker_attested_tier`)."""
+    tiers = {requested_tier(task), (getattr(task, "access_tier", "") or "").strip()}
+    return "team" in tiers and getattr(task, "collaborator", False) is True
 
 
 def requested_tier(task) -> str:
@@ -254,6 +256,7 @@ def turn_context(task, repo: str) -> TurnContext:
         reply_to_me=task.reply_to_me,
         reply_to_sender=task.reply_to_sender,
         reply_to_event=getattr(task, "reply_to_event", "") or "",
+        thread_root=getattr(task, "thread_root", "") or "",
         room_members=task.room_members,
         room_member_count=task.room_member_count,
         sandbox=tier_to_sandbox(tier),
@@ -262,21 +265,9 @@ def turn_context(task, repo: str) -> TurnContext:
     )
 
 
-async def run_turn(adapter, ctx: TurnContext, ops=None, settings=None, reporter=None) -> str:
-    """Drive one Turn up the Ladder and return the body to write as the result.
-
-    The whole event stream goes to the `TurnReporter`, which owns everything the
-    room sees: the placeholder, the throttled progress edits, the final edit and
-    the terminal marker — or, for a Turn that produced nothing, the structured
-    rejection that leaves the failure notice to the broker. With no `ops` — a
-    Worker holding no relay token, or a test — nothing is posted and the answer
-    travels as the result body, exactly as it did before the Ladder existed.
-
-    `reporter` is for a caller that already had to speak to the room before the
-    Turn began — announcing a queued message, which happens before the
-    placeholder exists. Everyone else lets one be built here.
-    """
-    return await (reporter or TurnReporter(ops, settings)).run(adapter, ctx)
+async def run_turn(adapter, ctx: TurnContext, ops=None, settings=None, reporter=None) -> Outcome:
+    """Run one Turn and return its `Outcome`. `settings` is ignored since 0.4.0."""
+    return await (reporter or TurnReporter(ops)).run(adapter, ctx)
 
 
 async def _preflight(check, status: Optional[StatusFile]):
@@ -307,53 +298,25 @@ async def process_one(
     sessions: dict = None,
     ops=None,
     settings=None,
-) -> str:
-    """Handle one delivered Task and return the body that answers it.
+) -> Optional[Outcome]:
+    """Handle one delivered Task and return its `Outcome`, or None for a Task
+    nothing could answer (no text and no files), which `handle_one` rejects.
 
-    Returns `""` for a Task nothing could answer — no text *and* no files, which
-    is what a body that was only an unsigned metadata block degrades to after
-    the library quarantines it. `handle_one` turns that into the reject.
-    Everything else comes back as a body: the answer, the terminal marker when
-    the answer already went to the room up the Ladder, or the structured
-    rejection when the Turn produced nothing to say.
-
-    An upload with no caption is emphatically not one of them: its body is empty
-    and its content is in the attachments, so `turn_context` gives it a prompt
-    that says so and the Turn runs like any other.
-
-    `sessions` — when given — maps a Session key to the `SessionQueue` that
-    keeps one Turn at a time open on it. Tasks with different keys never
-    contend, which is what makes two rooms concurrent; Tasks with the same key
-    queue, and **the person is told they are queued** rather than left
-    wondering whether their message arrived. Without a registry there is no
-    serialisation at all, which is what a single-Task caller wants.
-
-    `ops` is the relay to climb the Ladder on, shared across Tasks; `settings`
-    is how much of it to climb. Both may be `None`, and then the answer travels
-    whole in the body this returns, as it always did.
+    `sessions` maps a Session key to the `SessionQueue` that keeps one Turn at a
+    time open on it; s.space's queued indicator shows a Task waiting its turn.
+    `settings` is ignored since 0.4.0.
     """
     ctx = turn_context(task, repo)
     if not ctx.prompt:
-        return ""
+        return None
     # The owner releasing or discarding a held collaborator reply. It never
     # reaches the agent; the answer is the released reply or a short note.
     decision = withheld.decide(ctx)
     if decision is not None:
-        return decision.body
-    reporter = TurnReporter(ops, settings)
-
-    async def announce(turn) -> None:
-        # Said before the wait rather than after it, and as its own message:
-        # the placeholder for this Task does not exist yet, and editing
-        # someone else's would take their answer away.
-        await reporter.queued(ctx, turn.ahead)
-
-    if sessions is None:
-        held = _NoLock()
-    else:
-        held = queue_for(sessions, ctx.session_key).arrive(ctx, on_wait=announce)
+        return Outcome(ANSWERED, decision.body)
+    held = _NoLock() if sessions is None else queue_for(sessions, ctx.session_key).arrive(ctx)
     async with held:
-        return await run_turn(adapter, ctx, ops, settings, reporter)
+        return await run_turn(adapter, ctx, ops)
 
 
 async def handle_one(
@@ -368,62 +331,37 @@ async def handle_one(
 ) -> str:
     """`process_one`, answered to the broker, and unable to take the Worker down.
 
-    **Every Task that comes off the queue leaves through this function, once.**
-    That is the contract the library's seam is built on: it hands a Task over
-    and waits to be told `complete` or `reject`, and an answer that is merely
-    dropped is a lease left to expire, a redelivery, and eventually a
-    dead-letter five attempts later. So a Task that reaches the end of this
-    function has left through one of those two calls, and never both.
+    Every Task leaves through exactly one relay call:
+    - `complete` for an answer (status `completed`; the broker posts it);
+    - `no_action` when there is nothing to say (`no_action_needed`; nothing posted);
+    - `fail` for a Turn that produced nothing (`failed`; the broker posts its notice);
+    - `reject` for a Task with neither text nor files.
 
-    **Cancellation is the third exit, and it answers neither on purpose.**
-    `CancelledError` has been a `BaseException` since 3.8, so the guard below
-    does not catch it and must not: on a stop, `asyncio.run` cancels every Turn
-    in flight, and an id left accepted-and-unanswered is re-served by the broker
-    and re-executed — which is the correct outcome for work that never finished.
-    Answering it here would be worse in both directions: a `complete` would post
-    an answer nobody produced, and a `reject` is terminal for a Task whose only
-    problem was that the Worker was asked to stop.
-
-    One Task failing is still one Task's problem: the failure becomes the body,
-    so the person who asked hears something back rather than nothing, and the
-    drain loop above keeps turning.
-
-    A `reject` is reserved for input nothing could ever answer, which on this
-    side of the seam is one thing: a Task with neither text nor files in it.
-    Re-serving that produces the same nothing five times over, and the broker's
-    dead-letter park is where the protocol says it goes — this is the flow
-    sparrow never implemented and the reason the old code could only write
-    `[no-send] empty task` and hope. The broker posts the terminal-failure
-    notice; the Worker posts none, exactly as with the `TurnReporter`'s
-    structured rejection.
-
-    `client` may be `None` — a test, or a caller driving one Task by hand — and
-    then the answer travels back as the return value and nothing is told to any
-    broker. The body is returned either way, and `""` means the Task was
-    rejected.
+    Cancellation answers none of them: the broker re-serves an unfinished Task.
+    A Task that raises becomes an answer saying so. With `client` None nothing is
+    sent. Returns the answer body, or "" when nothing is posted.
     """
     try:
-        body = await process_one(task, adapter, repo, sessions, ops, settings)
+        outcome = await process_one(task, adapter, repo, sessions, ops, settings)
     except asyncio.CancelledError:
         # Written out rather than left to the `Exception` guard's blind spot, so
         # the third exit is visible where the other two are. Nothing is said to
         # the broker: see above.
         raise
     except Exception as e:  # noqa: BLE001 — never die on one bad task
-        body = f"agent-connect: worker error: {e}"
-    if not body.strip():
-        # Belt and braces: `process_one` returns "" only for a Task with neither
-        # text nor files, and the reporter's endings are never blank. A blank
-        # body would be refused by `complete` anyway (H5: an empty answer is
-        # "not ready", not an answer), so it must not be able to reach it.
+        outcome = Outcome(ANSWERED, f"agent-connect: worker error: {e}")
+    if outcome is None:
         await _answer(client, "reject", task.id, EMPTY_TASK)
         return ""
-    # `repo` travels with the answer as the directory a *relative* path in a
-    # `[file:]` marker is read against — the Turn's working directory, which is
-    # also the root the client was built with. It widens nothing: the library
-    # still judges where the file is, never how it was named.
-    await _answer(client, "complete", task.id, body, repo)
-    return body
+    if outcome.kind == ANSWERED and outcome.body.strip():
+        # `repo` is what a relative path in a `[file:]` marker is read against.
+        await _answer(client, "complete", task.id, outcome.body, repo)
+        return outcome.body
+    if outcome.kind == FAILED_OUTCOME:
+        await _answer(client, "fail", task.id, outcome.body)
+        return ""
+    await _answer(client, "no_action", task.id, NO_ACTION_OUTCOME)
+    return ""
 
 
 async def _answer(client, how: str, task_id: str, payload: str, *rest) -> None:
@@ -849,8 +787,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # a Task result being written at that instant can be left truncated, where
     # an unhandled SIGTERM would have killed the process between syscalls. One
     # Task's result file against every observer's ability to tell a stop from a
-    # crash; the archived result is also not the answer, which has already gone
-    # to the room up the Ladder.
+    # crash.
     #
     # The handler also tells the Relay Client to stop *here*, at the signal,
     # rather than at the `finally` below: the poll thread it has to wait for is
@@ -947,12 +884,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         agent = preflight(adapter, status)
         poll = float(os.environ.get("AGENT_CONNECT_POLL", "1.0"))
 
-        # The Ladder: the placeholder and its edits are Room Ops, asked for
-        # through the client the Worker already built — one bearer, one gateway,
-        # one speaker. There is no second credential read anywhere above this
-        # line, and nothing here knows a URL.
+        # Notices and owner questions are Room Ops, through the client the
+        # Worker already built: one bearer, one gateway, no second credential.
         ops = room_ops_for(client)
-        settings = LadderSettings.from_env()
+        settings = None
 
         detail = f"adapter={adapter_name} repo={repo} ws={ws}"
         print(f"agent-connect worker: {detail}")

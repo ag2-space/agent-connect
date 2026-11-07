@@ -33,6 +33,34 @@ check(not attested_collaborator(task(collaborator="true")), "only the exact bool
 check(not attested_collaborator(task(requested="guest")), "guest with collaborator is not")
 check(not attested_collaborator(SimpleNamespace()), "a task without the fields is not")
 
+# The wire vectors agreed with OpenClaw, end to end through turn_context.
+from agent_connect.worker import turn_context
+
+
+def wire(access_tier="guest", requested="team", collaborator=True, user=AGENT):
+    return SimpleNamespace(
+        id="t", body="hi", room_id="!r:s.space", room_name="", access_tier=access_tier,
+        requested_access_tier=requested, collaborator=collaborator,
+        sensitive_data_filter=True, sender_name="", user_id=user,
+        source_message_id="$m", addressed_to="", reply_to_me=False, reply_to_sender="",
+        reply_to_event="", room_members=(), room_member_count=0, attachments=())
+
+
+VECTORS = (
+    ("owner", wire(access_tier="owner", requested="", collaborator=False), True),
+    ("guest + requested team + collaborator, listed", wire(), True),
+    ("team + collaborator, listed", wire(access_tier="team", requested=""), True),
+    ("Team without collaborator", wire(collaborator=False), False),
+    ("collaborator sent as the string 'true'", wire(collaborator="true"), False),
+    ("collaborator sent as 1", wire(collaborator=1), False),
+    ("no room grant (guest, no Team)", wire(requested=""), False),
+    ("not on the list", wire(user="@stranger:s.space"), False),
+    ("no user id", wire(user=""), False),
+)
+for name, raw, want in VECTORS:
+    check(admitted(turn_context(raw, "/tmp"), ENV) is want,
+          f"{name}: {'admitted' if want else 'refused'}")
+
 
 def ctx(tier=GUEST, collaborator=True, user=AGENT):
     return TurnContext(prompt="hi", room="!r:s.space", access_tier=tier,
@@ -63,7 +91,8 @@ async def first_event(c, env):
 
 refused = asyncio.run(first_event(ctx(), {}))
 check(refused.reason == REFUSED, "turn refuses an unlisted collaborator")
-check("on this agent alone" in REFUSAL, "the refusal names the narrower option")
+check("this agent's collaborators" in REFUSAL and "Collaborator access" in REFUSAL,
+      "the refusal names the narrower option: the room grant plus this agent's list")
 passed = asyncio.run(first_event(ctx(), ENV))
 check(getattr(passed, "reason", None) != REFUSED, "turn does not refuse a listed collaborator")
 

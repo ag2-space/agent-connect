@@ -51,7 +51,7 @@ check(sent_sandbox == "workspace-write", "owner task → workspace-write sandbox
 check(sent_task.startswith("[agent-connect: this run's sandbox is 'workspace-write'"),
       "prompt starts with the authoritative preamble")
 check(sent_task.endswith("do the thing"), "original task body preserved after preamble")
-check(answer == "stub-output", "and the answer is what the adapter produced")
+check(answer.body == "stub-output", "and the answer is what the adapter produced")
 
 print("\n" + ("PASS — preamble green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)
