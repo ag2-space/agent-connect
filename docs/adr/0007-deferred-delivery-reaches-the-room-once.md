@@ -57,9 +57,13 @@ moderator can change it. It holds:
 
 - `binding`: an opaque id the Worker creates per Session key (room and owner, or room and
   collaborator; ADR 0003's amendment, #40). It is `<worker id>.<random>`. The worker id is
-  random, created once and stored in `<workspace>/worker-id`, so it is stable across
-  restarts and a client that did not issue a binding can tell at once. Two collaborators in one room never share a binding or
-  an `export_dir`. Renewal keeps the same id and `export_dir`.
+  random, created once and stored in `<workspace>/worker-id` (written like the ledger: temp
+  file, fsync, rename, fsync of the directory), so it is stable across restarts and a
+  client that did not issue a binding can tell at once. If `deliveries.json` exists but
+  `worker-id` is missing, unreadable or disagrees with the worker id stored in the ledger's
+  entries, the Worker does not enable delivery and says why at start; it never mints a new
+  id over an existing ledger. Two collaborators in one room never share a binding or an
+  `export_dir`. Renewal keeps the same id and `export_dir`.
 - `export_dir`: `<workspace>/export/<binding>/`. The agent writes files it will deliver there.
 
 Lifetimes:
@@ -125,8 +129,10 @@ like a part (`part = "notice"`), so a crash and retry cannot post it twice.
 Each part is posted with `Idempotency-Key = sha256(JCS([worker id, id, part]))`, where JCS is
 RFC 8785 canonical JSON, so `id="x1", part=0` and `id="x", part=10` cannot collide and a
 non-ASCII `id` has one encoding. The key does **not** include the binding: an `id` is the
-agent's, scoped to this Worker, and a resend of it can never mint a new key. The broker
-scopes keys per agent identity as well. A resend under the same `id` must carry identical parts in the same order. Parts
+agent's, scoped to this Worker, and a resend of it can never mint a new key. The worker id
+used is the one stored in that `id`'s ledger entry, not the current file, so an entry is
+always continued under the key it started with. The broker scopes keys per agent identity
+as well. A resend under the same `id` must carry identical parts in the same order. Parts
 that already landed replay, and only the missing ones post. Parts are posted one after
 another; there is no ordering across deliveries.
 
@@ -169,7 +175,7 @@ binding expired after it finished still gets its result, and a known `id` is nev
 another binding or another Worker.
 
 **The ledger.** `<workspace>/deliveries.json` records, per `id`, when the Worker first saw it,
-its binding and room, and each part's result. It is what enforces `expired` after the key's
+its binding, room and worker id, and each part's result. It is what enforces `expired` after the key's
 lifetime, so it fails closed:
 
 - The first-seen entry is written and fsynced (temp file, fsync, rename, fsync of the
@@ -193,8 +199,11 @@ deliveries without calling the relay, and enforces `expired`. When two listeners
 the same delivery, the agent decides which one owns it; the same key makes a second attempt
 harmless anyway.
 
-**4. `_ag2/notify` is unchanged.** AG2 Assistant (its ADR 0049) relies on it. It stays
-text-only and best-effort. New agents should use `_ag2/deliver`.
+**4. `_ag2/notify` stays, and #40 guards it.** AG2 Assistant (its ADR 0049) relies on it. It
+stays text-only and best-effort, with no retry safety. With #40, while any collaborator is
+listed, a `_ag2/notify` text goes through #40's result guard and may only target a room where
+the owner has a Session; otherwise it is withheld. So both paths an agent can use unasked,
+`_ag2/deliver` and `_ag2/notify`, are guarded. New agents should use `_ag2/deliver`.
 
 **5. Standard ACP files in a Turn are sent, for local agents.** An `agent_message_chunk`
 whose content is a `resource_link` with a `file://` URI is treated as an outgoing file of
@@ -317,6 +326,8 @@ paths, by design.
   - capability probe negative: `ag2/deliver` not declared;
   - keyed 200 without the echo: recorded as posted, Delivered, declaration withdrawn;
   - a non-ASCII `id`: one key, whatever its JSON escaping;
+  - `worker-id` deleted, unreadable or changed while `deliveries.json` exists: delivery not
+    enabled, no new id minted; an in-progress entry resumes under its stored worker id;
   - relay 409 `running`: Retry, and room ops in other rooms keep working;
   - keys for `id="x1", part=0` and `id="x", part=10` differ;
   - simultaneous deliveries to two rooms: each lands in its own room only;
