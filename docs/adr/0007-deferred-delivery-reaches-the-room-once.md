@@ -32,8 +32,9 @@ the Worker acknowledges it (step 3), not until it is written to a socket.
 **2. Deliveries are bound to a room by the Worker, not by the agent.** `session/new` already
 sends `_meta["ag2/destination"]`. It gains:
 
-- `binding`: an opaque random id the Worker creates per (room, Access Tier) and keeps in its
-  own store, independent of Session rotation. It expires 30 days after the room's last Turn,
+- `binding`: an opaque random id the Worker creates per Session key (room and owner, or room
+  and collaborator, ADR 0003's amendment) and keeps in its own store, independent of
+  Session rotation. Two collaborators in one room never share a binding or an `export_dir`. It expires 30 days after the room's last Turn,
   and each Turn renews it, keeping the same id and `export_dir`.
 - `export_dir`: `<workspace>/export/<binding>/`, a directory the Worker creates and deletes
   when the binding expires. The agent writes files it will deliver there. The Worker adds
@@ -46,6 +47,11 @@ room named by the agent is never used. Attachments are accepted only from that b
 `RoomOps.upload`) like every other file. A path from another binding is refused even when it
 is inside the allowlist, so the Worker enforces that one room cannot send another room's file.
 A binding does not expire, and its folder is not deleted, while a delivery for it is in flight.
+
+A collaborator's binding records the sender. At delivery the Worker re-checks that the
+sender is still in `AGENT_CONNECT_ACP_COLLABORATORS`, and answers `rejected` otherwise. A
+Turn in which the broker no longer attests that sender as Team collaborator drops their
+bindings. Removing a sender takes effect at once, not 30 days later.
 
 A binding names a destination; it is not a credential. `_ag2/deliver` is accepted only on the
 Worker's own connection to the agent (a process it spawned, or a link it dialled). Which
@@ -145,6 +151,11 @@ accepted: `RoomOps.upload` takes only paths, by design.
 
 - One extra idle process per Worker for a spawned agent that advertises `ag2/deliver`, and
   none otherwise.
+- Deliveries are not scanned by the room's sensitive data filter, which agent-connect does
+  not implement. This includes a collaborator's delivery, up to 30 days after their Turn.
+- A `resource_link` in a Turn is no wider than a `[file: …]` marker. For an admitted
+  collaborator, a prompt can ask for any file inside the egress allowlist roots, so choose
+  those roots with collaborators in mind.
 - `export_dir` is a local path, so `_ag2/deliver` attachments work only when the agent and the
   Worker share a filesystem. A dialled remote agent can still deliver text.
 - A delivery is complete only when the relay accepted it. A room the Worker cannot post to
@@ -155,6 +166,8 @@ accepted: `RoomOps.upload` takes only paths, by design.
   - lost response, then retry with the same `id`: one post;
   - replay after a listener restart: one post;
   - unknown binding: refused;
+  - a collaborator removed from the list, then delivering: `rejected`;
+  - two collaborators in one room: separate bindings and folders;
   - attachment from another binding: refused;
   - path outside `export_dir`: refused;
   - upload accepted but acknowledgment lost: one post;
