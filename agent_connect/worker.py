@@ -338,8 +338,8 @@ async def handle_one(
     - `reject` for a Task with neither text nor files.
 
     Cancellation answers none of them: the broker re-serves an unfinished Task.
-    A Task that raises becomes an answer saying so. With `client` None nothing is
-    sent. Returns the answer body, or "" when nothing is posted.
+    A Task that raises is `fail`ed: the broker posts its notice and the error is
+    archived. With `client` None nothing is sent. Returns the answer body, or "" when nothing is posted.
     """
     try:
         outcome = await process_one(task, adapter, repo, sessions, ops, settings)
@@ -349,7 +349,9 @@ async def handle_one(
         # the broker: see above.
         raise
     except Exception as e:  # noqa: BLE001 — never die on one bad task
-        outcome = Outcome(ANSWERED, f"agent-connect: worker error: {e}")
+        # Archived, never posted: exception text can carry paths and arguments,
+        # and it would skip the collaborator result guard.
+        outcome = Outcome(FAILED_OUTCOME, f"agent-connect: worker error: {e!r}")
     if outcome is None:
         await _answer(client, "reject", task.id, EMPTY_TASK)
         return ""

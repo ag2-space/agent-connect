@@ -284,9 +284,10 @@ async def _one_bad():
 
 asyncio.run(_one_bad())
 check(
-    client.answer("b1") == "agent-connect: worker error: adapter blew up",
-    "a failing Task completes with the same error text as before — the person "
-    "who asked hears something back rather than nothing",
+    client.answer("b1") is None
+    and any(i == "b1" and "adapter blew up" in d for i, d in client.failed),
+    "a failing Task is `fail`ed: the broker posts its notice, and the error is "
+    "archived rather than posted to the room",
 )
 check(client.answer("b2") == "ok", "the healthy Task in another room is unaffected")
 check(not client.rejected,
@@ -517,8 +518,8 @@ async def _drain():
 
 check(asyncio.run(_drain()), "the drain loop survives a Task that raised")
 check(client.answer("l2") == "ok", "the drain loop answered the healthy Task")
-check(client.answer("l1") == "agent-connect: worker error: adapter blew up",
-      "and answered the one that raised, instead of leaving its lease to expire")
+check(any(i == "l1" for i, _ in client.failed),
+      "and failed the one that raised, instead of leaving its lease to expire")
 
 
 # -- but a Worker that cannot be given work does not go on saying it is serving --

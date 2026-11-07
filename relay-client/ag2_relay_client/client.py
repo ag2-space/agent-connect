@@ -112,6 +112,9 @@ SOCKET_MARGIN_S = 10
 SIDE_TIMEOUT_S = 10.0
 #: The result POST. Longer, because it is the one call that matters.
 RESULT_TIMEOUT_S = 20.0
+#: How long an answer refused as a stale generation waits for its task to be
+#: re-served to this client before it is given up, said out loud.
+PARKED_TTL_S = 1800.0
 
 #: E1's interval. "At most every 60 s" — the gate is checked once per poll, so
 #: the real spacing is the first poll boundary at or past 60 s.
@@ -256,7 +259,7 @@ class RelayClient:
         "capabilities", "tasks", "media", "_room_ops", "_questions", "outbound",
         "_reconciler", "_live", "_presence",
         "_ack_disabled_until", "_ack_owed", "_intake_deadline",
-        "_result_retry_at", "_heartbeat_disabled", "_last_heartbeat",
+        "_result_retry_at", "_parked", "_heartbeat_disabled", "_last_heartbeat",
         "_deferred_auth", "_drain_lock", "_stop", "_thread",
     )
 
@@ -403,6 +406,9 @@ class RelayClient:
         #: it is tried again, which is what lets the drain move on to the answer
         #: behind it instead of stalling the whole queue on one id.
         self._result_retry_at: Dict[str, Tuple[Backoff, float]] = {}
+        #: Answers refused as `stale_execution_generation`, by when they were
+        #: parked: held, not retried, until a re-serve brings fresh fences.
+        self._parked: Dict[str, float] = {}
         self._heartbeat_disabled = False
         #: `None` is "never", for the same reason as above: with a monotonic
         #: clock whose origin is process start, a `0.0` sentinel makes the
@@ -844,7 +850,8 @@ class RelayClient:
             # dropping it instead would leave the lease to expire and the task
             # to come back for a third time.
             self.journal.record_result(
-                wire_id, {"id": wire_id, "body": NO_SEND, "no_send": True})
+                wire_id, {"id": wire_id, "body": NO_SEND, "no_send": True,
+                          "status": STATUS_NO_ACTION, **_fences(raw)})
             log.info("task %s was already answered — re-completing the lease, "
                      "not re-executing (attempt %s)", wire_id, task.attempt)
             return 0
@@ -872,6 +879,10 @@ class RelayClient:
         fences = _fences(raw)
         if self.journal.is_pending(wire_id):
             self.journal.refresh_fences(wire_id, fences)
+            if self._parked.pop(wire_id, None) is not None:
+                # The re-serve a parked answer was waiting for: post it now,
+                # under the new lease.
+                self._result_retry_at.pop(wire_id, None)
             self._owe_ack(wire_id, urgent=True)
             log.info("task %s already has an answer waiting to be POSTed — the "
                      "re-serve is re-acked so the new lease survives, and the "
@@ -1237,6 +1248,15 @@ class RelayClient:
                          "nothing is lost (F5)", self.result_budget,
                          len(owed) - index)
                 break
+            parked = self._parked.get(wire_id)
+            if parked is not None:
+                if time.monotonic() - parked < PARKED_TTL_S:
+                    continue  # waiting for a re-serve with fresh fences
+                log.warning("result for %s was refused as a stale generation and "
+                            "its task was not re-served within %.0fs — the answer "
+                            "is dropped", wire_id, PARKED_TTL_S)
+                self._settle_dropped(wire_id)
+                continue
             gate = self._result_retry_at.get(wire_id)
             if gate is not None and time.monotonic() < gate[1]:
                 continue  # this one is waiting out its own failure
@@ -1250,16 +1270,18 @@ class RelayClient:
                 self._defer_auth(exc)  # C8
                 break
             except RelayHTTPError as exc:
-                if exc.status == 409 and _says_superseded(exc.body):
-                    # Another serve of this task owns it now: retrying cannot
-                    # land, and holding it would block nothing but itself forever.
-                    log.warning("result for %s was refused as superseded (%s) — "
-                                "another execution owns the task; dropping it",
-                                wire_id, _describe(exc))
-                    self.journal.retire(wire_id)
-                    self._live.discard(wire_id)
-                    self._result_retry_at.pop(wire_id, None)
-                    self.outbound.forget(wire_id)
+                code = _error_code_of(exc.body) if exc.status == 409 else ""
+                if code == "stale_execution_generation":
+                    # A newer serve exists. It usually comes back to this
+                    # client; the answer waits for it rather than being lost.
+                    log.warning("result for %s was refused as a stale generation — "
+                                "held until the task is re-served", wire_id)
+                    self._parked[wire_id] = time.monotonic()
+                    continue
+                if code in _TERMINAL_CODES:
+                    log.warning("result for %s was refused (%s): the task is "
+                                "closed, so the answer is dropped", wire_id, code)
+                    self._settle_dropped(wire_id)
                     continue
                 self._retry_result_later(wire_id, _describe(exc))
                 continue
@@ -1283,6 +1305,13 @@ class RelayClient:
                      " (the broker had it already)" if duplicate else "")
         return delivered
 
+    def _settle_dropped(self, wire_id: str) -> None:
+        self.journal.retire(wire_id)
+        self._live.discard(wire_id)
+        self._result_retry_at.pop(wire_id, None)
+        self._parked.pop(wire_id, None)
+        self.outbound.forget(wire_id)
+
     def _retry_result_later(self, wire_id: str, why: str) -> None:
         """Hold one result back for a while. The rest of the queue goes now."""
         ladder = (self._result_retry_at.get(wire_id) or (Backoff(), 0.0))[0]
@@ -1295,6 +1324,8 @@ class RelayClient:
     def _forget_stale_result_gates(self, owed_ids: set) -> None:
         for wire_id in [k for k in self._result_retry_at if k not in owed_ids]:
             self._result_retry_at.pop(wire_id, None)
+        for wire_id in [k for k in self._parked if k not in owed_ids]:
+            self._parked.pop(wire_id, None)
 
     # --- heartbeat (E1, E2, E3) --------------------------------------------
 
@@ -1556,13 +1587,24 @@ def _fences(raw: Any) -> Dict[str, Any]:
     return out
 
 
-#: Ledger refusals that mean another serve of the task owns it now.
-_SUPERSEDED = ("stale_execution_generation", "task_already_terminal", "task_cancelled")
+#: Ledger refusals that mean the task is closed: its answer can never land.
+_TERMINAL_CODES = ("task_already_terminal", "task_cancelled")
 
 
-def _says_superseded(body: Any) -> bool:
-    text = body if isinstance(body, str) else json.dumps(body or "")
-    return any(code in text for code in _SUPERSEDED)
+def _error_code_of(body: Any) -> str:
+    """The broker's `error_code` (or `error`) field, exactly; "" when absent."""
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body or "{}")
+        except ValueError:
+            return ""
+    if not isinstance(body, Mapping):
+        return ""
+    for key in ("error_code", "error"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def _says_not_leased(body: Any) -> bool:

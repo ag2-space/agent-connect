@@ -225,8 +225,9 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
           "a redelivered task the client already answered never reaches the consumer")
     replayed = broker.took("POST", "/v1/results")
     check(len(replayed) == 1 and replayed[0].json == {
-              "id": "task-1", "body": NO_SEND, "no_send": True},
-          "it is re-completed upstream with a skip marker instead (F3, H1)")
+              "id": "task-1", "body": NO_SEND, "no_send": True,
+              "status": "no_action_needed", "lease_id": "l-2"},
+          "it is re-completed upstream as a no action, under the new lease (F3, H1)")
     check(client.journal.is_done("task-1"), "and the id stays done")
     check(client.inflight() == [], "a re-completed redelivery leaves nothing in flight")
 
