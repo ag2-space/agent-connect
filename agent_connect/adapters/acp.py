@@ -636,17 +636,34 @@ def allow_option(request) -> str:
     return ""
 
 
+#: How much of the agent's raw input the question shows, split between its start and end.
+DETAILS_MAX = 1000
+
+
+def _details(raw) -> str:
+    """The agent's raw input, secrets masked, never cut silently."""
+    text = result_guard.mask(json.dumps(raw, default=str))
+    if len(text) <= DETAILS_MAX:
+        return text
+    half = DETAILS_MAX // 2
+    return f"{text[:half]} […{len(text) - 2 * half} characters cut…] {text[-half:]}"
+
+
 def approval_prompt(ctx: TurnContext, decision, request, requester: str) -> str:
-    """The private question: what the agent wants, where, and for whom."""
+    """The private question. What agent-connect itself knows comes first; the agent's
+    own description is labelled as such, and its input is masked and never cut silently."""
     tool = getattr(request, "tool_call", None)
     tool = tool if isinstance(tool, dict) else {}
-    lines = [f"The agent wants to {decision.title}.",
-             f"Not allowed automatically: {decision.reason}."]
+    lines = ["The agent is asking to do something agent-connect cannot allow by itself.",
+             f"Kind of action: {tool.get('kind') or 'unknown'}",
+             f"Why it needs you: {decision.reason}"]
     if decision.paths:
-        lines.append("Paths: " + ", ".join(decision.paths))
+        lines.append("Paths it touches: " + ", ".join(decision.paths))
     raw = tool.get("rawInput")
     if raw:
-        lines.append("Details: " + json.dumps(raw, default=str)[:800])
+        lines.append("Exact input: " + _details(raw))
+    lines.append("The agent's own description (it wrote this): "
+                 + result_guard.mask(" ".join(str(decision.title).split()))[:200])
     lines.append(f"Room: {ctx.room_name or ctx.room}")
     lines.append(f"Asked by {requester}, a collaborator, not you." if requester
                  else "This is your own turn.")

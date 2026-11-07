@@ -153,7 +153,12 @@ class OwnerQuestions:
             accepted = question.get("accepted_answer")
             if status == "answered" and isinstance(accepted, dict) \
                     and accepted.get("kind") == "choice":
-                option = str(accepted.get("option_id") or "")
+                # Only the owner's answer counts, whatever the server accepted:
+                # the agent can mint its own token on this machine.
+                if accepted.get("respondent") == owner.mxid:
+                    option = str(accepted.get("option_id") or "")
+                else:
+                    status = "foreign"
             return Answer(status, option, str(question.get("revision") or ""))
         except Exception as exc:  # noqa: BLE001
             log.warning("owner questions: inspect failed (%s)", _describe(exc))

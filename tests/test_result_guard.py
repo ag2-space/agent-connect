@@ -311,6 +311,104 @@ for leftover in held_dir.glob("wr_*.json"):
     leftover.unlink()
 
 
+# --- swaps, tampering, double posting, bad records ----------------------------
+for leftover in held_dir.glob("wr_*.json"):
+    leftover.unlink()
+asking = AskingOps()
+run_turn(ctx(), "first " + SAMPLES["GitHub token"], ops=asking)
+run_turn(ctx(), "second reply, harmless " + SAMPLES["AWS access key"], ops=asking)
+a_path, b_path = sorted(held_dir.glob("wr_*.json"), key=lambda p: json.loads(p.read_text())["created_at"])
+a_text, b_text = a_path.read_text(), b_path.read_text()
+a_path.write_text(b_text)
+b_path.write_text(a_text)
+second_q = withheld._QUESTION[b_path.stem]
+asking.sync.answers[second_q] = ("answered", "release")
+before = len(asking.messages)
+asyncio.run(withheld.check_answers(asking))
+check(len(asking.messages) == before, "swapping two reviews' files releases neither")
+for leftover in held_dir.glob("wr_*.json"):
+    leftover.unlink()
+withheld._QUESTION.clear()
+
+for field, value in (("cwd", "/somewhere/else"), ("expires_at", 9e12)):
+    asking = AskingOps()
+    run_turn(ctx(), secret_reply, ops=asking)
+    path = next(held_dir.glob("wr_*.json"))
+    record = json.loads(path.read_text())
+    record[field] = value
+    path.write_text(json.dumps(record))
+    asking.sync.answers["q1"] = ("answered", "release")
+    asyncio.run(withheld.check_answers(asking))
+    check(not asking.messages[1:], f"a tampered {field} is never released")
+    for leftover in held_dir.glob("wr_*.json"):
+        leftover.unlink()
+
+asking = AskingOps()
+run_turn(ctx(), secret_reply, ops=asking)
+run_turn(ctx(), secret_reply, ops=asking)
+broken, good = sorted(held_dir.glob("wr_*.json"), key=lambda p: json.loads(p.read_text())["created_at"])
+record = json.loads(broken.read_text())
+del record["room"]
+broken.write_text(json.dumps(record))
+asking.sync.answers["q1"] = ("answered", "release")
+asking.sync.answers["q2"] = ("answered", "release")
+asyncio.run(withheld.check_answers(asking))
+check(any(SAMPLES["GitHub token"] in m for m in asking.messages[1:]) and not good.exists(),
+      "one broken review does not stop the others")
+for leftover in held_dir.glob("wr_*.json"):
+    leftover.unlink()
+
+
+class RaceOps(AskingOps):
+    """Answers Post it, and meanwhile the owner releases it from the room."""
+
+    async def _answer(self, question_id):
+        self.room_release = withheld.decide(as_ctx("release"))
+        return "answered", "release"
+
+
+race = RaceOps()
+run_turn(ctx(), secret_reply, ops=race)
+race.questions.answer = race._answer
+before = len(race.messages)
+asyncio.run(withheld.check_answers(race))
+check(race.room_release is not None and race.room_release.body.startswith(secret_reply)
+      and len(race.messages) == before,
+      "a review released from the room is not posted again by the watcher")
+for leftover in held_dir.glob("wr_*.json"):
+    leftover.unlink()
+withheld._QUESTION.clear()
+
+check(withheld.decide(TurnContext(prompt="release", room="!r:s.space", access_tier="owner",
+                                  reply_to_event="$unrelated", reply_to_me=True)) is None,
+      "an owner's plain 'release' with nothing pending goes to the agent")
+
+
+class ForeignSync(Sync):
+    def inspect(self, question_id):
+        return SimpleNamespace(status="foreign", option="", revision="1")
+
+
+foreign = AskingOps()
+foreign.sync.__class__ = ForeignSync
+run_turn(ctx(), secret_reply, ops=foreign)
+asyncio.run(withheld.check_answers(foreign))
+check(len(list(held_dir.glob("wr_*.json"))) == 1 and len(foreign.messages) == 1,
+      "an answer that is not the owner's releases nothing")
+for leftover in held_dir.glob("wr_*.json"):
+    leftover.unlink()
+withheld._QUESTION.clear()
+
+pem = "key:\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nAAAABG5vbmU=\n-----END OPENSSH PRIVATE KEY-----\nafter"
+masked = result_guard.mask(pem)
+check("b3BlbnNzaC1rZXktdjEAAAAA" not in masked and masked.endswith("after"),
+      "a private key is masked through its END line")
+check("AAAABG5vbmU" not in result_guard.mask("-----BEGIN RSA PRIVATE KEY-----\nAAAABG5vbmU"),
+      "and to the end of the text when there is no END line")
+check("ghp_" not in result_guard.mask("ghp_" + "a" * 10 + "\u200b" + "a" * 30),
+      "a zero-width split does not get a token past the mask")
+
+
 # --- notes, notices, zero-width, stale releases --------------------------------
 
 

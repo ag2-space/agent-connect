@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import tempfile
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,8 +54,13 @@ def directory(env: Optional[Mapping[str, str]] = None) -> Path:
     return workspace_dir(env) / DIR_NAME
 
 
-def _seal(review_id: str, room: str, body: str) -> str:
-    return hmac.new(_KEY, json.dumps([review_id, room, body]).encode(), hashlib.sha256).hexdigest()
+def _seal(record: dict) -> str:
+    fields = [record.get(k) for k in ("review_id", "room", "body", "cwd", "expires_at")]
+    return hmac.new(_KEY, json.dumps(fields).encode(), hashlib.sha256).hexdigest()
+
+
+def _intact(record: dict) -> bool:
+    return hmac.compare_digest(str(record.get("seal", "")), _seal(record))
 
 
 def hold(room: str, body: str, why, env: Optional[Mapping[str, str]] = None,
@@ -64,7 +70,8 @@ def hold(room: str, body: str, why, env: Optional[Mapping[str, str]] = None,
     review_id = "wr_" + secrets.token_hex(8)
     record = {"review_id": review_id, "room": room, "body": body, "why": list(why),
               "created_at": now, "expires_at": now + TTL_S, "cwd": cwd,
-              "process": _PROCESS, "seal": _seal(review_id, room, body)}
+              "process": _PROCESS}
+    record["seal"] = _seal(record)
     try:
         _write(directory(env) / f"{review_id}.json", record)
     except OSError:
@@ -129,26 +136,39 @@ async def check_answers(ops, env: Optional[Mapping[str, str]] = None) -> None:
         return
     sweep(env)
     for review_id, question_id in list(_QUESTION.items()):
-        path = directory(env) / f"{review_id}.json"
         try:
-            record = json.loads(path.read_text())
-        except (OSError, ValueError):
+            await _check_one(ops, questions, review_id, question_id, env)
+        except Exception as exc:  # noqa: BLE001 — one bad review must not stop the rest
             _QUESTION.pop(review_id, None)
-            continue
-        if record.get("review_id") != review_id:
-            _QUESTION.pop(review_id, None)
-            _remove(path)
-            continue
-        status, option = await questions.answer(question_id)
-        if status in ("expired", "cancelled", "answered"):
-            _QUESTION.pop(review_id, None)
-        if status in ("expired", "cancelled") or (status == "answered" and option != "release"):
-            _remove(path)
-        elif status == "answered":
-            _remove(path)
-            if hmac.compare_digest(record.get("seal", ""),
-                                   _seal(record["review_id"], record["room"], record["body"])):
-                await post_released(ops, record)
+            print(f"agent-connect: dropped withheld review {review_id}: {exc!r}", file=sys.stderr)
+
+
+async def _check_one(ops, questions, review_id: str, question_id: str, env) -> None:
+    path = directory(env) / f"{review_id}.json"
+    record = _load(path, review_id)
+    if record is None:
+        _QUESTION.pop(review_id, None)
+        _remove(path)
+        return
+    status, option = await questions.answer(question_id)
+    if status not in ("expired", "cancelled", "answered"):
+        return
+    _QUESTION.pop(review_id, None)
+    # Re-read after the wait: a room release may have taken it meanwhile.
+    record = _load(path, review_id)
+    if record is None:
+        return
+    _remove(path)
+    if status == "answered" and option == "release" and _intact(record):
+        await post_released(ops, record)
+
+
+def _load(path: Path, review_id: str) -> Optional[dict]:
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and record.get("review_id") == review_id else None
 
 
 async def post_released(ops, record: dict) -> None:
@@ -199,15 +219,15 @@ def decide(ctx, env: Optional[Mapping[str, str]] = None,
     sweep(env, now)
     record, path = _find(ctx.room, named, reply_to, env)
     if record is None:
-        known = named or reply_to in _announced(env) or getattr(ctx, "reply_to_me", False)
+        # Only claimed when it plainly names a review; otherwise it is the agent's.
+        known = named or reply_to in _announced(env)
         return Decision(NOT_FOUND) if known else None
     _remove(path)
-    _EVENT.pop(record["review_id"], None)
+    # The message stays known, so a second reply to it is answered, not passed on.
     _QUESTION.pop(record["review_id"], None)
     if verb == "discard":
         return Decision(DISCARDED)
-    if not hmac.compare_digest(record.get("seal", ""),
-                               _seal(record["review_id"], record["room"], record["body"])):
+    if not _intact(record):
         return Decision(TAMPERED)
     return Decision(f"{record['body']}\n\n{RELEASED_NOTE}")
 

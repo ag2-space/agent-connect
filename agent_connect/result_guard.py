@@ -66,9 +66,15 @@ def secret_types(text: str) -> Tuple[str, ...]:
 def mask(text: str) -> str:
     """`text` with every known secret format replaced by its name in brackets."""
     text = "".join(c for c in (text or "") if unicodedata.category(c) != "Cf")
+    text = _WHOLE_KEY.sub("[private key]", text)
     for name, pattern in PATTERNS:
         text = pattern.sub(f"[{name}]", text)
     return text
+
+
+#: A private key from its BEGIN line through its END line, or to the end of the text.
+_WHOLE_KEY = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----|[\s\S]*)")
 
 
 def guarded(ctx: TurnContext) -> bool:

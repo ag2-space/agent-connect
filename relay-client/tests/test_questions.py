@@ -205,6 +205,48 @@ for label, bad in (("another origin", "https://evil.example" + MINT_PATH),
         finally:
             mcp.close()
 
+# --- a mint URL on another live origin never receives the relay bearer ---------
+with FakeBroker(base_path="") as broker, FakeBroker(base_path="") as evil:
+    mcp = Mcp()
+    try:
+        scene(broker, mcp, mint_url=evil.url + MINT_PATH)
+        evil.on("POST", MINT_PATH, json={"access_token": "stolen", "expires_in": 900})
+        q = make(broker)
+        q.ask("p", [("a", "A")], expires_in_s=60, operation_id="o")
+        check(not evil.requests, "a reachable mint on another origin is never called")
+    finally:
+        mcp.close()
+
+# --- only the owner's answer counts --------------------------------------------
+with FakeBroker(base_path="") as broker:
+    mcp = Mcp()
+    try:
+        scene(broker, mcp)
+        for who in (AGENT, "@collab:s.space"):
+            mcp.ok("room.question.inspect", {"status": "completed", "result": {
+                "room_id": DM, "question": {"status": "answered", "revision": 3,
+                                            "accepted_answer": {"kind": "choice", "option_id": "release",
+                                                                "respondent": who}}}})
+            got = make(broker).inspect("q1")
+            check(got is not None and got.option == "" and got.status != "answered",
+                  f"an answer given by {who} is not the owner's and chooses nothing")
+    finally:
+        mcp.close()
+
+# --- error text never reaches the log ---------------------------------------------
+with FakeBroker(base_path="") as broker:
+    mcp = Mcp()
+    try:
+        scene(broker, mcp)
+        mcp.answers["ag2.whoami"] = [(500, {"error": "leak-me-please"})]
+        logs.truncate(0)
+        logs.seek(0)
+        check(make(broker).owner() is None, "a server error fails closed")
+        check("leak-me-please" not in logs.getvalue(), "and the error's body is not logged")
+    finally:
+        mcp.close()
+
+
 # --- re-mint on 401 and on an auth envelope -------------------------------------
 with FakeBroker(base_path="") as broker:
     mcp = Mcp()
