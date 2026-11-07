@@ -148,11 +148,21 @@ def attested_tier(raw: str) -> str:
     may guess at, and that is not a hypothetical: sutando writes
     `access_tier: team` on a task from a negotiated collaborator, and it arrives
     here. It is read as `guest`, like everything else that is not `owner` —
-    read-only under codex and refused under ACP. The demotion is deliberate and
+    read-only under codex and refused under ACP unless the owner lists the
+    sender (`attested_collaborator`, `AGENT_CONNECT_ACP_COLLABORATORS`). The demotion is deliberate and
     recorded in `docs/adr/0003`; a tier this side cannot verify is a tier this
     side does not get to interpret.
     """
     return OWNER if (raw or "").strip() == OWNER else GUEST
+
+
+def attested_collaborator(task) -> bool:
+    """Team with the exact boolean `collaborator: true`, as the broker sent it."""
+    return requested_tier(task) == "team" and getattr(task, "collaborator", False) is True
+
+
+def requested_tier(task) -> str:
+    return (getattr(task, "requested_access_tier", "") or "").strip()
 
 
 def task_attachments(task) -> Tuple[Attachment, ...]:
@@ -233,6 +243,8 @@ def turn_context(task, repo: str) -> TurnContext:
         room=task.room_id,
         room_name=task.room_name,
         access_tier=tier,
+        requested_access_tier=requested_tier(task),
+        collaborator=attested_collaborator(task),
         sender_name=task.sender_name,
         user_id=task.user_id,
         source_message_id=task.source_message_id,

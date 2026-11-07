@@ -50,3 +50,30 @@ honest onboarding promise.
 - The broker's `WORKER-PROTOCOL.md` remains the single normative description of the
   wire field; no mirrored ADR on the backend.
 - Cutover is atomic — the broker has always sent the field; no compatibility shim.
+
+## Amendment: listed Team collaborators under ACP
+
+The broker sends Team as `access_tier: guest` with `requested_access_tier: team` and
+`collaborator: true`. In a private room with no Agent Native card this is the default
+for every member, so the flag alone cannot mean "the owner chose this sender".
+
+The ACP adapter therefore admits a non-owner only when both hold:
+
+- the broker attested `requested_access_tier: team` and the exact boolean
+  `collaborator: true`; and
+- the sender's Matrix id is in the Worker's `AGENT_CONNECT_ACP_COLLABORATORS`.
+
+The list can only narrow what the room grants, never widen it, so the rule above
+(local settings lower, never raise) still holds. The list narrows **who** is admitted,
+not **what** they can do: once admitted, a sender has the agent's normal capabilities.
+agent-connect cannot confine an ACP agent, so a narrower tool policy for collaborators
+is the agent's to enforce. To let it, the Worker sends `_meta["ag2/requester"]` on
+`session/new` and every `session/prompt`: `user_id`, `access_tier`,
+`requested_access_tier`, `collaborator` and `admitted_as` (`owner` or `collaborator`),
+all from the broker's attestation and never from message text. Each collaborator gets
+a Session per (room, sender), so collaborators never share history with each other or
+with the owner. Separate history does not separate files, memory or credentials.
+agent-connect does not implement the room's sensitive data filter, and a listed
+sender's results are not scanned. Everyone else is refused as
+before. This matches sparrow's per-adapter `--allow-collaborator` opt-in, narrowed to
+named senders because the room default cannot be told apart from an owner's choice.

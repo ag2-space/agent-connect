@@ -12,7 +12,9 @@ ACP has no such thing. The Local Agent performs its own file access and the only
 lever left is answering its `session/request_permission` calls by policy — which
 binds an agent that asks and does nothing whatsoever to one that does not.
 Rather than ship a cooperative imitation of a guarantee that used to be real,
-a guest's Task is refused at the top of `turn` and never reaches ACP. It is
+a guest's Task is refused at the top of `turn` and never reaches ACP. The one
+exception is a sender the owner lists in `AGENT_CONNECT_ACP_COLLABORATORS`, and
+only where the broker attested Team with `collaborator: true`. It is
 refused **out loud**: the refusal is the Turn's answer, so it climbs the Ladder
 like any other and the room reads a sentence rather than watching a placeholder
 that never resolves. Silence is indistinguishable from breakage, and a guest who
@@ -20,9 +22,10 @@ cannot tell the two apart reports the wrong bug.
 
 That refusal is in exactly one place, deliberately: lifting it later (once there
 is real confinement around the bridge process) is a single change, and there is
-no second path into this Adapter that could forget it. It reads `ctx.access_tier`
-and nothing else — the tier the broker attested, settled by the Worker into
-`owner` or `guest` before the Turn was built (`docs/adr/0003`) and not something
+no second path into this Adapter that could forget it (`admitted`). It reads
+`ctx.access_tier`, `ctx.collaborator` and `ctx.user_id`, all as the broker
+attested them and settled by the Worker before the Turn was built
+(`docs/adr/0003`), and not something
 the sender can write: a duplicated `access_tier` header already fails closed.
 
 **Naming an agent is enough; a command is always allowed to win.** The ordinary
@@ -118,7 +121,7 @@ import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from typing import AsyncIterator, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from .. import attachments as att
@@ -178,6 +181,8 @@ ALLOW_REMOTE_ENV = "AGENT_CONNECT_ACP_ALLOW_REMOTE"
 #: The directory to open Sessions in on the *dialled* Agent's machine.
 REMOTE_CWD_ENV = "AGENT_CONNECT_ACP_REMOTE_CWD"
 SKIP_AUTH_ENV = "AGENT_CONNECT_ACP_SKIP_AUTH_CHECK"
+#: Senders the owner lets use this agent where the room grants them Team.
+COLLABORATORS_ENV = "AGENT_CONNECT_ACP_COLLABORATORS"
 TIMEOUT_ENV = "AGENT_CONNECT_TURN_TIMEOUT"
 
 #: How long one Turn may run before it is cancelled through the protocol. Ten
@@ -323,12 +328,28 @@ REFUSAL = (
     "registered the agent.\n\n"
     "Nothing is wrong with your message. My owner can `trust` you, and then I "
     "will answer it — but that grants owner tier, which is their own level of "
-    "access on every agent they own, not a guest pass to this room.\n\n"
+    "access on every agent they own, not a guest pass to this room. Where this "
+    "room gives you Team access, my owner can instead allow you on this agent "
+    "alone.\n\n"
     "Where it has to be said: in a direct message to the concierge, "
     "`{concierge}`. Sent anywhere else, `trust @user` is not a command at all — "
     "in this room, or in a direct message to me, I read it as an ordinary "
     "question and answer it as one."
 )
+
+
+def allowed_collaborators(env: Optional[Mapping[str, str]] = None) -> frozenset:
+    """The Matrix ids in `AGENT_CONNECT_ACP_COLLABORATORS`, comma or space separated."""
+    env = os.environ if env is None else env
+    raw = (env.get(COLLABORATORS_ENV) or "").replace(",", " ")
+    return frozenset(item for item in raw.split() if item.startswith("@"))
+
+
+def admitted(ctx: TurnContext, env: Optional[Mapping[str, str]] = None) -> bool:
+    """Owner, or a listed sender the room granted Team with collaborator."""
+    if ctx.access_tier == OWNER:
+        return True
+    return ctx.collaborator and bool(ctx.user_id) and ctx.user_id in allowed_collaborators(env)
 
 
 def refusal(ctx: TurnContext) -> str:
@@ -571,6 +592,24 @@ def destination_meta(ctx: TurnContext) -> dict:
             "chat_id": ctx.room,
             "room_name": ctx.room_name,
             "access_tier": ctx.access_tier,
+        }
+    }
+
+
+#: The `_meta` key on `session/new` and every `session/prompt` saying who asked.
+#: Set by the Worker from the broker's attestation, never from message text.
+REQUESTER_META_KEY = "ag2/requester"
+
+
+def requester_meta(ctx: TurnContext) -> dict:
+    """Who this Turn is for and why it was admitted (`admitted`)."""
+    return {
+        REQUESTER_META_KEY: {
+            "user_id": ctx.user_id,
+            "access_tier": ctx.access_tier,
+            "requested_access_tier": ctx.requested_access_tier,
+            "collaborator": ctx.collaborator,
+            "admitted_as": "owner" if ctx.access_tier == OWNER else "collaborator",
         }
     }
 
@@ -1184,7 +1223,7 @@ class AcpAdapter:
     async def turn(self, ctx: TurnContext) -> AsyncIterator[TurnEvent]:
         """One Turn: refuse, or run it over ACP and report what happened."""
         # --- the whole non-owner restriction, in one place -----------------
-        if ctx.access_tier != OWNER:
+        if not admitted(ctx):
             yield Done(reason=REFUSED, text=refusal(ctx))
             return
 
@@ -1323,7 +1362,7 @@ class AcpAdapter:
                             )
                     if not session_id:
                         session_id = await client.new_session(
-                            cwd=session_cwd, meta=destination_meta(ctx)
+                            cwd=session_cwd, meta={**destination_meta(ctx), **requester_meta(ctx)}
                         )
                         turns = 0
                     mode = self.mode()
@@ -1352,7 +1391,7 @@ class AcpAdapter:
                 blocks, problems = prompt_blocks(ctx, agent, att.max_bytes())
                 if problems:
                     queue.put_nowait(Notice(text=unread_notice(problems, agent)))
-                return await client.prompt(session_id, blocks)
+                return await client.prompt(session_id, blocks, meta=requester_meta(ctx))
 
         seconds = self.timeout()
         work = asyncio.ensure_future(run())
