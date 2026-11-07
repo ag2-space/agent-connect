@@ -195,10 +195,13 @@ try:
     got.clear()
     asyncio.run(relay._on_notification(Notification(NOTIFY_METHOD, {
         "destination": "!dm:s.space", "text": "key ghp_" + "a" * 36})))
-    check(got == [], "with collaborators listed, a notification carrying a secret is withheld")
+    from agent_connect.adapters.acp import NOTIFY_WITHHELD
+    check(got == [NOTIFY_WITHHELD],
+          "with collaborators listed, a notification carrying a secret is withheld, and the room told")
+    got.clear()
     asyncio.run(relay._on_notification(Notification(NOTIFY_METHOD, {
         "destination": "!elsewhere:s.space", "text": "done"})))
-    check(got == [], "and one to a room with no owner Session is withheld")
+    check(got == [], "and one to a room with no owner Session is withheld silently")
     asyncio.run(relay._on_notification(Notification(NOTIFY_METHOD, {
         "destination": "!dm:s.space", "text": "nightly build passed"})))
     check(got == ["nightly build passed"], "while a clean one to an owner room is posted")
@@ -208,6 +211,13 @@ got.clear()
 asyncio.run(relay._on_notification(Notification(NOTIFY_METHOD, {
     "destination": "!elsewhere:s.space", "text": "key ghp_" + "a" * 36})))
 check(len(got) == 1, "with no collaborators listed, notify is unchanged")
+
+with tempfile.TemporaryDirectory() as tmp:
+    owned = AcpAdapter(command=["true"], store=SessionStore(Path(tmp) / "s.json"))
+    owned.store().remember(("!owned:s.space", "owner"), "sess-1", tmp, 1)
+    owned.store().remember(("!r:s.space", f"collaborator:{AGENT}"), "sess-2", tmp, 1)
+    check(owned.owner_rooms() == {"!owned:s.space"},
+          "owner rooms come from the Session map's owner keys only")
 
 # --- card guards cannot collide across Sessions -------------------------------
 from agent_connect import hitl_seam

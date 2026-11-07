@@ -345,7 +345,15 @@ def allowed_collaborators(env: Optional[Mapping[str, str]] = None) -> frozenset:
     """The Matrix ids in `AGENT_CONNECT_ACP_COLLABORATORS`, comma or space separated."""
     env = os.environ if env is None else env
     raw = (env.get(COLLABORATORS_ENV) or "").replace(",", " ")
+    for item in raw.split():
+        if not item.startswith("@") and item not in _REPORTED_ENTRIES:
+            _REPORTED_ENTRIES.add(item)
+            print(f"agent-connect: ignoring {COLLABORATORS_ENV} entry {item!r}: "
+                  f"not a Matrix id", file=sys.stderr)
     return frozenset(item for item in raw.split() if item.startswith("@"))
+
+
+_REPORTED_ENTRIES: set = set()
 
 
 def admitted(ctx: TurnContext, env: Optional[Mapping[str, str]] = None) -> bool:
@@ -353,6 +361,12 @@ def admitted(ctx: TurnContext, env: Optional[Mapping[str, str]] = None) -> bool:
     if ctx.access_tier == OWNER:
         return True
     return ctx.collaborator and bool(ctx.user_id) and ctx.user_id in allowed_collaborators(env)
+
+
+def _logged(exc) -> str:
+    """Write an error to the Worker log and say so, for a room that must not see it."""
+    print(f"agent-connect: could not restore a collaborator's Session: {exc}", file=sys.stderr)
+    return "details are in the Worker log"
 
 
 def refusal(ctx: TurnContext) -> str:
@@ -602,6 +616,10 @@ def destination_meta(ctx: TurnContext) -> dict:
         }
     }
 
+
+#: Posted in place of an unsolicited message the collaborator check held.
+NOTIFY_WITHHELD = ("🔒 agent-connect: a message from the agent was withheld because it may "
+                   "contain sensitive data. The Worker log has the reason.")
 
 #: The `_meta` key on `session/new` and every `session/prompt` saying who asked.
 #: Set by the Worker from the broker's attestation, never from message text.
@@ -1067,18 +1085,29 @@ class AcpAdapter:
         return {room for room, tier in keys if tier == OWNER} | self._owner_rooms
 
     async def _on_notification(self, notification) -> None:
+        message = room_message(notification)
+        if message is not None:
+            await self.post_unasked(*message)
+
+    async def post_unasked(self, destination: str, text: str) -> None:
+        """Post what the agent said unasked, on a Turn's dial or the Listener Link.
+
+        While collaborators are listed, the Turn that caused it is unknowable, so
+        it is checked like a collaborator's reply and may only go to a room with an
+        owner Session. A held one is logged, and its room, if an owner room, is
+        told that something was withheld."""
         if self._notifier is None:
             return
-        message = room_message(notification)
-        if message is None:
-            return
         if allowed_collaborators():
-            held = result_guard.notify_verdict(message[1], message[0], self.owner_rooms())
+            rooms = self.owner_rooms()
+            held = result_guard.notify_verdict(text, destination, rooms)
             if held.hold:
-                print(f"agent-connect: withheld a notification to {message[0]}: "
+                print(f"agent-connect: withheld a notification to {destination}: "
                       f"it contained {', '.join(held.why)}", file=sys.stderr)
+                if destination in rooms:
+                    await self._notifier(destination, NOTIFY_WITHHELD)
                 return
-        await self._notifier(*message)
+        await self._notifier(destination, text)
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<AcpAdapter {self._url or self._command or 'from ' + COMMAND_ENV}>"
@@ -1398,7 +1427,7 @@ class AcpAdapter:
                                 Notice(text=RESET.format(
                                     why=WHY_REFUSED.format(
                                         detail=exc if ctx.access_tier == OWNER
-                                        else "details are in the Worker log")))
+                                        else _logged(exc))))
                             )
                     if not session_id:
                         session_id = await client.new_session(

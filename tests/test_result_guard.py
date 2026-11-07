@@ -9,7 +9,11 @@ from pathlib import Path
 
 from agent_connect import hitl_seam, result_guard
 from agent_connect.events import Done, MessageChunk, TurnContext
+from types import SimpleNamespace
+
 from agent_connect.reporter import HELD, TurnReporter
+
+NS_REQ = SimpleNamespace(tool_call={"toolCallId": "t1", "title": "x"}, options=[])
 
 fails = 0
 
@@ -211,7 +215,7 @@ check("GitHub token" in result_guard.secret_types("ghp_" + "a" * 10 + "\u200b" +
       "a zero-width space inside a token does not hide it")
 
 
-async def stale_release():
+async def stale_release(task_id="t1"):
     with tempfile.TemporaryDirectory() as tmp:
         ws = Path(tmp)
         os.environ[hitl_seam.WORKSPACE_ENV] = str(ws)
@@ -228,15 +232,43 @@ async def stale_release():
                     "chosen_action": result_guard.RELEASE, "status": "in_progress"}}))
 
             clicker = asyncio.create_task(click_first())
-            first = await result_guard.ask_owner(ctx(), ("a possible GitHub token",), timeout=3, poll=0.01)
+            first = await result_guard.ask_owner(ctx(task_id=task_id), ("a possible GitHub token",),
+                                                 timeout=3, poll=0.01)
             await clicker
-            second = await result_guard.ask_owner(ctx(), ("a redirect to another room",), timeout=0.2, poll=0.01)
+            second = await result_guard.ask_owner(ctx(task_id=task_id), ("a redirect to another room",),
+                                                  timeout=0.2, poll=0.01)
             return first, second
         finally:
             os.environ.pop(hitl_seam.WORKSPACE_ENV, None)
 
 first, second = asyncio.run(stale_release())
 check(first and not second, "a release answers only its own card, never a later ask for the same Task")
+first, second = asyncio.run(stale_release("0b8e3a52-7d3f-4c2a-9f1e-6a5b4c3d2e1f" * 2))
+check(first and not second, "and so with a long task id, where only the digest tells asks apart")
+
+for value in ("0", "false", "2", "y", "enable", "@a:b", "\uff11", "1\u200b"):
+    check(result_guard.verdict(ctx(), SAMPLES["GitHub token"],
+                               env={result_guard.UNCHECKED_ENV: value}).hold,
+          f"an opt-out value of {value!r} keeps the check on")
+check(not result_guard.verdict(ctx(), SAMPLES["GitHub token"],
+                               env={result_guard.UNCHECKED_ENV: "yes"}).hold, "'yes' turns it off")
+check("a'b" in result_guard.asked_by(ctx(sender_name='a"b')), "a quote in a display name is replaced")
+card = hitl_seam.event_for(NS_REQ, "s", "x\u202ey")
+check("\u202e" not in card["prompt"], "the card strips a bidi override itself")
+check(result_guard.notify_verdict("[channel: !x:s.space]\nhi", "!r:s.space", {"!r:s.space"},
+                                  env={result_guard.UNCHECKED_ENV: "1"}).hold,
+      "a redirected notification is held even with scanning off")
+
+
+async def no_placeholder():
+    os.environ[hitl_seam.TIMEOUT_ENV] = "0"
+    try:
+        return await TurnReporter(None).run(Adapter(secret_reply), ctx())
+    finally:
+        os.environ.pop(hitl_seam.TIMEOUT_ENV, None)
+
+body = asyncio.run(no_placeholder())
+check(SAMPLES["GitHub token"] not in body, "with no Room Ops the reply is still withheld, without error")
 
 if fails:
     raise SystemExit(f"FAIL — {fails} check(s)")

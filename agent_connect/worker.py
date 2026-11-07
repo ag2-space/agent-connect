@@ -518,8 +518,10 @@ def start_listener_link(adapter, ops) -> Optional[asyncio.Task]:
         return None
     from .link import keep_link
 
+    # The adapter's own entry point, so the link gets the same collaborator check.
+    gated = getattr(adapter, "post_unasked", post)
     return asyncio.ensure_future(
-        keep_link(endpoint.url, post, token=endpoint.token,
+        keep_link(endpoint.url, gated, token=endpoint.token,
                   cookie_store=getattr(adapter, "_cookies", None))
     )
 

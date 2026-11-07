@@ -12,6 +12,7 @@ from __future__ import annotations
 import _bootstrap  # noqa: F401 — puts the repo root on sys.path
 import asyncio
 import contextlib
+import os
 import json
 import sys
 import tempfile
@@ -320,6 +321,50 @@ async def _a_turn_with_a_notifier_is_a_receiver():
 
 check(run(_a_turn_with_a_notifier_is_a_receiver()) is True,
       "and a Turn's dial asks for the queue once the notifier is installed")
+
+# --- with collaborators listed, the standing link is checked too -------------
+from agent_connect.adapters.acp import COLLABORATORS_ENV, NOTIFY_WITHHELD  # noqa: E402
+
+TOKEN = "ghp_" + "a" * 36
+GATED = {"turns": [], "notify": [
+    {"destination": "!elsewhere:example", "text": "creds: " + TOKEN},
+    {"destination": ROOM, "text": "creds: " + TOKEN},
+    {"destination": ROOM, "text": "✅ nightly: done"},
+]}
+
+
+async def _link_with_collaborators():
+    with tempfile.TemporaryDirectory() as tmp:
+        async with Door(GATED) as door:
+            adapter = AcpAdapter(url=door.url, token=door.token,
+                                 store=SessionStore(Path(tmp) / "sessions.json"))
+            adapter._owner_rooms.add(ROOM)  # noqa: SLF001 — an owner Turn ran here
+            posted = []
+
+            class Ops:
+                async def message(self, room, text, mentions=None):
+                    posted.append((room, text))
+
+            link = worker.start_listener_link(adapter, Ops())
+            arrived = await until(lambda: len(posted) >= 2)
+            await asyncio.sleep(0.2)
+            link.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await link
+            return posted, arrived
+
+
+os.environ[COLLABORATORS_ENV] = "@cc:example"
+try:
+    posted, arrived = run(_link_with_collaborators())
+finally:
+    os.environ.pop(COLLABORATORS_ENV, None)
+check(arrived and not any(TOKEN in text for _, text in posted),
+      "with collaborators listed, a token queued for the standing link is never posted")
+check(not any(room == "!elsewhere:example" for room, _ in posted),
+      "nor is anything sent to a room with no owner Session")
+check((ROOM, NOTIFY_WITHHELD) in posted, "the owner room is told something was withheld")
+check((ROOM, "✅ nightly: done") in posted, "and a clean message to an owner room still posts")
 
 print()
 if fails:
