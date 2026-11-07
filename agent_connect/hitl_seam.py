@@ -102,27 +102,36 @@ def guard_for(request: Any, session: str = "") -> str:
     return f"acp:{_safe(session)}:{ident}"
 
 
-def event_for(request: Any, session: str) -> dict:
+def event_for(request: Any, session: str, asked_by: str = "") -> dict:
+    """The card. `asked_by` names a non-owner requester, so the owner never
+    approves a collaborator's request believing it is their own."""
     tc = _tool_call_dict(request.tool_call)
     title = str(tc.get("title") or tc.get("kind") or "tool call")
+    asked_by = " ".join(asked_by.split())
     options = []
     for o in request.options or []:
         oid = _option_id(o)
         if oid:
             options.append({"id": oid, "label": str(o.get("name") or oid), "kind": str(o.get("kind") or "")})
-    return {
+    prompt = f"Agent wants to {title}"
+    if asked_by:
+        prompt += f" (asked by {asked_by}, a collaborator, not you)"
+    event = {
         "schema": SCHEMA,
         "session": session,
         "socket": "",
         "runtime": RUNTIME,
         "kind": "permission",
-        "prompt": f"Agent wants to {title}",
+        "prompt": prompt,
         "guard": guard_for(request, session),
         "observed_ms": int(time.time() * 1000),
         # What is being asked, structurally: the Manager's policy reads `tool`.
         "subject": {"tool": str(tc.get("kind") or title), "input": json.dumps(tc.get("rawInput"), default=str)[:200]},
         "options": options,
     }
+    if asked_by:
+        event["asked_by"] = asked_by
+    return event
 
 
 def _write_atomic(path: Path, body: dict) -> None:
@@ -158,13 +167,14 @@ async def escalate(
     timeout: float = DEFAULT_TIMEOUT_S,
     poll: float = DEFAULT_POLL_S,
     sleep: Callable = asyncio.sleep,
+    asked_by: str = "",
 ) -> Optional[str]:
     """Post the requirement, wait for the human's option id; None on timeout.
 
     Always leaves a tombstone so the Manager closes the card whichever way
     this ends. The caller maps None onto the request's reject option.
     """
-    ev = event_for(request, session)
+    ev = event_for(request, session, asked_by)
     guard = ev["guard"]
     path = workspace / "state" / "hitl" / "events" / f"{_safe(session)}-{_safe(guard)}.json"
     _write_atomic(path, ev)

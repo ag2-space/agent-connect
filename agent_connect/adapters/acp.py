@@ -352,6 +352,14 @@ def admitted(ctx: TurnContext, env: Optional[Mapping[str, str]] = None) -> bool:
     return ctx.collaborator and bool(ctx.user_id) and ctx.user_id in allowed_collaborators(env)
 
 
+def asked_by(ctx: TurnContext) -> str:
+    """Who a non-owner Turn is for, as the owner should see it; `""` for the owner."""
+    if ctx.access_tier == OWNER:
+        return ""
+    name = " ".join(ctx.sender_name.split())
+    return f"{name} ({ctx.user_id})" if name and name != ctx.user_id else ctx.user_id
+
+
 def refusal(ctx: TurnContext) -> str:
     """`REFUSAL`, addressed to a recipient the reader can act on."""
     return REFUSAL.format(concierge=concierge_for(ctx))
@@ -1287,13 +1295,15 @@ class AcpAdapter:
                 return None
             decision = policy.decide(request)
             hitl_ws = hitl_seam.configured()
+            requester = asked_by(ctx)
+            who = {"asked_by": requester} if requester else {}
             if decision.allowed or hitl_ws is None:
                 queue.put_nowait(
                     PermissionAsked(
                         title=decision.title,
                         allowed=decision.allowed,
                         reason=decision.reason,
-                        detail={"paths": list(decision.paths)},
+                        detail={"paths": list(decision.paths), **who},
                     )
                 )
                 return decision.option_id
@@ -1302,7 +1312,8 @@ class AcpAdapter:
                 # The Policy could not allow it; the owner decides from a chat
                 # card. The core awaits this coroutine; a timeout is the reject.
                 chosen = await hitl_seam.escalate(
-                    request, session=key, workspace=hitl_ws, timeout=hitl_seam.timeout_s()
+                    request, session=key, workspace=hitl_ws, timeout=hitl_seam.timeout_s(),
+                    asked_by=requester,
                 )
                 allowed = chosen is not None and chosen != decision.option_id
                 queue.put_nowait(
@@ -1310,7 +1321,7 @@ class AcpAdapter:
                         title=decision.title,
                         allowed=allowed,
                         reason="owner allowed via card" if allowed else f"{decision.reason}; owner did not allow",
-                        detail={"paths": list(decision.paths), "hitl": True},
+                        detail={"paths": list(decision.paths), "hitl": True, **who},
                     )
                 )
                 return chosen if chosen is not None else decision.option_id

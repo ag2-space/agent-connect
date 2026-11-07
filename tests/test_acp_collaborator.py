@@ -139,6 +139,70 @@ with tempfile.TemporaryDirectory() as tmp:
     check(opened["o"][1]["_meta"][REQUESTER_META_KEY]["admitted_as"] == "owner",
           "the owner's prompt says owner")
 
+# --- an escalation card names a collaborator, and never the owner -----------
+from types import SimpleNamespace as NS
+
+from agent_connect import hitl_seam
+from agent_connect.adapters import acp as acp_module
+from agent_connect.events import PermissionAsked
+
+request = NS(tool_call={"toolCallId": "t1", "title": "write /etc/x"},
+             options=[{"optionId": "allow", "name": "Allow", "kind": "allow_once"}])
+card = hitl_seam.event_for(request, "s", "Bob\n(@bob:s.space)")
+check("asked by Bob (@bob:s.space), a collaborator" in card["prompt"] and "\n" not in card["prompt"],
+      "a card for a collaborator names them, on one line")
+check("asked by" not in hitl_seam.event_for(request, "s")["prompt"], "an owner's card names nobody")
+
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    repo = base / "repo"
+    repo.mkdir()
+    script = base / "script.json"
+    script.write_text(json.dumps({"defaultTurn": {"actions": [{
+        "type": "permission",
+        "toolCall": {"toolCallId": "t1", "title": "write /etc/x", "kind": "edit",
+                     "rawInput": {"path": "/etc/x"}, "locations": [{"path": "/etc/x"}]},
+        "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]}]}}))
+    adapter = AcpAdapter(command=[sys.executable, FAKE, str(script)],
+                         store=SessionStore(base / "sessions.json"))
+    cards = []
+
+    async def fake_escalate(request, *, asked_by="", **_):
+        cards.append(hitl_seam.event_for(request, "s", asked_by)["prompt"])
+        return None
+
+    real_escalate = acp_module.hitl_seam.escalate
+    acp_module.hitl_seam.escalate = fake_escalate
+    os.environ[hitl_seam.WORKSPACE_ENV] = str(base / "hitl")
+    os.environ[COLLABORATORS_ENV] = AGENT
+    try:
+        def run_turn(c):
+            async def go():
+                return [e async for e in adapter.turn(c)]
+            return asyncio.run(asyncio.wait_for(go(), timeout=30))
+
+        collab = run_turn(TurnContext(prompt="hi", room="!r:s.space", cwd=str(repo),
+                                      access_tier=GUEST, requested_access_tier="team",
+                                      collaborator=True, user_id=AGENT, sender_name="cc-backend"))
+        owner = run_turn(TurnContext(prompt="hi", room="!r:s.space", cwd=str(repo),
+                                     access_tier=OWNER, user_id="@mark:s.space"))
+    finally:
+        acp_module.hitl_seam.escalate = real_escalate
+        os.environ.pop(hitl_seam.WORKSPACE_ENV, None)
+        os.environ.pop(COLLABORATORS_ENV, None)
+
+    check(len(cards) == 2, f"both out-of-directory writes were escalated ({len(cards)})")
+    check(bool(cards) and f"asked by cc-backend ({AGENT}), a collaborator" in cards[0],
+          "the collaborator's escalation card names them")
+    check(len(cards) == 2 and "asked by" not in cards[1], "the owner's does not")
+    asks = [e for e in collab if isinstance(e, PermissionAsked)]
+    check(bool(asks) and asks[0].detail.get("asked_by") == f"cc-backend ({AGENT})",
+          "and the collaborator's PermissionAsked carries who asked")
+    owner_asks = [e for e in owner if isinstance(e, PermissionAsked)]
+    check(bool(owner_asks) and "asked_by" not in owner_asks[0].detail,
+          "the owner's PermissionAsked does not")
+
 if fails:
     raise SystemExit(f"FAIL — {fails} check(s)")
 print("PASS — ACP collaborator admission")
