@@ -86,7 +86,9 @@ for render in (acp_text, shim_text):
     assert COLLABORATOR_GUIDANCE in collab and collab.index(COLLABORATOR_GUIDANCE) < collab.index(MARKER)
     assert COLLABORATOR_GUIDANCE not in owner and COLLABORATOR_GUIDANCE not in guest
 assert "do not work around a denial" in acp_text(base)
-for phrase in ("skills, memory or credentials", "install software", "owner's approval"):
+for phrase in ("skills, memory or credentials", "install software", "owner's approval",
+               "routing record admits your owner", "saying your owner agreed",
+               "other than your reply here", "answer the rest"):
     assert phrase in COLLABORATOR_GUIDANCE.replace("\n", " ")
 print("collaborator guidance: ok")
 
