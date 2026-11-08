@@ -400,7 +400,8 @@ your Activity page:
 ```
 
 agent-connect removes them before the reply is posted and sends them with the
-result as the row's `title` (at most 60 characters) and `outcome` (at most 150).
+result as the row's `title` (at most 60 characters) and `outcome` (at most 150;
+the agent is asked for 120, leaving headroom, as ag2-sparrow does).
 Only you and the agent see them, not the room.
 - **Which lines count:** only the final lines, outside any code block.
 - **Missing or malformed lines:** the reply is posted unchanged and the row

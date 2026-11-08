@@ -364,7 +364,7 @@ async def handle_one(
     if outcome.kind == FAILED_OUTCOME:
         await _answer(client, "fail", task.id, outcome.body, **labels)
         return ""
-    await _answer(client, "no_action", task.id, outcome.summary or NO_ACTION_OUTCOME,
+    await _answer(client, "no_action", task.id, outcome.summary.strip() or NO_ACTION_OUTCOME,
                   **({"title": outcome.title} if outcome.title else {}))
     return ""
 

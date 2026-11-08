@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ag2_relay_client.client import OUTCOME_MAX, TITLE_MAX, clean_label
+
 TITLE_TAG = "[activity:title]"
 OUTCOME_TAG = "[activity:outcome]"
 META_KEY = "ag2/activity"
@@ -38,28 +40,41 @@ class Labels:
 def split(text: str) -> "tuple[str, Labels]":
     """The reply without its trailer, and the labels the trailer carried.
 
-    Only the final lines count: one title and one outcome, in either order,
-    adjacent, after any trailing blank lines, and not inside an open code block.
-    Anything else leaves the text untouched and returns no labels.
+    The trailer is the run of final lines that are each a title line, an
+    outcome line or blank, outside any open code block. It is removed whole or
+    not at all. A repeated tag is consumed; its last line wins.
     """
     if not text:
         return text or "", Labels()
-    lines = text.rstrip().split("\n")
+    lines = text.split("\n")
     found: dict = {}
     cut = len(lines)
-    while cut > 0 and len(found) < 2:
+    while cut > 0:
         line = lines[cut - 1].strip()
+        if not line:
+            cut -= 1
+            continue
         tag = next((t for t in (TITLE_TAG, OUTCOME_TAG) if line.startswith(t)), None)
-        if tag is None or tag in found:
+        if tag is None:
             break
-        found[tag] = line[len(tag):].strip()
+        found.setdefault(tag, line[len(tag):].lstrip(" :").strip())
         cut -= 1
-    if not found:
+    if not found or _in_fence(lines[:cut]):
         return text, Labels()
-    head = lines[:cut]
-    if sum(1 for ln in head if ln.strip().startswith(_FENCE)) % 2:
-        return text, Labels()
-    return "\n".join(head).rstrip(), Labels(found.get(TITLE_TAG, ""), found.get(OUTCOME_TAG, ""))
+    return "\n".join(lines[:cut]).rstrip(), Labels(found.get(TITLE_TAG, ""), found.get(OUTCOME_TAG, ""))
+
+
+def _in_fence(lines) -> bool:
+    """Whether a code block opened in `lines` is still open at their end."""
+    open_fence = ""
+    for line in lines:
+        s = line.strip()
+        if open_fence:
+            if s.startswith(open_fence):
+                open_fence = ""
+        elif s.startswith(_FENCE):
+            open_fence = s[:3]
+    return bool(open_fence)
 
 
 def from_meta(meta: Any) -> Labels:
@@ -70,8 +85,8 @@ def from_meta(meta: Any) -> Labels:
     if not isinstance(got, dict):
         return Labels()
     title, outcome = got.get("title"), got.get("outcome")
-    return Labels(title if isinstance(title, str) else "",
-                  outcome if isinstance(outcome, str) else "")
+    return Labels(title.strip() if isinstance(title, str) else "",
+                  outcome.strip() if isinstance(outcome, str) else "")
 
 
 def pick(meta: Labels, trailer: Labels) -> Labels:
@@ -80,10 +95,15 @@ def pick(meta: Labels, trailer: Labels) -> Labels:
 
 
 def guarded(ctx, labels: Labels, verdict) -> Labels:
-    """Drop any label the reply guard would hold for this requester."""
-    def ok(value: str) -> str:
+    """The labels as they will be sent, minus any the reply guard would hold.
+
+    Cleaned first, so the guard checks the exact string that leaves: a control
+    character cannot split a secret past the scan and then be removed.
+    """
+    def ok(value: str, limit: int) -> str:
+        value = clean_label(value, limit)
         return value if value and not verdict(ctx, value).hold else ""
-    return Labels(ok(labels.title), ok(labels.outcome))
+    return Labels(ok(labels.title, TITLE_MAX), ok(labels.outcome, OUTCOME_MAX))
 
 
 __all__ = ["INSTRUCTION", "Labels", "split", "from_meta", "pick", "guarded",

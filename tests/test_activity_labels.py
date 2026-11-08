@@ -47,16 +47,33 @@ check(activity.split(text) == (text, activity.Labels()), "inside an open code bl
 text = "[activity:title] a\nmiddle\n[activity:title] b"
 body, labels = activity.split(text)
 check(labels.title == "b" and body == "[activity:title] a\nmiddle", "only the final lines count")
-text = "x\n[activity:title] a\n[activity:title] b"
+text = "x\n[activity:outcome] O\n[activity:title] t\n[activity:outcome] O2"
 body, labels = activity.split(text)
-check(labels.title == "b" and body == "x\n[activity:title] a", "a repeated tag stops the trailer")
+check(labels == activity.Labels("t", "O2") and body == "x",
+      "a repeated tag in the final run is consumed; its last line wins")
+body, labels = activity.split("x\r\n[activity:title] t\r\n[activity:outcome] o\r\n")
+check(body.rstrip() == "x" and labels == activity.Labels("t", "o"), "CRLF line endings work")
+body, labels = activity.split("x\n[activity:title]")
+check(body == "x" and not labels, "an empty trailer line is removed and yields no label")
 check(activity.split("no labels here") == ("no labels here", activity.Labels()), "no trailer, no change")
+body, labels = activity.split("NO_REPLY\n[activity:title] Ack\n\n[activity:outcome] Nothing to add.")
+check(body == "NO_REPLY" and labels == activity.Labels("Ack", "Nothing to add."),
+      "blank lines between trailer lines: the whole trailer is removed, so NO_REPLY stays exact")
+body, labels = activity.split("x\n\n[activity:title] t\n\n\n[activity:outcome] o\n\n")
+check(body == "x" and labels == activity.Labels("t", "o"), "any blank lines inside or after the trailer")
+text = "```\n~~~\n[activity:title] t"
+check(activity.split(text) == (text, activity.Labels()), "a ~~~ line inside a ``` block does not close it")
+body, labels = activity.split("```\ncode\n```\n[activity:title] t")
+check(body == "```\ncode\n```" and labels.title == "t", "a trailer after a closed block is read")
+check(activity.split("x\n[activity:title]: Fix it")[1].title == "Fix it", "a colon after the tag is dropped")
 
 print("-- meta --")
 check(activity.from_meta({"ag2/activity": {"title": "T", "outcome": 5}}) == activity.Labels("T", ""),
       "_meta labels are read; non-strings are ignored")
 check(activity.pick(activity.Labels("M", ""), activity.Labels("A", "B")) == activity.Labels("M", "B"),
       "meta wins field by field")
+check(activity.pick(activity.from_meta({"ag2/activity": {"title": "   "}}), activity.Labels("A", "")).title == "A",
+      "a blank _meta title does not hide the trailer's")
 
 
 class Scripted:
@@ -115,6 +132,15 @@ collab = ctx(access_tier="guest", requested_access_tier="team", collaborator=Tru
 out = run(*said(f"Fine.\n[activity:title] Leak {secret}\n[activity:outcome] ok"), c=collab)
 check(out.title == "" and out.summary == "ok" and out.body == "Fine.",
       "a collaborator's label the guard would hold is dropped; the rest is kept")
+for ctl in ("\x00", "\x1b", "\x7f", "\u200b"):
+    split_secret = "ghp_" + "a" * 18 + ctl + "a" * 18
+    out = run(*said(f"Fine.\n[activity:title] {split_secret}"), c=collab)
+    check(out.title == "", f"a secret split by {ctl!r} is checked as sent, and dropped")
+
+from agent_connect.events import TIMEOUT
+out = run(MessageChunk(text="Partial work."), Done(reason=TIMEOUT, text="Partial work." + TRAILER, note="ran out of time"))
+check(out.kind == ANSWERED and out.title == "Fix login redirect" and out.summary == "",
+      "a turn that stopped short with text keeps its title only")
 
 print("-- worker --")
 
@@ -135,6 +161,39 @@ check(client.no_actions == [("t-1", "The agent had nothing to add.")]
       "a no action without an outcome keeps the default outcome, with the title")
 client = handled(*said("plain"))
 check(client.labels == {}, "no trailer, no labels")
+client = handled(*said("NO_REPLY\n[activity:title] Ack\n[activity:outcome]    "))
+check(client.no_actions == [("t-1", "The agent had nothing to add.")],
+      "a blank outcome keeps the default no-action outcome")
+
+from ag2_relay_client.client import clean_label
+check(clean_label("Deploy \ud83d", 60) == "Deploy", "a lone surrogate is removed, so the journal can write it")
+
+print("-- ACP end to end --")
+import json, sys, tempfile
+from pathlib import Path
+try:
+    from agent_connect.adapters.acp import AcpAdapter
+    from agent_connect.sessions import SessionStore
+except ImportError:
+    AcpAdapter = None
+if AcpAdapter is None:
+    print("  skip the ACP SDK is not installed")
+else:
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        (base / "repo").mkdir()
+        script = base / "script.json"
+        script.write_text(json.dumps({"defaultTurn": {
+            "actions": [{"type": "message", "text": "Done.\n[activity:title] From trailer\n[activity:outcome] Trailer outcome."}],
+            "meta": {"ag2/activity": {"title": "From the host"}}}}))
+        adapter = AcpAdapter(command=[sys.executable, str(Path(__file__).parent / "fake_acp_agent.py"), str(script)],
+                             store=SessionStore(base / "sessions.json"))
+        client = FakeClient()
+        asyncio.run(asyncio.wait_for(handle_one(task("t-1", "do it", room=ROOM), adapter, str(base / "repo"),
+                                                client=client), timeout=30))
+        check(client.completed == [("t-1", "Done.")]
+              and client.labels.get("t-1") == ("From the host", "Trailer outcome."),
+              "a real ACP turn: _meta from the prompt response wins, the trailer fills the rest")
 
 print("-- framing --")
 check(activity.INSTRUCTION in routing_preamble(ctx()), "the framing asks for the two lines")

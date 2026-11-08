@@ -1584,12 +1584,13 @@ _ERROR_KEYS = ("error", "detail", "message", "reason", "title")
 
 
 def clean_label(text: Any, limit: int) -> str:
-    """One line of plain text, at most `limit` code points: control, format and
-    bidi characters removed, whitespace collapsed, cut with an ellipsis."""
+    """One line of plain text, at most `limit` code points: control, format,
+    bidi and lone surrogate characters removed, whitespace collapsed, cut with
+    an ellipsis."""
     if not isinstance(text, str):
         return ""
     kept = "".join(" " if ch.isspace() else ch for ch in text
-                   if ch.isspace() or unicodedata.category(ch) not in ("Cc", "Cf"))
+                   if ch.isspace() or unicodedata.category(ch) not in ("Cc", "Cf", "Cs"))
     line = " ".join(kept.split())
     if len(line) > limit:
         line = line[:limit - 1].rstrip() + "…"

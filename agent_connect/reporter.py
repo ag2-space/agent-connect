@@ -7,7 +7,8 @@ hands to the relay client:
 
 - `completed`: the answer is the result body, and the broker posts it once, as
   a reply to the request. The activity ledger records the task as responded.
-- `no_action`: the agent had nothing to say — no text, or exactly `NO_REPLY`.
+- `no_action`: the agent had nothing to say — no text, or `NO_REPLY` followed
+  only by its Activity lines (`agent_connect.activity`).
   Nothing is posted and nobody is mentioned; the ledger records no action.
 - `failed`: the Turn produced nothing and did not end normally. The broker
   posts its one failure notice; the diagnostics go to the archived result.
@@ -85,12 +86,14 @@ class Outcome:
     summary: str = ""
 
 
-def _labelled(outcome: Outcome, labels: "activity.Labels") -> Outcome:
-    """Attach the Activity labels. A failed Turn keeps its title only: the
-    agent's outcome line could claim a success that did not happen."""
+def _labelled(outcome: Outcome, labels: "activity.Labels", reason: str = COMPLETED) -> Outcome:
+    """Attach the Activity labels. A Turn that failed or did not end normally
+    (timeout, cancel, refusal, token limit) keeps its title only: the agent's
+    outcome line could claim a success that did not happen."""
     if not labels:
         return outcome
-    summary = "" if outcome.kind == FAILED_OUTCOME else labels.outcome
+    stopped_short = outcome.kind == FAILED_OUTCOME or reason not in NORMAL_REASONS
+    summary = "" if stopped_short else labels.outcome
     return replace(outcome, title=labels.title, summary=summary)
 
 
@@ -146,7 +149,7 @@ class TurnReporter:
             answer = ""
         note = done.note if done else ""
         reason = done.reason if done else COMPLETED
-        return _labelled(await self._finish_turn(ctx, answer, note, reason), labels)
+        return _labelled(await self._finish_turn(ctx, answer, note, reason), labels, reason)
 
     async def _finish_turn(self, ctx: TurnContext, answer: str, note: str, reason: str) -> Outcome:
         held = result_guard.verdict(ctx, f"{answer}\n{note}")
