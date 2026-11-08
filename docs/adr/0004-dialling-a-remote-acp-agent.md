@@ -96,7 +96,7 @@ allowance that lets the Ollama Adapter talk to a local model server. The fence's
 subject, the relay bearer, is excused nowhere.
 
 **Concurrent dialers are the door's business, not ours.** Refusing a second client would
-break the legitimate case of an editor and AG2 Space connected at once. Worth stating
+break the legitimate case of an editor and s.space connected at once. Worth stating
 because it is easy to get backwards: the interesting concurrency is not two Workers, it is
 *one*. Tasks are processed concurrently across rooms and serialised only within a Session,
 so a single Worker with two busy rooms already issues concurrent prompts. Over stdio each

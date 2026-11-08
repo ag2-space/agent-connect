@@ -51,7 +51,7 @@ from agent_connect.roomops import room_ops_for
 from agent_connect.sandbox import sandbox_preamble
 from agent_connect.worker import handle_one
 
-ROOM = "!room:ag2.space"
+ROOM = "!room:s.space"
 MEDIA = "/v1/rooms/" + urllib.parse.quote(ROOM, safe="") + "/media"
 
 fails = 0
@@ -132,7 +132,7 @@ class Wire:
             self._events += 1
             return {"event_id": f"$ev{self._events}"}
         if path.endswith("/media"):
-            return {"mxc": "mxc://ag2.space/upload"}
+            return {"mxc": "mxc://s.space/upload"}
         return {"ok": True}
 
 

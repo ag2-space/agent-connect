@@ -49,8 +49,8 @@ from agent_connect.reporter import (
 from _taskqueue import FakeClient, room_ops_at, task
 from agent_connect.worker import handle_one, process_one
 
-ROOM_A = "!alpha:ag2.space"
-ROOM_B = "!beta:ag2.space"
+ROOM_A = "!alpha:s.space"
+ROOM_B = "!beta:s.space"
 
 fails = 0
 

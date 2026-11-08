@@ -32,7 +32,7 @@ from ag2_relay_client.egress import EgressAllowlist
 from ag2_relay_client.roomops import RoomOps
 from ag2_relay_client.transport import AuthRejected, RelayHTTP
 
-ROOM = "!room:ag2.space"
+ROOM = "!room:s.space"
 MEDIA = "/v1/rooms/" + urllib.parse.quote(ROOM, safe="") + "/media"
 
 fails = 0
@@ -57,7 +57,7 @@ class Clock:
 
 # --- I3: there is no gateway in this module, and there never may be
 source = Path(roomops_module.__file__).read_text()
-check("chat.ag2.space" not in source and "https://" not in source.replace(
+check("chat.s.space" not in source and "chat.ag2.space" not in source and "https://" not in source.replace(
     "https://<broker", ""),
     "no base URL is compiled into roomops.py — it comes from the credential (I3)")
 
@@ -124,13 +124,13 @@ with FakeBroker() as broker:
 
     # --- mentions: a hand-typed mxid in body text does not notify anyone
     broker.on("POST", "/v1/room", json={"event_id": "$m"})
-    rooms.message(ROOM, "@alice:ag2.space have a look",
-                  mentions=["@alice:ag2.space", "not-an-mxid"])
+    rooms.message(ROOM, "@alice:s.space have a look",
+                  mentions=["@alice:s.space", "not-an-mxid"])
     sent = broker.took("POST", "/v1/room")[-1].json
-    check(sent.get("mentions") == ["@alice:ag2.space"],
+    check(sent.get("mentions") == ["@alice:s.space"],
           "mentions ride as full mxids, and a malformed one is dropped")
     broker.on("POST", "/v1/room", json={"event_id": "$m"})
-    rooms.message(ROOM, "everyone", mentions=[f"@u{n}:ag2.space" for n in range(14)])
+    rooms.message(ROOM, "everyone", mentions=[f"@u{n}:s.space" for n in range(14)])
     sent = broker.took("POST", "/v1/room")[-1].json
     check(len(sent.get("mentions", [])) == 10,
           "over the broker's cap of 10 the extras are dropped — a message that "
@@ -141,7 +141,7 @@ with FakeBroker() as broker:
 
     # --- a bad room id never becomes a request
     before = len(broker.requests)
-    check(rooms.message("room:ag2.space", "hi") is None, "a room id with no sigil is refused")
+    check(rooms.message("room:s.space", "hi") is None, "a room id with no sigil is refused")
     check(rooms.message("!bad/../room:x", "hi") is None,
           "and one carrying path separators is refused before it becomes a URL")
     check(len(broker.requests) == before, "neither one reached the wire")
@@ -229,9 +229,9 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     clock = Clock()
     rooms = RoomOps(http, allowlist=EgressAllowlist([root]), clock=clock)
 
-    broker.on("POST", MEDIA, json={"ok": True, "mxc": "mxc://ag2.space/abc"})
+    broker.on("POST", MEDIA, json={"ok": True, "mxc": "mxc://s.space/abc"})
     result = rooms.upload(ROOM, chart, caption="the chart")
-    check(result.ok and result.mxc == "mxc://ag2.space/abc", "an allowlisted file uploads")
+    check(result.ok and result.mxc == "mxc://s.space/abc", "an allowlisted file uploads")
     sent = broker.took("POST", MEDIA)[0].json
     check(base64.b64decode(sent["content_b64"]) == b"\x89PNG fake bytes",
           "the bytes that arrive are the bytes of the file that was judged")
@@ -337,7 +337,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
 
     http = RelayHTTP(TokenSource(token=f"{broker.url}|SECRET"))
     rooms = RoomOps(http, allowlist=EgressAllowlist([root]), clock=Clock())
-    broker.on("POST", MEDIA, json={"ok": True, "mxc": "mxc://ag2.space/abc"})
+    broker.on("POST", MEDIA, json={"ok": True, "mxc": "mxc://s.space/abc"})
 
     def stale_read(fd, size):
         raise OSError(errno.ESTALE, "Stale file handle")
@@ -424,12 +424,12 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     try:
         broker.on("POST", "/v1/room", json={"event_id": "$g"})
         rooms.message(ROOM, "hi",
-                      mentions=(m for m in ["@alice:ag2.space", "not-an-mxid"]))
+                      mentions=(m for m in ["@alice:s.space", "not-an-mxid"]))
     finally:
         room_log.removeHandler(caught)
         room_log.setLevel(was_level)
     sent = broker.took("POST", "/v1/room")[-1].json
-    check(sent.get("mentions") == ["@alice:ag2.space"],
+    check(sent.get("mentions") == ["@alice:s.space"],
           "a generator of mentions still notifies the right person")
     check(any("dropped 1 mention" in line for line in caught.lines),
           "and the drop is counted from a list, not walked out of an exhausted "

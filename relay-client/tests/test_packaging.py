@@ -92,7 +92,7 @@ for source in SOURCES:
     urls = [s for s in literals if re.search(r"https?://\S", s)]
     check(not urls, f"{source.name} compiles in no gateway URL" +
           (f" (found: {urls})" if urls else ""))
-    hosts = [s for s in literals if "ag2.space" in s]
+    hosts = [s for s in literals if "s.space" in s or "ag2.space" in s]
     check(not hosts, f"{source.name} names no deployment host")
 
 # --- the packaging metadata says what the docstring says

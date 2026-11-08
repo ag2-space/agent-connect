@@ -31,10 +31,10 @@ def check(cond, name):
 def task_dict(**over):
     base = {
         "id": "task-1755500000000",
-        "task": "[AG2Space @alice:ag2.space] what is the status?",
+        "task": "[AG2Space @alice:s.space] what is the status?",
         "source": "ag2space",
-        "channel_id": "!room:ag2.space",
-        "user_id": "@alice:ag2.space",
+        "channel_id": "!room:s.space",
+        "user_id": "@alice:s.space",
         "access_tier": "owner",
         "priority": "normal",
         "timestamp": "2026-08-20T10:00:00Z",
@@ -159,8 +159,8 @@ check(parse_task(None) is None, "and neither is nothing")
 full = parse_task(task_dict(
     room_name="The Room", sender_name="Alice", reply_to_event="$evt",
     reply_to_me=True, source_event_id="$evt", requested_access_tier="team"))
-check(full.room_id == "!room:ag2.space", "channel_id becomes the room the answer goes to")
-check(full.user_id == "@alice:ag2.space", "the attested sender rides along (G1)")
+check(full.room_id == "!room:s.space", "channel_id becomes the room the answer goes to")
+check(full.user_id == "@alice:s.space", "the attested sender rides along (G1)")
 check(full.source_message_id == "$evt",
       "source_event_id is read under the canonical name")
 check(parse_task(task_dict(source_message_id="$canon",
@@ -217,19 +217,19 @@ check(strip_room_ops_meta(many)[0] == "keep me and me",
 # nobody here — and the roster arrives in either of the two shapes the broker
 # has been seen to send it in.
 roomful = parse_task(task_dict(
-    addressed_to="@codex.agent:ag2.space", reply_to_sender="@bob:ag2.space",
-    room_members=["@alice:ag2.space", "@codex.agent:ag2.space", "@bob:ag2.space"],
+    addressed_to="@codex.agent:s.space", reply_to_sender="@bob:s.space",
+    room_members=["@alice:s.space", "@codex.agent:s.space", "@bob:s.space"],
     room_member_count=3))
-check(roomful.addressed_to == "@codex.agent:ag2.space", "addressed_to is delivered")
-check(roomful.reply_to_sender == "@bob:ag2.space", "and so is reply_to_sender")
-check(roomful.room_members == ("@alice:ag2.space", "@codex.agent:ag2.space",
-                               "@bob:ag2.space"),
+check(roomful.addressed_to == "@codex.agent:s.space", "addressed_to is delivered")
+check(roomful.reply_to_sender == "@bob:s.space", "and so is reply_to_sender")
+check(roomful.room_members == ("@alice:s.space", "@codex.agent:s.space",
+                               "@bob:s.space"),
       "a roster sent as a list arrives as a tuple of full mxids, in order")
 check(roomful.room_member_count == 3, "with the broker's count beside it")
 
 capped = parse_task(task_dict(
-    room_members="@alice:ag2.space, @bob:ag2.space (+3 more)", room_member_count=5))
-check(capped.room_members == ("@alice:ag2.space", "@bob:ag2.space"),
+    room_members="@alice:s.space, @bob:s.space (+3 more)", room_member_count=5))
+check(capped.room_members == ("@alice:s.space", "@bob:s.space"),
       "the capped string form names the members it names, and '+3 more' is prose")
 check(capped.room_member_count == 5,
       "and the count, not the list, says how big the room is")
@@ -240,14 +240,14 @@ check(bare.addressed_to == "" and bare.reply_to_sender == "",
 check(bare.room_members == () and bare.room_member_count == 0,
       "and an absent roster is empty with a count of zero, not a guess")
 
-check(parse_task(task_dict(room_members=["@alice:ag2.space", "alice", 7, None,
-                                          "@alice:ag2.space"])).room_members
-      == ("@alice:ag2.space",),
+check(parse_task(task_dict(room_members=["@alice:s.space", "alice", 7, None,
+                                          "@alice:s.space"])).room_members
+      == ("@alice:s.space",),
       "a list is kept to full mxids, each once — a bare name or a non-string "
       "is not a member")
-check(parse_task(task_dict(room_members={"@alice:ag2.space": True})).room_members == (),
+check(parse_task(task_dict(room_members={"@alice:s.space": True})).room_members == (),
       "a roster in a shape this client does not understand is empty")
-check(len(parse_task(task_dict(room_members=[f"@u{n}:ag2.space" for n in range(200)]))
+check(len(parse_task(task_dict(room_members=[f"@u{n}:s.space" for n in range(200)]))
           .room_members) == 64,
       "and an unbounded roster does not become an unbounded local one")
 for bogus in (3.0, True, -1, None, [3], 10 ** 7):
@@ -268,7 +268,7 @@ check(parse_task(task_dict(room_member_count="999999")).room_member_count == 999
       "the digit width and the numeric bound agree, as text and as an int")
 check(parse_task(task_dict(addressed_to={"id": "x"})).addressed_to == "",
       "an addressee that is not text is absent, not stringified")
-check(Task("task-1") != Task("task-1", room_members=("@alice:ag2.space",)),
+check(Task("task-1") != Task("task-1", room_members=("@alice:s.space",)),
       "the roster is part of what makes two Tasks equal")
 
 # --- the enrichment fields: carried across, never interpreted --------------
@@ -301,19 +301,19 @@ check(rich.session_scope == "room" and rich.interaction_type == "realtime_audio"
 # prove its own room; a consumer that read one without the other could put a
 # redirected answer inside a thread in a different room.
 threaded = parse_task(task_dict(
-    reply_to_event="$inner:ag2.space",
-    thread_root="$root:ag2.space",
-    source_room_id="!room:ag2.space",
+    reply_to_event="$inner:s.space",
+    thread_root="$root:s.space",
+    source_room_id="!room:s.space",
 ))
-check(threaded.thread_root == "$root:ag2.space"
-      and threaded.source_room_id == "!room:ag2.space",
+check(threaded.thread_root == "$root:s.space"
+      and threaded.source_room_id == "!room:s.space",
       "an in-thread ask carries the thread root and the room it lives in")
-check(threaded.reply_to_event == "$inner:ag2.space"
+check(threaded.reply_to_event == "$inner:s.space"
       and threaded.thread_root != threaded.reply_to_event,
       "distinct from the reply target: a reply inside a thread names both")
-check(parse_task(task_dict(thread_root={"event_id": "$root:ag2.space"})).thread_root == "",
+check(parse_task(task_dict(thread_root={"event_id": "$root:s.space"})).thread_root == "",
       "a shape that is not a string is absent, not str()'d into a header")
-check(parse_task(task_dict(thread_root="$root\x00:ag2.space")).thread_root == "$root:ag2.space",
+check(parse_task(task_dict(thread_root="$root\x00:s.space")).thread_root == "$root:s.space",
       "and a control character does not travel inside an event id")
 
 # No vocabulary is enforced here. `interaction_type` HAS one — in the consumer,
@@ -355,7 +355,7 @@ check(parse_task(task_dict(platform_card="a string")).platform_card is None,
 # field, unknown fields ignored.
 check(parse_task(task_dict(lease_id="l-9", some_future_field={"x": 1})) is not None,
       "an unknown field still does not break a running client (G3)")
-check(Task("task-1") != Task("task-1", thread_root="$root:ag2.space"),
+check(Task("task-1") != Task("task-1", thread_root="$root:s.space"),
       "the enrichment fields are part of what makes two Tasks equal")
 
 

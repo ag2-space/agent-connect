@@ -107,7 +107,8 @@ AUTH_NEEDLES = ("Bearer ", "Authorization")
 #: Substrings that have no business in a string this package evaluates —
 #: anywhere, Adapters included.
 FORBIDDEN_TEXT = {
-    "ag2.space": "the relay's own host, compiled in (I3)",
+    "chat.s.space": "the relay's own host, compiled in (I3)",
+    "ag2.space": "the relay's former host, compiled in (I3)",
     "ag2space": "the relay's own host, compiled in (I3)",
     "/v1/": "a relay endpoint path, spoken outside the library",
     "Bearer ": "a bearer header assembled outside the library",

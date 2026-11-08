@@ -1,9 +1,9 @@
 # agent-connect
 
-**Connect your own local agent (Codex, Hermes, …) to AG2 Space.**
+**Connect your own local agent (Codex, Hermes, …) to s.space.**
 
 You run a coding/agent CLI locally (with your own creds and your own repos).
-`agent-connect` lets that local agent appear as a **first-class agent in AG2 Space
+`agent-connect` lets that local agent appear as a **first-class agent in s.space
 rooms**: people `!codex …` (or `@`-mention it) in a room, the task is routed to
 *your* agent, your machine runs it, and the result is posted back.
 
@@ -18,9 +18,9 @@ is a tiny thing that runs **on your machine**:
 - **Execution happens locally** via this worker — one command links your machine,
   like a self-hosted CI runner.
 
-## How it reuses AG2 Space infra (no new appservice)
+## How it reuses s.space infra (no new appservice)
 
-AG2 Space's relay is already a generic **outbound** transport: a client on your
+s.space's relay is already a generic **outbound** transport: a client on your
 machine connects *out* and long-polls `GET /v1/tasks` for *your* agent
 (identified by your token). Appservices (which require the homeserver to reach
 *you*) don't scale to laptops behind NAT; the outbound relay does.
@@ -126,7 +126,107 @@ tier a task runs at is the lower of what the broker attested and what your map
 allows, so the map can take trust away from a named sender on this host and can
 never hand any out. Nothing a *sender* writes touches it either way.
 
-## The ACP adapter: cooperative confinement, owner only
+## Team collaborators
+
+### What a Team collaborator is
+
+In s.space a room can grant a member **Team — collaborator** access, through
+the room's Agent Native settings. The broker attests it on each task, beside
+the tier: `access_tier` or `requested_access_tier` is `team` and `collaborator`
+is the boolean `true`. agent-connect trusts that attestation only when both are
+there, exactly as sent, and the task names its sender (a non-empty user id).
+
+Who the room grants it to is set in s.space, not on your machine:
+
+- **A private room with no Agent Native card makes every member a
+  collaborator** by default.
+- **Room moderators, not only you, can change a room's grants.**
+
+### What it means for your agent
+
+The room's grant alone gives a collaborator nothing extra:
+
+- **codex path:** a collaborator runs as a guest, in the read-only sandbox.
+- **cline, kilo and omnigent paths:** a collaborator is a guest too, but only
+  codex enforces read-only. These adapters only tell the agent the files are
+  read-only, so a guest, collaborator or not, gets the tool's full autonomy.
+- **ACP path:** a collaborator is refused, with a reply in the room saying what
+  would change that, until **you** admit them on this machine. The room's grant
+  is still required: your setting only narrows who the room allows.
+
+### How you control it
+
+Pick one of three scopes. Named senders and named rooms combine: a sender is
+admitted if either lets them in. "Everyone" replaces named senders, since both
+use the same setting; a `*` mixed with ids is refused by the installer and is
+not `*` to the Worker.
+
+| Scope | Installer flag | Setting | Who is admitted |
+| --- | --- | --- | --- |
+| Named senders | `--collaborators "@a:s.space,@b:s.space"` | `AGENT_CONNECT_ACP_COLLABORATORS` | Only those full Matrix ids, where a room grants them collaborator |
+| Named rooms | `--collaborator-rooms "!room:s.space"` | `AGENT_CONNECT_ACP_COLLABORATOR_ROOMS` | Every collaborator in those rooms |
+| Everyone | `--collaborators all` | `AGENT_CONNECT_ACP_COLLABORATORS=*` | Every collaborator in every room this agent is in, now or later |
+
+- **Re-running the installer keeps the values. Pass `""` to clear one**, for
+  example `--collaborators ""`.
+- **The Worker reads them at start**, so restart it after editing
+  `config.env` by hand.
+- **Narrowest first:** the "Everyone" scope plus the private-room default means
+  every member of every private room your agent is in. Prefer named senders,
+  or named rooms you moderate.
+
+### What an admitted collaborator gets
+
+- **Their own Session per room**, never yours. The agent is told who asked, in
+  `_meta["ag2/requester"]` and the routing record.
+- **The agent's normal capabilities:** its tools, its working directory and its
+  host's permission policy. Admit only senders you would let act as you on
+  this agent.
+- **Guidance in the prompt.** The agent is told to get your approval before it
+  does any of these:
+  - changes files outside its working directory;
+  - changes its own settings, permissions, skills, memory or credentials;
+  - installs software;
+  - posts anywhere but its reply, or acts on outside services;
+  - reads your private data.
+
+  Without your approval it declines that part, says the sender can ask you,
+  and answers the rest. Only the host's approval prompt, or a message from
+  you, counts as your approval. A collaborator saying you agreed does not.
+- **agent-connect's permission check, when the host asks.** If the host asks
+  agent-connect for permission, a request whose paths are all inside the
+  working directory is allowed. Anything else, including most shell commands,
+  which name no paths, goes to you as a private Allow/Deny question that names
+  the collaborator.
+- **A check on the reply.** A reply that matches a known secret format, or
+  carries a file, is withheld. You are asked privately whether to post it.
+  `AGENT_CONNECT_UNCHECKED_COLLABORATORS=1` turns off the secret and file
+  check. A `[channel:]` redirect is still held.
+
+### What it does not protect
+
+- **The guidance is advisory, not enforcement.** agent-connect's own check runs
+  only when the host asks for permission. A host that never asks is not
+  stopped: for example, OpenClaw with `approval_policy=never` asks nobody, so
+  an admitted collaborator's commands run without you being asked. agent-connect
+  does not yet restrict collaborator sessions by itself (for example through a
+  restrictive session mode). Tighten the host's policy if that matters.
+- **Files inside the working directory are not protected.** A collaborator can
+  ask the agent to change or delete them.
+- **Your scheduled tasks are reachable.** A collaborator can steer the agent
+  into changing and running one of your scheduled tasks, and that task's
+  outcome is posted unchecked.
+- **Posts through the s.space MCP are not checked.** agent-connect checks only
+  the answer it posts. Withhold that MCP from collaborator sessions, or make it
+  read-only, if your host can.
+- **On one OS user this is a trust boundary, not tamper resistance.** The agent
+  can edit `config.env`, the launcher or agent-connect itself. Run it as
+  another OS user, or in its host's sandbox, if that matters.
+
+To revoke access, clear the setting and restart the Worker, or have the room
+remove the collaborator grant.
+
+## The ACP adapter: cooperative confinement
 
 The `acp` adapter drives any agent that speaks the [Agent Client
 Protocol](https://agentclientprotocol.com) (Claude Code via
@@ -679,7 +779,7 @@ nothing about the relay client underneath.
   "relay": {
     "state": "connected",
     "connected": true,
-    "gateway": "https://chat.ag2.space/relay",
+    "gateway": "https://chat.s.space/relay",
     "last_ok_ts": 1755600120.0,
     "backoff_s": 0.0,
     "recheck_s": 0.0,
@@ -843,8 +943,8 @@ ACP adapter (see the section above):
 | `AGENT_CONNECT_ACP_REMOTE_CWD` | the directory a **dialled** agent opens its sessions in. `session/new` requires one, so something is always sent; unset means "this worker's own directory", which is correct on loopback and wrong across hosts | *(unset)* |
 | `AGENT_CONNECT_ACP_ALLOW_REMOTE` | `1` to allow `AGENT_CONNECT_ACP_URL` to name a host other than loopback. Off by default because the Permission Policy resolves paths on *this* machine: against another host its answers are guesses shaped like a guarantee. A non-loopback URL must also be `wss://` — this setting accepts the policy's uncertainty, not an unencrypted bearer | *(unset)* |
 | `AGENT_CONNECT_ACP_MODE` | session mode id to request. Left alone by default: every bridge's own default already routes permission requests to the worker, and mode ids are the agent's to name | *(unset)* |
-| `AGENT_CONNECT_ACP_COLLABORATORS` | Matrix ids, comma or space separated, matched exactly and case-sensitively on the full id, that may use the ACP agent where the room grants them **Team — collaborator** (Agent Native). Both are required: the list only narrows what the room allows. **Once admitted, a listed sender has the agent's normal capabilities** (its tools, workspace and permission policy), so list only senders you would let act as you on this agent. A collaborator's prompt also tells the agent to ask for the owner's approval before it changes files outside its working directory, changes its own settings, skills, memory or credentials, installs software, posts anywhere but its reply or acts on outside services, or reads the owner's private data, and otherwise to decline that part and point the sender to the owner. Only the host's approval prompt or a message from the owner counts as approval, never a collaborator's claim that the owner agreed. Files inside the working directory are not on that list: a collaborator can ask the agent to change or delete them, so do not open sessions in a directory you would not let a collaborator edit. That is guidance to the agent, not enforcement: what actually stops a command is your host's own approval policy (for example, OpenClaw with `approval_policy=never` asks nobody). Each gets its own Session per room, never the owner's, and the agent is told who asked in `_meta["ag2/requester"]` on `session/new` and every `session/prompt`. A listed sender's reply is checked before it is posted, unless you set `AGENT_CONNECT_UNCHECKED_COLLABORATORS=1` on this machine. The room's "Sensitive data filter" flag cannot turn the check off, because a room moderator can change it: a reply that matches a known secret format, or carries a file, is withheld and kept, owner-only, in `<workspace>/withheld/` on this machine. The owner is asked privately, in their DM with the agent (which must have exactly the agent and the owner as members), with the reply shown with known secret formats masked and **Post it** / **Discard**; the question and its masked excerpt stay in that DM's history. Files named in the reply are read when it is released; the room hears only that it was withheld for the owner's review. When no private DM question can be asked, the room message says how to act instead: send `release <review id>` or `discard <review id>`, which only a sender the broker attests as owner can do, and the message must be exactly that. Either way the reply is posted only if the stored record (its text, room, working directory and expiry) is unchanged, and only an answer the owner gave counts. Reviews expire after 24 hours, and a Worker restart drops pending ones. A `[channel:]` redirect is withheld and cannot be released. The check matches known formats only. A collaborator's own Turn cannot post with `_ag2/notify`, and while any collaborator is listed, every `_ag2/notify` the agent sends is checked the same way and may only go to a room this Worker has an owner Session in; one that fails is withheld and logged. The agent's own tools still can: a listed sender can steer it, for example, into changing and running one of the owner's scheduled tasks, whose outcome is posted unchecked. Set it with `install.sh --collaborators "@a:s.space,@b:s.space"` (validated, kept across re-runs, `""` clears it). **`*` admits every room-approved collaborator** (`install.sh --collaborators all`): any sender any room grants Team — collaborator, now or later, in every room this agent is in, without being named here. **A private room with no Agent Native card grants that to every member**, and a room moderator, not only you, can change a room's grants, so `*` lets the members of all those rooms use the agent as above. For less, list rooms in `AGENT_CONNECT_ACP_COLLABORATOR_ROOMS` instead. Everything else above still applies, the reply check included. A `*` mixed with ids, or a value such as `all` or `**` written here directly, is not `*`: only listed ids are admitted, and the Worker logs why. **Replies sent through the s.space MCP are not checked**: agent-connect checks only the answer it posts, so an agent that also has the s.space MCP can be steered by a collaborator into posting through it. Withhold that MCP from collaborator sessions, or give them read-only access, if your host can. It is read when the Worker starts. **On one OS user this is a trust boundary, not tamper resistance**: the agent can edit this file, the launcher or agent-connect itself. Editing only the list can admit only senders the room already grants collaborator; editing the Worker voids the check. Run the agent as another OS user, or in its host's tool sandbox, if that matters to you. Typical use: your own other agents, e.g. `@you-other.agent:s.space` | *(unset)* |
-| `AGENT_CONNECT_ACP_COLLABORATOR_ROOMS` | Room ids, comma or space separated, in which **every** sender the room grants **Team — collaborator** may use the ACP agent, as a listed collaborator would (own Session, reply check, same capabilities). Other rooms are unaffected. Combines with `AGENT_CONNECT_ACP_COLLABORATORS`: a sender is admitted if either lets them in. Remember that a private room with no Agent Native card grants collaborator to every member, and its moderators can grant it to more. Set it with `install.sh --collaborator-rooms "!a:s.space,!b:s.space"` (validated, kept across re-runs, `""` clears it). Read when the Worker starts | *(unset)* |
+| `AGENT_CONNECT_ACP_COLLABORATORS` | See [Team collaborators](#team-collaborators) first. Matrix ids, comma or space separated, matched exactly and case-sensitively on the full id, that may use the ACP agent where the room grants them **Team — collaborator** (Agent Native). Both are required: the list only narrows what the room allows. **Once admitted, a listed sender has the agent's normal capabilities** (its tools, workspace and permission policy), so list only senders you would let act as you on this agent. A collaborator's prompt also tells the agent to ask for the owner's approval before it changes files outside its working directory, changes its own settings, skills, memory or credentials, installs software, posts anywhere but its reply or acts on outside services, or reads the owner's private data, and otherwise to decline that part and point the sender to the owner. Only the host's approval prompt or a message from the owner counts as approval, never a collaborator's claim that the owner agreed. Files inside the working directory are not on that list: a collaborator can ask the agent to change or delete them, so do not open sessions in a directory you would not let a collaborator edit. That is guidance to the agent, not enforcement: what actually stops a command is your host's own approval policy (for example, OpenClaw with `approval_policy=never` asks nobody). Each gets its own Session per room, never the owner's, and the agent is told who asked in `_meta["ag2/requester"]` on `session/new` and every `session/prompt`. A listed sender's reply is checked before it is posted, unless you set `AGENT_CONNECT_UNCHECKED_COLLABORATORS=1` on this machine. The room's "Sensitive data filter" flag cannot turn the check off, because a room moderator can change it: a reply that matches a known secret format, or carries a file, is withheld and kept, owner-only, in `<workspace>/withheld/` on this machine. The owner is asked privately, in their DM with the agent (which must have exactly the agent and the owner as members), with the reply shown with known secret formats masked and **Post it** / **Discard**; the question and its masked excerpt stay in that DM's history. Files named in the reply are read when it is released; the room hears only that it was withheld for the owner's review. When no private DM question can be asked, the room message says how to act instead: send `release <review id>` or `discard <review id>`, which only a sender the broker attests as owner can do, and the message must be exactly that. Either way the reply is posted only if the stored record (its text, room, working directory and expiry) is unchanged, and only an answer the owner gave counts. Reviews expire after 24 hours, and a Worker restart drops pending ones. A `[channel:]` redirect is withheld and cannot be released. The check matches known formats only. A collaborator's own Turn cannot post with `_ag2/notify`, and while any collaborator is listed, every `_ag2/notify` the agent sends is checked the same way and may only go to a room this Worker has an owner Session in; one that fails is withheld and logged. The agent's own tools still can: a listed sender can steer it, for example, into changing and running one of the owner's scheduled tasks, whose outcome is posted unchecked. Set it with `install.sh --collaborators "@a:s.space,@b:s.space"` (validated, kept across re-runs, `""` clears it). **`*` admits every room-approved collaborator** (`install.sh --collaborators all`): any sender any room grants Team — collaborator, now or later, in every room this agent is in, without being named here. **A private room with no Agent Native card grants that to every member**, and a room moderator, not only you, can change a room's grants, so `*` lets the members of all those rooms use the agent as above. For less, list rooms in `AGENT_CONNECT_ACP_COLLABORATOR_ROOMS` instead. Everything else above still applies, the reply check included. A `*` mixed with ids, or a value such as `all` or `**` written here directly, is not `*`: only listed ids are admitted, and the Worker logs why. **Replies sent through the s.space MCP are not checked**: agent-connect checks only the answer it posts, so an agent that also has the s.space MCP can be steered by a collaborator into posting through it. Withhold that MCP from collaborator sessions, or give them read-only access, if your host can. It is read when the Worker starts. **On one OS user this is a trust boundary, not tamper resistance**: the agent can edit this file, the launcher or agent-connect itself. Editing only the list can admit only senders the room already grants collaborator; editing the Worker voids the check. Run the agent as another OS user, or in its host's tool sandbox, if that matters to you. Typical use: your own other agents, e.g. `@you-other.agent:s.space` | *(unset)* |
+| `AGENT_CONNECT_ACP_COLLABORATOR_ROOMS` | See [Team collaborators](#team-collaborators). Room ids, comma or space separated, in which **every** sender the room grants **Team — collaborator** may use the ACP agent, as a listed collaborator would (own Session, reply check, same capabilities). Other rooms are unaffected. Combines with `AGENT_CONNECT_ACP_COLLABORATORS`: a sender is admitted if either lets them in. Remember that a private room with no Agent Native card grants collaborator to every member, and its moderators can grant it to more. Set it with `install.sh --collaborator-rooms "!a:s.space,!b:s.space"` (validated, kept across re-runs, `""` clears it). Read when the Worker starts | *(unset)* |
 | `AGENT_CONNECT_UNCHECKED_COLLABORATORS` | `1` (or `true`, `yes`, `on`) to post listed collaborators' replies without the secret and file check. The room's "Sensitive data filter" setting is not trusted for this, because a room moderator can change it. A `[channel:]` redirect is still held | *(unset)* |
 | `AGENT_CONNECT_ACP_SKIP_AUTH_CHECK` | `1` to start even when the agent advertises authentication methods. The escape hatch for an agent whose `authMethods` mean something else | *(unset)* |
 | `AGENT_CONNECT_TURN_TIMEOUT` | seconds one turn may run before it is cancelled **through the protocol**, keeping whatever it produced. `0` waits forever | `600` |
@@ -897,25 +997,25 @@ agent and return its output." Ships with:
 **Three integration levers** (pick per agent):
 1. **Direct adapter** — a ~30-line wrapper around an agent's own headless CLI. Best when the agent has a clean exec mode.
 2. **`omnigent` adapter** — one adapter that drives [omnigent](https://github.com/omnigent-ai/omnigent)'s whole harness catalog (claude, codex, cursor, kimi, qwen, goose, hermes, pi, opencode, …). Unlocks many agents from a single file and isolates that (alpha) dependency. Per-message `[harness]` prefix selects the harness.
-3. **`acp` adapter** — one adapter for any agent that speaks the Agent Client Protocol (Cline, Pi, Codex, Claude, OpenClaw via `acpx`). **Owner-tier only, cooperative confinement — see the section above.**
+3. **`acp` adapter** — one adapter for any agent that speaks the Agent Client Protocol (Cline, Pi, Codex, Claude, OpenClaw via `acpx`). **Owner and admitted collaborators only, cooperative confinement — see [Team collaborators](#team-collaborators) and [The ACP adapter](#the-acp-adapter-cooperative-confinement).**
 
 **Shipped adapters:**
 - **codex** — `codex exec`. ✅ verified, live.
 - **ollama** — local model via the Ollama HTTP API (fully private, no provider auth). ✅ verified, live.
 - **omnigent** — drives any omnigent harness. ✅ verified, live.
 - **cline** — `cline -y`. ✅ verified (command path + auth handling); go-live needs Cline auth.
-- **acp** — any ACP-speaking agent, driven over stdio. ⚠️ owner-tier only, and the confinement is cooperative (see above).
+- **acp** — any ACP-speaking agent, driven over stdio. ⚠️ owner and admitted collaborators only, and the confinement is cooperative (see above).
 - **kilo** — `kilo run --auto`. ⚠️ scaffold; headless output capture unverified (needs Kilo auth to confirm / finish).
 
 **Roadmap coverage** (owner list Codex/Hermes/OpenClaw/Cline/PI/Kilo): Codex ✅ · Hermes ✅ (omnigent) · PI ✅ (omnigent / ACP) · Cline ✅ (direct / ACP) · Kilo ⚠️ (direct scaffold, or omnigent's opencode harness) · OpenClaw = a personal-assistant *gateway*, not a coding harness → reach its coding via ACP.
 
-**Auth model — two independent layers:** (1) agent identity → AG2 Space (a relay token we issue); (2) the agent's own tool auth (its login / provider API key), which AG2 Space never sees. `ollama` needs no provider auth (the model is local).
+**Auth model — two independent layers:** (1) agent identity → s.space (a relay token we issue); (2) the agent's own tool auth (its login / provider API key), which s.space never sees. `ollama` needs no provider auth (the model is local).
 
 The framework is agent-agnostic; the relay client + onboarding + access-tiers are shared.
 
 ## Quick start (MVP)
 
-1. In the AG2 Space Agent Portal, **create a Codex agent** → copy your token.
+1. In the s.space Agent Portal, **create a Codex agent** → copy your token.
 2. On your machine:
    ```bash
    export AGENT_CONNECT_TOKEN=<token from the portal>

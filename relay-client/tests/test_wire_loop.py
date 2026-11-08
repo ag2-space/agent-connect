@@ -39,10 +39,10 @@ def wire_task(wire_id="task-1", **over):
     """A task as the broker's documented envelope serves it."""
     task = {
         "id": wire_id,
-        "task": "[AG2Space @alice:ag2.space] what is the status?",
+        "task": "[AG2Space @alice:s.space] what is the status?",
         "source": "ag2space",
-        "channel_id": "!room:ag2.space",
-        "user_id": "@alice:ag2.space",
+        "channel_id": "!room:s.space",
+        "user_id": "@alice:s.space",
         "access_tier": "owner",
         "priority": "normal",
         "timestamp": "2026-08-20T10:00:00Z",
@@ -179,7 +179,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
 
     task = client.next_task(timeout=1)
     check(task is not None and task.id == "task-1", "the task comes out of the queue")
-    check(task.room_id == "!room:ag2.space" and task.access_tier == "owner",
+    check(task.room_id == "!room:s.space" and task.access_tier == "owner",
           "carrying the room and the attestation, as data")
 
     # F2: the ack left AFTER the journal entry was durable, never before. An
@@ -191,7 +191,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(broker.took("POST", "/v1/tasks/task-1/ack"),
           "and it goes out, under the task's own id")
 
-    check(client.journal.room_for("task-1") == "!room:ag2.space",
+    check(client.journal.room_for("task-1") == "!room:s.space",
           "the task->room sidecar is captured at accept (F7)")
     check(client.inflight() == ["task-1"], "the id is in flight until it is answered (E2)")
 
@@ -913,9 +913,9 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     # nothing, so the working case is right beside it.
     broker.on("POST", "/v1/room", json={"ok": True})
     broker.on("POST", "/v1/room", json={"ok": True})
-    check(client.room_ops.react("!room:ag2.space", "$something-else", "👍") is True,
+    check(client.room_ops.react("!room:s.space", "$something-else", "👍") is True,
           "a reaction the consumer asks for on its own account goes")
-    check(client.room_ops.react("!room:ag2.space", "$intake", "🫡") is False,
+    check(client.room_ops.react("!room:s.space", "$intake", "🫡") is False,
           "but an event this client was *served* is never reacted to — the "
           "broker already put the intake reaction on it, and a second one is "
           "the room seeing double (I2)")
@@ -924,7 +924,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
 
     prepared = client.complete(
         "task-out", "Here it is.\n\n[file: report.md]", base_dir=workspace)
-    uploads = broker.took("POST", "/v1/rooms/%21room%3Aag2.space/media")
+    uploads = broker.took("POST", "/v1/rooms/%21room%3As.space/media")
     check(len(uploads) == 1 and uploads[0].json.get("filename") == "report.md",
           "a file the answer names is uploaded from an allowlisted path, in "
           "this process, before the result POST")
@@ -938,7 +938,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     prepared = client.complete(
         "task-out", "Sure.\n\n[file: %s]" % (Path(tmp) / "secret.key"),
         base_dir=workspace)
-    check(not broker.took("POST", "/v1/rooms/%21room%3Aag2.space/media")[1:],
+    check(not broker.took("POST", "/v1/rooms/%21room%3As.space/media")[1:],
           "a path outside every root is refused in-process — nothing is "
           "uploaded and no bytes are read")
     seen = [r.json for r in broker.took("POST", "/v1/results")]
@@ -963,7 +963,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     # id takes, and the one the ledger exists for. So the drain is still here,
     # asserting what it can honestly assert, and the second `complete` is what
     # holds F6 up.
-    uploads = "POST", "/v1/rooms/%21room%3Aag2.space/media"
+    uploads = "POST", "/v1/rooms/%21room%3As.space/media"
     workspace = Path(tmp) / "work"
     workspace.mkdir()
     (workspace / "chart.png").write_bytes(b"chart")

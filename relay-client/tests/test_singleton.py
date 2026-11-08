@@ -79,8 +79,8 @@ class Listening(logging.Handler):
 
 
 def wire_task(wire_id="task-1", **over):
-    task = {"id": wire_id, "task": "do it", "channel_id": "!room:ag2.space",
-            "user_id": "@alice:ag2.space", "access_tier": "owner"}
+    task = {"id": wire_id, "task": "do it", "channel_id": "!room:s.space",
+            "user_id": "@alice:s.space", "access_tier": "owner"}
     task.update(over)
     return task
 

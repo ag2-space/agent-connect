@@ -34,7 +34,7 @@ from ag2_relay_client.outbound import Outbound
 from ag2_relay_client.roomops import RoomOps
 from ag2_relay_client.transport import RelayHTTP
 
-ROOM = "!room:ag2.space"
+ROOM = "!room:s.space"
 MEDIA = "/v1/rooms/" + urllib.parse.quote(ROOM, safe="") + "/media"
 
 fails = 0
@@ -76,13 +76,13 @@ check(prepared.body == "[no-send] recorded for the log only",
       "a [no-send] body keeps its text: the broker records it, it just posts nothing")
 
 # --- H3: the redirect goes back onto the POSTed body
-prepared = out.prepare("task-2", ROOM, "[channel: !other:ag2.space]\nthe answer")
-check(prepared.redirect == "!other:ag2.space", "the redirect is reported")
-check(prepared.body == "[channel: !other:ag2.space]\nthe answer",
+prepared = out.prepare("task-2", ROOM, "[channel: !other:s.space]\nthe answer")
+check(prepared.redirect == "!other:s.space", "the redirect is reported")
+check(prepared.body == "[channel: !other:s.space]\nthe answer",
       "and re-stitched onto the first line — the broker performs the move, not us")
 
 prepared = out.prepare("task-3", ROOM,
-                       "[channel: !shared:ag2.space]\n[dm-only]\nprivate")
+                       "[channel: !shared:s.space]\n[dm-only]\nprivate")
 check(prepared.dm_only and prepared.redirect == "",
       "[dm-only] suppresses the redirect wherever it sits")
 check("[channel:" not in prepared.body,
@@ -106,7 +106,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     clock = Clock()
     rooms = RoomOps(http, allowlist=EgressAllowlist([root]), clock=clock)
     out = Outbound(rooms)
-    broker.on("POST", MEDIA, json={"ok": True, "mxc": "mxc://ag2.space/1"})
+    broker.on("POST", MEDIA, json={"ok": True, "mxc": "mxc://s.space/1"})
 
     # --- the ordinary case
     prepared = out.prepare("task-10", ROOM, f"here it is [file: {chart}]")

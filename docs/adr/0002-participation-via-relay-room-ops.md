@@ -2,7 +2,7 @@
 
 To make the agent a real participant — visibly working, able to speak — the obvious path
 looked like writing a Matrix client: `GET /_matrix/client/v3/sync` is an *outbound* long-poll,
-so NAT was never the obstacle the appservice argument made it out to be, and AG2 Space rooms
+so NAT was never the obstacle the appservice argument made it out to be, and s.space rooms
 are unencrypted, which removes the single largest cost. We are not doing it. The relay already
 exposes everything that path would buy: `POST /v1/room` performs `message`, `edit`, `react`,
 `redact`, `upload` and more *as* the Agent Identity, and `GET /v1/events` is a per-agent log of

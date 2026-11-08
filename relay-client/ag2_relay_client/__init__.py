@@ -1,4 +1,4 @@
-"""`ag2-relay-client` — the AG2 Space relay wire, as a library.
+"""`ag2-relay-client` — the s.space relay wire, as a library.
 
 One bearer's whole conversation with the broker lives here: poll, lease, ack,
 results, heartbeat, media in both directions, Room Ops. A consumer gets Tasks

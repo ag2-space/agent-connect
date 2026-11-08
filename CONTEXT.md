@@ -1,7 +1,7 @@
 # agent-connect
 
 Runs *your* local coding agent, on *your* machine, with *your* credentials, and makes
-it answerable from an AG2 Space room. This context covers the local half: how a
+it answerable from an s.space room. This context covers the local half: how a
 message from a room becomes a run of a local agent, and what that agent is allowed
 to do.
 
@@ -16,11 +16,11 @@ _Avoid_: daemon, bot, bridge, client
 
 **Local Agent**:
 The coding CLI on the user's machine that actually does the thinking — Codex, Claude
-Code, Cline. It holds its own tool credentials, which AG2 Space never sees.
+Code, Cline. It holds its own tool credentials, which s.space never sees.
 _Avoid_: model, LLM, backend, tool
 
 **Managed Local Agent**:
-A [[Local Agent]] whose lifecycle the AG2 Space desktop app's supervisor owns, rather
+A [[Local Agent]] whose lifecycle the s.space desktop app's supervisor owns, rather
 than one the operator starts themselves. A subtype, not a rival: it is the same Local
 Agent behind the same [[Agent Identity]], driven by the same [[Worker]] and
 [[Adapter]] — what is managed is starting it, stopping it, restarting it after a
@@ -53,7 +53,7 @@ _Avoid_: bridge, gateway, sparrow, transport
 > which the tickets that built it are named after.
 
 **Agent Identity**:
-The addressable participant an AG2 Space room mentions (`!codex …`). It is issued in
+The addressable participant an s.space room mentions (`!codex …`). It is issued in
 the Agent Portal, and is what a token or MXID authenticates. Distinct from the Local
 Agent that fulfils it — one identity, many possible Local Agents behind it.
 _Avoid_: agent, bot, user
@@ -125,7 +125,7 @@ declines to ask is still stopped. Contrast [[Permission Policy]].
 _Avoid_: mode, policy, isolation
 
 **Concierge**:
-The AG2 Space bot that grants and revokes an [[Access Tier]] — `allow`, `trust`,
+The s.space bot that grants and revokes an [[Access Tier]] — `allow`, `trust`,
 `untrust`, `remove`. It is a *recipient*, and that is the whole of why it is in this
 glossary: those words are only commands in a direct message to it. Sent in a room, or
 in a DM to the agent, they reach the Local Agent as an ordinary prompt and are answered

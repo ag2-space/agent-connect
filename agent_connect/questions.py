@@ -1,6 +1,6 @@
 """Private yes/no questions to the agent's owner, in the owner's DM with the agent.
 
-The relay client asks AG2 Space's `room.question.*` Actions (`ag2_relay_client.
+The relay client asks s.space's `room.question.*` Actions (`ag2_relay_client.
 questions`); this awaits them. Every failure is `None`: no private DM, no MCP
 access, an error. A caller treats that as "the owner could not be asked", which
 is never a yes.

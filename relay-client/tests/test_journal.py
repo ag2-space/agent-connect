@@ -57,11 +57,11 @@ class Listening(logging.Handler):
 # --- durability: the fact is on disk before the mutator returns -------------
 with tempfile.TemporaryDirectory() as tmp:
     journal = fresh(tmp)
-    journal.accept("task-1", room="!room:ag2.space")
+    journal.accept("task-1", room="!room:s.space")
 
     reopened = fresh(tmp).load()
     check(reopened.is_accepted("task-1"), "an accepted id survives without a save() call")
-    check(reopened.room_for("task-1") == "!room:ag2.space",
+    check(reopened.room_for("task-1") == "!room:s.space",
           "the task->room sidecar is captured at accept and persisted (F7)")
     check(reopened.inflight() == 1, "an accepted id counts as in flight (E2)")
 
@@ -375,7 +375,7 @@ with tempfile.TemporaryDirectory() as tmp:
     baseline_journal = fresh(tmp, name="baseline.jsonl")
     started = time.monotonic()
     for index in range(20):
-        baseline_journal.accept("warm-%d" % index, room="!room:ag2.space")
+        baseline_journal.accept("warm-%d" % index, room="!room:s.space")
     baseline = time.monotonic() - started
     rival = os.open(str(Path(tmp) / "journal.jsonl.lock"),
                     os.O_RDWR | os.O_CREAT, 0o600)
@@ -385,7 +385,7 @@ with tempfile.TemporaryDirectory() as tmp:
         before = descriptor_count()
         started = time.monotonic()
         for index in range(20):
-            journal.accept("task-%d" % index, room="!room:ag2.space")
+            journal.accept("task-%d" % index, room="!room:s.space")
         elapsed = time.monotonic() - started
         after = descriptor_count()
     finally:

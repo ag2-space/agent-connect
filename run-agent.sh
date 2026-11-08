@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch your local agent as an AG2 Space agent, from a checkout of this repo.
+# Launch your local agent as an s.space agent, from a checkout of this repo.
 #
 # ONE PROCESS. The worker carries its own relay client (workspace ADR 0001), so
 # it long-polls the gateway itself and this script starts nothing beside it.

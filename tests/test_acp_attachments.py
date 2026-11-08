@@ -146,7 +146,7 @@ bench = Bench(ANSWERS)
 shot = bench.file("shot.png", PNG)
 out = bench.handle(
     "a1", "what is wrong with this?", attachments=[shot],
-    channel_id="!room:ag2.space", sender_name="Ada",
+    channel_id="!room:s.space", sender_name="Ada",
 )
 blocks = bench.blocks()
 

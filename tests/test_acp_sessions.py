@@ -53,8 +53,8 @@ except ImportError as exc:  # pragma: no cover — an environment problem, not a
     )
 
 FAKE = str(Path(__file__).parent / "fake_acp_agent.py")
-ROOM_A = "!alpha:ag2.space"
-ROOM_B = "!beta:ag2.space"
+ROOM_A = "!alpha:s.space"
+ROOM_B = "!beta:s.space"
 
 fails = 0
 

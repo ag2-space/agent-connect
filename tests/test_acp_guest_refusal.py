@@ -53,7 +53,7 @@ except ImportError as exc:  # pragma: no cover — an environment problem, not a
     )
 
 FAKE = str(Path(__file__).parent / "fake_acp_agent.py")
-ROOM = "!room:ag2.space"
+ROOM = "!room:s.space"
 #: The Turn a Bench builds, as far as the refusal is concerned: the room is what
 #: carries the homeserver, so this is what `refusal()` is expected to produce.
 TASK_CTX = TurnContext(prompt="", room=ROOM)
@@ -213,7 +213,7 @@ check("trust" in edits[-1],
 # override — and not this module's to choose. Asserting the constant against
 # itself would stay green through a rename that sends every refused guest's
 # owner to a user who does not exist.
-check("@sutando-concierge:ag2.space" in edits[-1],
+check("@sutando-concierge:s.space" in edits[-1],
       "and WHERE to say it, as an MXID that can be pasted into a start-a-DM "
       "box — not the word 'concierge', which is no more a recipient than the "
       "instruction that sent an owner round four wasted Turns (ticket 14)")
