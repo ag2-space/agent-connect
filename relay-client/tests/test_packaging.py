@@ -40,11 +40,12 @@ ALLOWED = {
     "__future__", "base64", "collections", "contextlib", "ctypes", "dataclasses", "email",
     "errno", "fcntl", "hashlib", "http", "io", "json", "logging", "mimetypes", "msvcrt",
     "math", "os", "pathlib", "queue", "re", "shutil", "socket", "ssl", "stat", "sys",
-    "tempfile", "threading", "time", "traceback", "types", "typing", "urllib",
-    "uuid",
+    "tempfile", "threading", "time", "traceback", "types", "typing", "unicodedata",
+    "urllib", "uuid",
 }
 #: `fcntl` and `msvcrt` are platform-specific halves of the shared lock module;
 #: each is imported only by the backend selected for that platform.
+#: `unicodedata` strips control and format characters from Activity labels.
 
 # --- no third-party imports, and no asyncio
 for source in SOURCES:

@@ -171,5 +171,45 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
                    "execution_generation": 7},
           "an answered task served again is re-completed as no action, under its new lease")
 
+# --- Activity labels: title and outcome ride on the result ------------------
+from ag2_relay_client.client import OUTCOME_MAX, TITLE_MAX, clean_label, labels
+
+with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
+    broker.on("POST", "/v1/results", json={"ok": True})
+    client = client_for(broker, tmp)
+    served(broker, client, wire_task("l1"))
+    client.complete("l1", "the answer", title="Fix login redirect",
+                    outcome="Fixed the redirect loop and ran the tests.")
+    posted = broker.took("POST", "/v1/results")[-1].json
+    check(posted.get("title") == "Fix login redirect"
+          and posted.get("outcome") == "Fixed the redirect loop and ran the tests."
+          and posted["body"] == "the answer",
+          "an answer carries its title and outcome beside the body")
+
+    served(broker, client, wire_task("l2"))
+    client.no_action("l2", "Nothing to add.", title="Acknowledge thanks")
+    posted = broker.took("POST", "/v1/results")[-1].json
+    check(posted.get("title") == "Acknowledge thanks" and posted.get("outcome") == "Nothing to add.",
+          "a no action carries labels too")
+
+    served(broker, client, wire_task("l3"))
+    client.fail("l3", "bridge died", title="Run the tests")
+    posted = broker.took("POST", "/v1/results")[-1].json
+    check(posted.get("title") == "Run the tests" and "outcome" not in posted,
+          "a failure carries the title it was given, and no blank outcome")
+
+    served(broker, client, wire_task("l4"))
+    client.complete("l4", "plain")
+    posted = broker.took("POST", "/v1/results")[-1].json
+    check("title" not in posted and "outcome" not in posted,
+          "no labels given means no keys sent")
+
+check(clean_label("a\nb\t c\u202e\u0007d", 60) == "a b cd",
+      "a label is one line, without control, format or bidi characters")
+check(len(clean_label("x" * 100, TITLE_MAX)) == TITLE_MAX and clean_label("x" * 100, TITLE_MAX).endswith("…"),
+      "a long title is cut to the limit with an ellipsis")
+check(len(clean_label("y" * 400, OUTCOME_MAX)) == OUTCOME_MAX, "an outcome is cut to 150")
+check(labels(None, 5) == {} and labels("  ", "") == {}, "non-strings and blanks are left out")
+
 print("\n" + ("PASS — result statuses green" if fails == 0 else f"FAIL — {fails} failing"))
 raise SystemExit(1 if fails else 0)

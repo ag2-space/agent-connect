@@ -17,7 +17,7 @@ and not a copy of it:
 from __future__ import annotations
 
 #: The single source of the distribution version (`pyproject.toml` reads it).
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # The seam, reachable in one import: a consumer needs the client, the credential
 # it is constructed from, the type of the thing that comes out of the queue, and

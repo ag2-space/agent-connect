@@ -179,6 +179,14 @@ class PermissionRequest:
         return None
 
 
+def _response_meta(response: Any) -> Any:
+    """The prompt response's `_meta`, as the SDK model or a plain mapping carries it."""
+    meta = getattr(response, "field_meta", None)
+    if meta is None and isinstance(response, dict):
+        meta = response.get("_meta")
+    return meta if isinstance(meta, dict) else None
+
+
 @dataclass(frozen=True)
 class TurnResult:
     """The end of one Turn: why it stopped, and everything it produced."""
@@ -186,6 +194,7 @@ class TurnResult:
     stop_reason: str
     text: str
     updates: list = field(default_factory=list)
+    meta: Any = None
 
 
 @dataclass(frozen=True)
@@ -606,6 +615,7 @@ class AcpClient:
             self._turn_updates = None
         return TurnResult(
             stop_reason=getattr(response, "stopReason", "") or "",
+            meta=_response_meta(response),
             text="".join(u.text for u in collected if u.kind == "agent_message_chunk"),
             updates=collected,
         )

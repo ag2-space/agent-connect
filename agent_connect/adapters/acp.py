@@ -1630,6 +1630,7 @@ class AcpAdapter:
             reason=STOP_REASONS.get(result.stop_reason, FAILED),
             text="".join(chunks),
             note=_note(result.stop_reason),
+            meta=getattr(result, "meta", None),
         )
 
 

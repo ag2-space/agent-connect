@@ -381,7 +381,8 @@ A turn ends in one result (`docs/adr/0002`, amended for 0.4.0):
 
 - **An answer** is completed with `status: "completed"`, and the broker posts it
   once, as a reply to the request. Files it names are uploaded first.
-- **Nothing to say** (no text, or the agent replies exactly `NO_REPLY`) is
+- **Nothing to say** (no text, or the agent replies `NO_REPLY`, followed only
+  by its Activity lines) is
   completed with `status: "no_action_needed"`: nothing is posted, nobody is
   mentioned, and the activity ledger records no action. Agents are told to use
   it for acknowledgements, thanks and FYIs, which keeps agent exchanges from
@@ -389,6 +390,31 @@ A turn ends in one result (`docs/adr/0002`, amended for 0.4.0):
 - **A turn that produced nothing** and did not end normally is `failed`, and the
   broker posts its one failure notice. If the adapter explained the failure (not
   configured, not logged in), that explanation is the answer instead.
+
+**Activity labels.** The agent is asked to end every reply with two lines for
+your Activity page:
+
+```
+[activity:title] Fix login redirect
+[activity:outcome] Fixed the redirect loop and ran the tests.
+```
+
+agent-connect removes them before the reply is posted and sends them with the
+result as the row's `title` (at most 60 characters) and `outcome` (at most 150).
+Only you and the agent see them, not the room.
+- **Which lines count:** only the final lines, outside any code block.
+- **Missing or malformed lines:** the reply is posted unchanged and the row
+  shows the request text, as before.
+- **Hosts that send metadata:** a host that puts
+  `_meta["ag2/activity"] = {"title": …, "outcome": …}` on its ACP prompt
+  response takes precedence over the lines.
+- **Status:** labels never change a result's status.
+  - A failed turn keeps only its title, since its outcome line could claim a
+    success.
+  - A no-reply turn without an outcome line is labelled "The agent had nothing
+    to add."
+- **Collaborators:** their labels go through the same secret check as their
+  reply. A label the check would hold is dropped.
 
 Reported tool failures and permission refusals appear in the answer as aggregate
 lines. Raw tool titles and permission details never reach the room: they can
