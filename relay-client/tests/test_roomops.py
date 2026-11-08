@@ -57,7 +57,7 @@ class Clock:
 
 # --- I3: there is no gateway in this module, and there never may be
 source = Path(roomops_module.__file__).read_text()
-check("chat.s.space" not in source and "https://" not in source.replace(
+check("chat.s.space" not in source and "chat.ag2.space" not in source and "https://" not in source.replace(
     "https://<broker", ""),
     "no base URL is compiled into roomops.py — it comes from the credential (I3)")
 

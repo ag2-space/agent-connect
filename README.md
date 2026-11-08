@@ -134,7 +134,7 @@ In s.space a room can grant a member **Team — collaborator** access, through
 the room's Agent Native settings. The broker attests it on each task, beside
 the tier: `access_tier` or `requested_access_tier` is `team` and `collaborator`
 is the boolean `true`. agent-connect trusts that attestation only when both are
-there, exactly as sent.
+there, exactly as sent, and the task names its sender (a non-empty user id).
 
 Who the room grants it to is set in s.space, not on your machine:
 
@@ -147,14 +147,19 @@ Who the room grants it to is set in s.space, not on your machine:
 The room's grant alone gives a collaborator nothing extra:
 
 - **codex path:** a collaborator runs as a guest, in the read-only sandbox.
+- **cline, kilo and omnigent paths:** a collaborator is a guest too, but only
+  codex enforces read-only. These adapters only tell the agent the files are
+  read-only, so a guest, collaborator or not, gets the tool's full autonomy.
 - **ACP path:** a collaborator is refused, with a reply in the room saying what
   would change that, until **you** admit them on this machine. The room's grant
   is still required: your setting only narrows who the room allows.
 
 ### How you control it
 
-Pick one of three scopes, or combine them. A sender is admitted if any of them
-lets them in.
+Pick one of three scopes. Named senders and named rooms combine: a sender is
+admitted if either lets them in. "Everyone" replaces named senders, since both
+use the same setting; a `*` mixed with ids is refused by the installer and is
+not `*` to the Worker.
 
 | Scope | Installer flag | Setting | Who is admitted |
 | --- | --- | --- | --- |
@@ -180,25 +185,37 @@ lets them in.
 - **Guidance in the prompt.** The agent is told to get your approval before it
   does any of these:
   - changes files outside its working directory;
-  - changes its own settings, skills, memory or credentials;
+  - changes its own settings, permissions, skills, memory or credentials;
   - installs software;
   - posts anywhere but its reply, or acts on outside services;
   - reads your private data.
 
-  Only the host's approval prompt, or a message from you, counts as your
-  approval. A collaborator saying you agreed does not.
+  Without your approval it declines that part, says the sender can ask you,
+  and answers the rest. Only the host's approval prompt, or a message from
+  you, counts as your approval. A collaborator saying you agreed does not.
+- **agent-connect's permission check, when the host asks.** If the host asks
+  agent-connect for permission, a request whose paths are all inside the
+  working directory is allowed. Anything else, including most shell commands,
+  which name no paths, goes to you as a private Allow/Deny question that names
+  the collaborator.
 - **A check on the reply.** A reply that matches a known secret format, or
   carries a file, is withheld. You are asked privately whether to post it.
-  `AGENT_CONNECT_UNCHECKED_COLLABORATORS=1` turns this check off.
+  `AGENT_CONNECT_UNCHECKED_COLLABORATORS=1` turns off the secret and file
+  check. A `[channel:]` redirect is still held.
 
 ### What it does not protect
 
-- **The guidance is advisory, not enforcement.** What actually stops a command
-  is your host's own approval policy. For example, OpenClaw with
-  `approval_policy=never` asks nobody, so an admitted collaborator's commands
-  run without you being asked. Tighten the host's policy if that matters.
+- **The guidance is advisory, not enforcement.** agent-connect's own check runs
+  only when the host asks for permission. A host that never asks is not
+  stopped: for example, OpenClaw with `approval_policy=never` asks nobody, so
+  an admitted collaborator's commands run without you being asked. agent-connect
+  does not yet restrict collaborator sessions by itself (for example through a
+  restrictive session mode). Tighten the host's policy if that matters.
 - **Files inside the working directory are not protected.** A collaborator can
   ask the agent to change or delete them.
+- **Your scheduled tasks are reachable.** A collaborator can steer the agent
+  into changing and running one of your scheduled tasks, and that task's
+  outcome is posted unchecked.
 - **Posts through the s.space MCP are not checked.** agent-connect checks only
   the answer it posts. Withhold that MCP from collaborator sessions, or make it
   read-only, if your host can.

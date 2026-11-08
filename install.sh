@@ -52,7 +52,7 @@
 #   omnigent → Claude Code, cursor, kimi, qwen, …   — `--adapter omnigent` (default harness: claude)
 #   ollama   → local model via Ollama HTTP API      — no provider auth
 #   acp      → any Agent Client Protocol agent       — `--adapter acp --acp-agent claude`
-#              (owner-tier only, cooperative confinement — see README)
+#              (owner and admitted collaborators only, cooperative confinement — see README)
 # You still log into the underlying tool yourself; the token is your s.space
 # *identity*, never a model API key.
 set -eu
