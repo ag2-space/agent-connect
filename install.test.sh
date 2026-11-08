@@ -626,6 +626,58 @@ PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
 ! grep -q '^AGENT_CONNECT_ACP_COLLABORATORS=' "$ACPCFG" \
   && ok '--collaborators "" clears the list' \
   || { sed 's/^/    /' "$ACPCFG"; bad "--collaborators \"\" left a list behind"; }
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborators all --no-start >/dev/null 2>&1 \
+  || bad "--collaborators all failed"
+grep -q '^AGENT_CONNECT_ACP_COLLABORATORS="\*"$' "$ACPCFG" \
+  && ok '--collaborators all writes "*"' \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--collaborators all not written as *"; }
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T2 --adapter acp --no-start >/dev/null 2>&1 || bad "re-run failed"
+grep -q '^AGENT_CONNECT_ACP_COLLABORATORS="\*"$' "$ACPCFG" \
+  && ok "a re-run keeps all" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a re-run dropped all"; }
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
+     --collaborators "@a:s.space,*" --no-start >/dev/null 2>&1; then
+  bad "a * mixed with ids was accepted"
+else
+  ok "a * mixed with ids is refused"
+fi
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborators " ALL " --no-start >/dev/null 2>&1 \
+  && grep -q '^AGENT_CONNECT_ACP_COLLABORATORS="\*"$' "$ACPCFG" \
+  && ok "all is matched trimmed and case-insensitively" \
+  || bad '" ALL " was not read as all'
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
+     --collaborators "a l l" --no-start >/dev/null 2>&1; then
+  bad '"a l l" was accepted'
+else
+  ok '"a l l" is refused, not read as all'
+fi
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborators "" --no-start >/dev/null 2>&1
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborator-rooms "!a:s.space, !b:s.space" \
+     --no-start >/dev/null 2>&1 || bad "--collaborator-rooms install failed"
+grep -q '^AGENT_CONNECT_ACP_COLLABORATOR_ROOMS="!a:s.space,!b:s.space"$' "$ACPCFG" \
+  && ok "--collaborator-rooms writes the exact room ids" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--collaborator-rooms not written"; }
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T2 --adapter acp --no-start >/dev/null 2>&1 || bad "re-run failed"
+[ "$(grep -c '^AGENT_CONNECT_ACP_COLLABORATOR_ROOMS=' "$ACPCFG")" -eq 1 ] \
+  && ok "a re-run keeps the rooms, once" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a re-run changed the rooms"; }
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
+     --collaborator-rooms "@a:s.space" --no-start >/dev/null 2>&1; then
+  bad "a room that is not a room id was accepted"
+else
+  ok "a room that is not a room id is refused"
+fi
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborator-rooms "" --no-start >/dev/null 2>&1
+! grep -q '^AGENT_CONNECT_ACP_COLLABORATOR_ROOMS=' "$ACPCFG" \
+  && ok '--collaborator-rooms "" clears them' \
+  || bad '--collaborator-rooms "" left rooms behind'
 if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
      --collaborators "mark-cloud-6d4e" --no-start >/dev/null 2>&1; then
   bad "a collaborator that is not a Matrix id was accepted"

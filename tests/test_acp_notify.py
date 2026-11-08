@@ -61,6 +61,13 @@ from agent_connect.link import (  # noqa: E402
 )
 from agent_connect.sessions import SessionStore  # noqa: E402
 
+def _answered(outcome):
+    """The answer's body, after checking the Turn was answered."""
+    from agent_connect.reporter import ANSWERED
+    assert outcome.kind == ANSWERED, outcome
+    return outcome.body
+
+
 ROOM = "!room:example"
 
 
@@ -227,7 +234,7 @@ async def _adapter_declares_and_posts():
                 posted.append((destination, text))
 
             adapter.set_notifier(post)
-            text = await worker.run_turn(adapter, ctx)
+            text = _answered(await worker.run_turn(adapter, ctx))
             await until(lambda: len(posted) >= 1, 2)
             sent = door.agents[0].report["sessions"][0]["params"]
             return text, sent, posted
@@ -288,7 +295,7 @@ async def _startup_is_a_probe_and_then_a_receiver():
                                  store=SessionStore(Path(tmp) / "sessions.json"))
             problem = await adapter.preflight()
             await asyncio.sleep(0.05)
-            text = await worker.run_turn(adapter, ctx)
+            text = _answered(await worker.run_turn(adapter, ctx))
             await asyncio.sleep(0.05)
             ops = FakeOps()
             link = worker.start_listener_link(adapter, ops)

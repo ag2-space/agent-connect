@@ -13,8 +13,10 @@ lever left is answering its `session/request_permission` calls by policy — whi
 binds an agent that asks and does nothing whatsoever to one that does not.
 Rather than ship a cooperative imitation of a guarantee that used to be real,
 a guest's Task is refused at the top of `turn` and never reaches ACP. The one
-exception is a sender the owner lists in `AGENT_CONNECT_ACP_COLLABORATORS`, and
-only where the broker attested Team with `collaborator: true`. It is
+exception is a sender the owner lists in `AGENT_CONNECT_ACP_COLLABORATORS`, any
+sender in a room listed in `AGENT_CONNECT_ACP_COLLABORATOR_ROOMS`, or any sender
+when the first is `*`, and only where the broker attested Team with
+`collaborator: true`. It is
 refused **out loud**: the refusal is the Turn's answer, so it climbs the Ladder
 like any other and the room reads a sentence rather than watching a placeholder
 that never resolves. Silence is indistinguishable from breakage, and a guest who
@@ -188,6 +190,10 @@ REMOTE_CWD_ENV = "AGENT_CONNECT_ACP_REMOTE_CWD"
 SKIP_AUTH_ENV = "AGENT_CONNECT_ACP_SKIP_AUTH_CHECK"
 #: Senders the owner lets use this agent where the room grants them Team.
 COLLABORATORS_ENV = "AGENT_CONNECT_ACP_COLLABORATORS"
+#: That setting's value for every sender the room grants Team with collaborator.
+ALL_COLLABORATORS = "*"
+#: Rooms in which every sender the room grants Team with collaborator is admitted.
+COLLABORATOR_ROOMS_ENV = "AGENT_CONNECT_ACP_COLLABORATOR_ROOMS"
 TIMEOUT_ENV = "AGENT_CONNECT_TURN_TIMEOUT"
 
 #: How long one Turn may run before it is cancelled through the protocol. Ten
@@ -321,12 +327,27 @@ REFUSAL = (
     "collaborators. My owner can instead `trust` you, which grants owner access on "
     "every agent they own, in a direct message to `{concierge}`."
 )
+#: The refusal when the owner admits every room-approved collaborator.
+REFUSAL_ALL = (
+    "I can't take this request: over this connection I only work for my owner "
+    "and the collaborators this room has approved.\n\n"
+    "Nothing is wrong with your message. To work with me, this room has to give "
+    "you Collaborator access. My owner can instead `trust` you, which grants owner "
+    "access on every agent they own, in a direct message to `{concierge}`."
+)
 
 
 def allowed_collaborators(env: Optional[Mapping[str, str]] = None) -> frozenset:
     """The Matrix ids in `AGENT_CONNECT_ACP_COLLABORATORS`, comma or space separated."""
     env = os.environ if env is None else env
     raw = (env.get(COLLABORATORS_ENV) or "").replace(",", " ")
+    if raw.split() == [ALL_COLLABORATORS]:
+        return frozenset()
+    if "*" in raw or raw.strip().lower() == "all":
+        if raw not in _REPORTED_ENTRIES:
+            _REPORTED_ENTRIES.add(raw)
+            print(f"agent-connect: {COLLABORATORS_ENV} looks like a wildcard but is not "
+                  f"exactly *: only the listed ids are admitted", file=sys.stderr)
     for item in raw.split():
         if not item.startswith("@") and item not in _REPORTED_ENTRIES:
             _REPORTED_ENTRIES.add(item)
@@ -338,11 +359,40 @@ def allowed_collaborators(env: Optional[Mapping[str, str]] = None) -> frozenset:
 _REPORTED_ENTRIES: set = set()
 
 
+def all_collaborators(env: Optional[Mapping[str, str]] = None) -> bool:
+    """The setting is exactly `*`: every room-approved collaborator is admitted.
+    A `*` among ids is not, so a mistyped list narrows rather than widens."""
+    env = os.environ if env is None else env
+    return (env.get(COLLABORATORS_ENV) or "").replace(",", " ").split() == [ALL_COLLABORATORS]
+
+
+def collaborator_rooms(env: Optional[Mapping[str, str]] = None) -> frozenset:
+    """The room ids in `AGENT_CONNECT_ACP_COLLABORATOR_ROOMS`, comma or space separated."""
+    env = os.environ if env is None else env
+    raw = (env.get(COLLABORATOR_ROOMS_ENV) or "").replace(",", " ")
+    for item in raw.split():
+        if not item.startswith("!") and item not in _REPORTED_ENTRIES:
+            _REPORTED_ENTRIES.add(item)
+            print(f"agent-connect: ignoring {COLLABORATOR_ROOMS_ENV} entry {item!r}: "
+                  f"not a room id", file=sys.stderr)
+    return frozenset(item for item in raw.split() if item.startswith("!"))
+
+
+def collaborators_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Some sender other than the owner may be admitted."""
+    return (all_collaborators(env) or bool(allowed_collaborators(env))
+            or bool(collaborator_rooms(env)))
+
+
 def admitted(ctx: TurnContext, env: Optional[Mapping[str, str]] = None) -> bool:
-    """Owner, or a listed sender the room granted Team with collaborator."""
+    """Owner, or a sender the room granted Team with collaborator who is listed,
+    is in a listed room, or is anywhere when the list is `*`."""
     if ctx.access_tier == OWNER:
         return True
-    return ctx.collaborator and bool(ctx.user_id) and ctx.user_id in allowed_collaborators(env)
+    if ctx.collaborator is not True or not ctx.user_id:
+        return False
+    return (all_collaborators(env) or ctx.user_id in allowed_collaborators(env)
+            or (bool(ctx.room) and ctx.room in collaborator_rooms(env)))
 
 
 def _logged(exc) -> str:
@@ -353,7 +403,9 @@ def _logged(exc) -> str:
 
 def refusal(ctx: TurnContext) -> str:
     """`REFUSAL`, addressed to a recipient the reader can act on."""
-    return REFUSAL.format(concierge=concierge_for(ctx))
+    room_wide = all_collaborators() or (bool(ctx.room) and ctx.room in collaborator_rooms())
+    text = REFUSAL_ALL if room_wide else REFUSAL
+    return text.format(concierge=concierge_for(ctx))
 
 #: What the room is told when its conversation starts over. One sentence, in
 #: the room's own terms — a person needs to know that the agent no longer
@@ -1139,7 +1191,7 @@ class AcpAdapter:
         told that something was withheld."""
         if self._notifier is None:
             return
-        if allowed_collaborators():
+        if collaborators_enabled():
             rooms = self.owner_rooms()
             held = result_guard.notify_verdict(text, destination, rooms)
             if held.hold:

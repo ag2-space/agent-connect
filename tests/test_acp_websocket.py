@@ -34,6 +34,13 @@ from agent_connect.adapters.acp import (  # noqa: E402
     resolve_url,
 )
 
+def _answered(outcome):
+    """The answer's body, after checking the Turn was answered."""
+    from agent_connect.reporter import ANSWERED
+    assert outcome.kind == ANSWERED, outcome
+    return outcome.body
+
+
 fails = 0
 
 
@@ -343,7 +350,7 @@ import tempfile  # noqa: E402
 async def _adapter_turn(door, adapter, prompt="hello", cwd=None):
     ctx = TurnContext(prompt=prompt, task_id="t1", room="!r", access_tier="owner",
                       cwd=cwd or "/repo")
-    return await worker.run_turn(adapter, ctx)
+    return _answered(await worker.run_turn(adapter, ctx))
 
 
 async def _adapter_over_ws(remote_cwd=None, second_cwd="/local/repo"):
