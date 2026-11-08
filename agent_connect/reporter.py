@@ -7,7 +7,8 @@ hands to the relay client:
 
 - `completed`: the answer is the result body, and the broker posts it once, as
   a reply to the request. The activity ledger records the task as responded.
-- `no_action`: the agent had nothing to say — no text, or exactly `NO_REPLY`.
+- `no_action`: the agent had nothing to say — no text, or `NO_REPLY` followed
+  only by its Activity lines (`agent_connect.activity`).
   Nothing is posted and nobody is mentioned; the ledger records no action.
 - `failed`: the Turn produced nothing and did not end normally. The broker
   posts its one failure notice; the diagnostics go to the archived result.
@@ -18,7 +19,7 @@ message through Room Ops; one that cannot be posted leads the answer instead.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Sequence
 
 from ag2_relay_client.markers import mxids_in
@@ -40,7 +41,7 @@ from .events import (
     TurnContext,
     final_text,
 )
-from . import result_guard, withheld
+from . import activity, result_guard, withheld
 from .roomops import RoomOpError
 
 #: What an agent replies, alone, when the message needs no answer.
@@ -80,6 +81,20 @@ class Outcome:
 
     kind: str
     body: str = ""
+    #: The owner's Activity row labels, already checked; empty when none.
+    title: str = ""
+    summary: str = ""
+
+
+def _labelled(outcome: Outcome, labels: "activity.Labels", reason: str = COMPLETED) -> Outcome:
+    """Attach the Activity labels. A Turn that failed or did not end normally
+    (timeout, cancel, refusal, token limit) keeps its title only: the agent's
+    outcome line could claim a success that did not happen."""
+    if not labels:
+        return outcome
+    stopped_short = outcome.kind == FAILED_OUTCOME or reason not in NORMAL_REASONS
+    summary = "" if stopped_short else labels.outcome
+    return replace(outcome, title=labels.title, summary=summary)
 
 
 def is_no_reply(text: str) -> bool:
@@ -126,11 +141,17 @@ class TurnReporter:
                 done = event
             else:
                 await self.on_event(event)
-        answer = final_text(done, chunks)
+        answer, trailer = activity.split(final_text(done, chunks))
+        labels = activity.guarded(
+            ctx, activity.pick(activity.from_meta(done.meta if done else None), trailer),
+            result_guard.verdict)
         if is_no_reply(answer):
             answer = ""
         note = done.note if done else ""
         reason = done.reason if done else COMPLETED
+        return _labelled(await self._finish_turn(ctx, answer, note, reason), labels, reason)
+
+    async def _finish_turn(self, ctx: TurnContext, answer: str, note: str, reason: str) -> Outcome:
         held = result_guard.verdict(ctx, f"{answer}\n{note}")
         if held.hold:
             review = None

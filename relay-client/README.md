@@ -56,6 +56,12 @@ in-memory queue, and each one goes back through exactly one of:
 - `reject(id, reason)`: dead-letters a permanently malformed task instead of
   letting it re-serve five times.
 
+`complete`, `no_action` and `fail` also take optional `title` and `outcome`
+keywords: the owner's Activity row labels, sent as top-level result keys. Each is
+made one line, stripped of control, format and bidi characters, and cut with "…"
+to core-api's limits (60 and 150 code points). A blank one is left out. Only the
+owner and the agent see them; the room never does.
+
 Every result echoes the `lease_id` and `execution_generation` the task was
 served under, refreshed when the broker re-serves it. A result the ledger
 refuses as superseded (another serve owns the task) is dropped, not retried.

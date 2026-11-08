@@ -51,7 +51,8 @@ A `<turn>` is:
 
     {
       "actions": [ <action>, ... ],
-      "stopReason": "end_turn"        # or refusal / max_tokens / cancelled ...
+      "stopReason": "end_turn",       # or refusal / max_tokens / cancelled ...
+      "meta": {...}                   # returned as the prompt response's _meta
     }
 
 An `<action>` is one of:
@@ -369,7 +370,10 @@ class FakeAcpAgent:
             # the script: the prompt call ends normally, with `cancelled` and
             # whatever was produced before it. Everything already sent stands.
             return {"stopReason": "cancelled"}
-        return {"stopReason": turn.get("stopReason", "end_turn")}
+        response = {"stopReason": turn.get("stopReason", "end_turn")}
+        if isinstance(turn.get("meta"), dict):
+            response["_meta"] = turn["meta"]
+        return response
 
     async def _act(self, session_id: str, action: dict) -> None:
         kind = action.get("type")

@@ -268,6 +268,8 @@ class Done(TurnEvent):
     reason: str = COMPLETED
     text: str = ""
     note: str = ""
+    #: `_meta` from the agent's prompt response, when it sent one.
+    meta: Any = None
 
     @property
     def ok(self) -> bool:

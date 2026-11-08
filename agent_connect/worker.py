@@ -49,6 +49,7 @@ package and not in that section.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import signal
 import sys
@@ -355,18 +356,20 @@ async def handle_one(
     if outcome is None:
         await _answer(client, "reject", task.id, EMPTY_TASK)
         return ""
+    labels = {k: v for k, v in (("title", outcome.title), ("outcome", outcome.summary)) if v}
     if outcome.kind == ANSWERED and outcome.body.strip():
         # `repo` is what a relative path in a `[file:]` marker is read against.
-        await _answer(client, "complete", task.id, outcome.body, repo)
+        await _answer(client, "complete", task.id, outcome.body, repo, **labels)
         return outcome.body
     if outcome.kind == FAILED_OUTCOME:
-        await _answer(client, "fail", task.id, outcome.body)
+        await _answer(client, "fail", task.id, outcome.body, **labels)
         return ""
-    await _answer(client, "no_action", task.id, NO_ACTION_OUTCOME)
+    await _answer(client, "no_action", task.id, outcome.summary.strip() or NO_ACTION_OUTCOME,
+                  **({"title": outcome.title} if outcome.title else {}))
     return ""
 
 
-async def _answer(client, how: str, task_id: str, payload: str, *rest) -> None:
+async def _answer(client, how: str, task_id: str, payload: str, *rest, **labels) -> None:
     """Tell the library how one Task ended, without blocking the event loop.
 
     The call is sync and does I/O — `complete` reads the answer's markers,
@@ -387,7 +390,8 @@ async def _answer(client, how: str, task_id: str, payload: str, *rest) -> None:
     if client is None:
         return
     try:
-        await in_daemon_thread(getattr(client, how), task_id, payload, *rest)
+        await in_daemon_thread(functools.partial(getattr(client, how), **labels),
+                               task_id, payload, *rest)
     except asyncio.CancelledError:
         raise                               # a stop, not a failed answer
     except Exception as exc:  # noqa: BLE001 — one Task's answer, not the loop

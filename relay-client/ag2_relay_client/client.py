@@ -69,6 +69,7 @@ import logging
 import queue
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections import OrderedDict
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -208,7 +209,9 @@ NO_SEND = "[no-send]"
 STATUS_COMPLETED = "completed"
 STATUS_NO_ACTION = "no_action_needed"
 STATUS_FAILED = "failed"
-OUTCOME_MAX = 200
+#: The Activity row labels' limits, in code points, as core-api cuts them.
+TITLE_MAX = 60
+OUTCOME_MAX = 150
 
 #: The dead-letter code for a task this client cannot even name.
 INVALID_TASK_SCHEMA = "INVALID_TASK_SCHEMA"
@@ -1075,7 +1078,8 @@ class RelayClient:
     # --- results (F5) ------------------------------------------------------
 
     def complete(self, broker_id: str, body: str,
-                 base_dir: Optional[object] = None) -> PreparedResult:
+                 base_dir: Optional[object] = None, *,
+                 title: str = "", outcome: str = "") -> PreparedResult:
         """Answer a task. The answer is durable before this returns.
 
         The result carries `status: "completed"`, so the activity ledger records
@@ -1105,6 +1109,8 @@ class RelayClient:
         `base_dir` is what a *relative* path in a marker is read against — the
         consumer's notion of "where this turn ran". It widens nothing: the
         destination is still judged against `egress_roots`.
+
+        `title` and `outcome` label the owner's Activity row; see `labels`.
 
         Returns what was prepared — the body actually POSTed, what was
         uploaded, what was refused — so a consumer can log or display it.
@@ -1142,28 +1148,32 @@ class RelayClient:
             # variant that is correct whichever one the broker actually honors,
             # and it costs a boolean.
             payload["no_send"] = True
+        payload.update(labels(title, outcome))
         self._record_result(wire_id, payload)
         return prepared
 
-    def no_action(self, broker_id: str, outcome: str = "") -> None:
+    def no_action(self, broker_id: str, outcome: str = "", *, title: str = "") -> None:
         """Complete a task that needs no reply: nothing is posted, nobody is
         mentioned, and the activity ledger records no action (`no_action_needed`).
-        `outcome` is an optional line for the owner's activity row."""
+        `outcome` and `title` are optional labels for the owner's activity row."""
         wire_id = self._require_wire_id(broker_id)
         payload: Dict[str, Any] = {"id": wire_id, "status": STATUS_NO_ACTION,
                                    "body": NO_SEND, "no_send": True}
-        if outcome.strip():
-            payload["outcome"] = outcome.strip()[:OUTCOME_MAX]
+        payload.update(labels(title, outcome))
         self._record_result(wire_id, payload)
 
-    def fail(self, broker_id: str, diagnostics: str = "") -> None:
+    def fail(self, broker_id: str, diagnostics: str = "", *,
+             title: str = "", outcome: str = "") -> None:
         """Complete a task the agent could not finish (`failed`). The broker posts
         its one failure notice; nothing else is posted. `diagnostics` is archived
-        with the result, never shown in the room."""
+        with the result, never shown in the room. `title` and `outcome` are
+        optional labels for the owner's activity row."""
         wire_id = self._require_wire_id(broker_id)
         body = f"{NO_SEND} {diagnostics}".strip() if diagnostics.strip() else NO_SEND
-        self._record_result(wire_id, {"id": wire_id, "status": STATUS_FAILED,
-                                      "body": body, "no_send": True})
+        payload: Dict[str, Any] = {"id": wire_id, "status": STATUS_FAILED,
+                                   "body": body, "no_send": True}
+        payload.update(labels(title, outcome))
+        self._record_result(wire_id, payload)
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:
         """Dead-letter a task: terminal, never re-served, nothing posted.
@@ -1571,6 +1581,26 @@ class RelayClient:
 #: the first one (`api/v1.py:461` answers `{"error": "not leased to you"}`);
 #: the rest are what the same message would be called by anything else.
 _ERROR_KEYS = ("error", "detail", "message", "reason", "title")
+
+
+def clean_label(text: Any, limit: int) -> str:
+    """One line of plain text, at most `limit` code points: control, format,
+    bidi and lone surrogate characters removed, whitespace collapsed, cut with
+    an ellipsis."""
+    if not isinstance(text, str):
+        return ""
+    kept = "".join(" " if ch.isspace() else ch for ch in text
+                   if ch.isspace() or unicodedata.category(ch) not in ("Cc", "Cf", "Cs"))
+    line = " ".join(kept.split())
+    if len(line) > limit:
+        line = line[:limit - 1].rstrip() + "…"
+    return line
+
+
+def labels(title: Any = "", outcome: Any = "") -> Dict[str, str]:
+    """The Activity row's `title` and `outcome` result keys; blank ones are left out."""
+    out = {"title": clean_label(title, TITLE_MAX), "outcome": clean_label(outcome, OUTCOME_MAX)}
+    return {k: v for k, v in out.items() if v}
 
 
 def _fences(raw: Any) -> Dict[str, Any]:

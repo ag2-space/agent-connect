@@ -47,8 +47,8 @@ So the Worker posts and edits nothing of the answer. A Turn ends in one result
 
 - `status: "completed"` with the answer as the body. The broker posts it once, as a reply to
   the request, and the ledger records responded, then delivered.
-- `status: "no_action_needed"` when the agent has nothing to say: no text, or exactly
-  `NO_REPLY`. Nothing is posted and nobody is mentioned.
+- `status: "no_action_needed"` when the agent has nothing to say: no text, or `NO_REPLY`
+  followed only by its Activity lines (0.6.0). Nothing is posted and nobody is mentioned.
 - `status: "failed"` when the Turn produced nothing and did not end normally. The broker posts
   its one failure notice. An Adapter that explained the failure (not configured, not logged
   in) is answered with that explanation instead.

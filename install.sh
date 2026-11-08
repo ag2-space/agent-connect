@@ -81,7 +81,7 @@ START=1
 # here rather than left to pyproject because this line is what a fresh host
 # resolves: without it an installer run can settle on a pre-transport worker
 # that still expects task files.
-AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.5.1}"
+AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.6.0}"
 ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-}"
 # Empty means "not asked for". The default is settled after arg parsing,
 # because it depends on whether a command was supplied.

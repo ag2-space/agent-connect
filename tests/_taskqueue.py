@@ -141,6 +141,8 @@ class FakeClient:
         self.failed: list = []
         #: `(id, base_dir)` — what a relative attachment path is read against.
         self.base_dirs: list = []
+        #: id -> `(title, outcome)` for results sent with Activity labels.
+        self.labels: dict = {}
         #: Whatever `on_status` was given, so a test can drive the hook itself.
         self.hook = None
         self.started = 0
@@ -194,7 +196,8 @@ class FakeClient:
         except queue.Empty:
             return None
 
-    def complete(self, broker_id: str, body: str, base_dir=None) -> None:
+    def complete(self, broker_id: str, body: str, base_dir=None, *, title: str = "",
+                 outcome: str = "") -> None:
         """The real one's signature, including the third argument.
 
         `base_dir` is what a relative path in a `[file:]` marker is read
@@ -208,14 +211,22 @@ class FakeClient:
             raise ValueError(f"refusing an empty result for {wire_id}")
         self.base_dirs.append((wire_id, base_dir))
         self.completed.append((wire_id, body))
+        self._label(broker_id, title, outcome)
 
-    def no_action(self, broker_id: str, outcome: str = "") -> None:
+    def no_action(self, broker_id: str, outcome: str = "", *, title: str = "") -> None:
         """Completed with nothing to post (`no_action_needed`)."""
         self.no_actions.append((self._wire_id(broker_id), outcome))
+        self._label(broker_id, title, outcome)
 
-    def fail(self, broker_id: str, diagnostics: str = "") -> None:
+    def fail(self, broker_id: str, diagnostics: str = "", *, title: str = "",
+             outcome: str = "") -> None:
         """Completed as `failed`: the broker posts its notice."""
         self.failed.append((self._wire_id(broker_id), diagnostics))
+        self._label(broker_id, title, outcome)
+
+    def _label(self, broker_id: str, title: str, outcome: str) -> None:
+        if title or outcome:
+            self.labels[self._wire_id(broker_id)] = (title, outcome)
 
     def reject(self, broker_id: str, reason: str = "INVALID_TASK") -> None:
         # Coerced, as the real one coerces it: free text degrades to the schema
