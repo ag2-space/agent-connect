@@ -149,7 +149,7 @@ from ..acp.core import (
 from ..acp.policy import WorkingDirectoryPolicy
 from ..link import receiver_meta, room_message
 from ..addressing import addressing_preamble
-from ..routing import routing_preamble
+from ..routing import requester_line, routing_preamble
 from ..events import (
     CANCELLED,
     COMPLETED,
@@ -929,11 +929,8 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
     user text. Names are whitespace-normalized so they cannot insert framing
     lines. This is a plain-text convention, not an authorization boundary.
     """
-    who = " ".join(ctx.sender_name.split()) or "someone"
-    room_name = " ".join(ctx.room_name.split())
-    where = f" in {room_name}" if room_name else ""
     framing = (
-        f"[agent-connect] {who} is asking you this{where}, through a chat room. "
+        f"{requester_line(ctx)} "
         "Answer in chat: prose, no more than a few short paragraphs unless asked "
         "for more. You are working in the directory this session was opened in. "
         "Your host may ask the owner to approve some commands before they run; "
