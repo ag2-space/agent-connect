@@ -133,7 +133,7 @@ def notify_verdict(text: str, destination: str, owner_rooms, scan=secret_types,
     return Verdict(bool(why), tuple(why))
 
 
-def _display_name(raw: str) -> str:
+def display_name(raw: str) -> str:
     """A sender-set display name, safe to show: no control or format characters
     (bidi overrides included), one line, capped."""
     kept = "".join(" " if unicodedata.category(c)[0] == "C" else c for c in raw)
@@ -145,5 +145,5 @@ def asked_by(ctx: TurnContext) -> str:
     """Who a non-owner Turn is for, led by the attested Matrix id; `""` for the owner."""
     if ctx.access_tier == OWNER:
         return ""
-    name = _display_name(ctx.sender_name)
+    name = display_name(ctx.sender_name)
     return f'{ctx.user_id} ("{name}")' if name and name != ctx.user_id else ctx.user_id

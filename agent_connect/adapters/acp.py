@@ -149,7 +149,7 @@ from ..acp.core import (
 from ..acp.policy import WorkingDirectoryPolicy
 from ..link import receiver_meta, room_message
 from ..addressing import addressing_preamble
-from ..routing import requester_line, routing_preamble
+from ..routing import admitted_as as routing_admitted_as, requester_line, routing_preamble
 from ..events import (
     CANCELLED,
     COMPLETED,
@@ -721,7 +721,7 @@ def requester_meta(ctx: TurnContext) -> dict:
             "requested_access_tier": ctx.requested_access_tier,
             "collaborator": ctx.collaborator,
             "sensitive_data_filter": ctx.sensitive_data_filter,
-            "admitted_as": "owner" if ctx.access_tier == OWNER else "collaborator",
+            "admitted_as": routing_admitted_as(ctx),
         }
     }
 
