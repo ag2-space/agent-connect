@@ -6,7 +6,7 @@ from dataclasses import replace
 from agent_connect.adapters.acp import prompt_blocks
 from agent_connect.adapters.shim import ShimAdapter
 from agent_connect.events import TurnContext
-from agent_connect.routing import MARKER, BODY_MARKER, GUIDANCE
+from agent_connect.routing import MARKER, BODY_MARKER, COLLABORATOR_GUIDANCE, GUIDANCE
 
 def acp_text(ctx):
     blocks, problems = prompt_blocks(ctx, None, 1024)
@@ -76,3 +76,17 @@ for name in ("", " \t\n"):
     text = acp_text(replace(base, sender_name=name))
     assert text.startswith("[agent-connect] someone is asking")
 print("PASS — routing uniqueness, label injection, body boundary, identity and shim parity")
+
+# A collaborator's Turn carries the extra guidance; the owner's and a guest's do not.
+for render in (acp_text, shim_text):
+    owner = render(base)
+    collab = render(replace(base, access_tier="guest", collaborator=True,
+                            requested_access_tier="team"))
+    guest = render(replace(base, access_tier="guest"))
+    assert COLLABORATOR_GUIDANCE in collab and collab.index(COLLABORATOR_GUIDANCE) < collab.index(MARKER)
+    assert COLLABORATOR_GUIDANCE not in owner and COLLABORATOR_GUIDANCE not in guest
+assert "do not work around a denial" in acp_text(base)
+for phrase in ("skills, memory or credentials", "install software", "owner's approval"):
+    assert phrase in COLLABORATOR_GUIDANCE.replace("\n", " ")
+print("collaborator guidance: ok")
+
