@@ -270,7 +270,7 @@ export AGENT_CONNECT_REPO=/path/to/the/repo    # the session's working directory
 Or install it in one line, with the bridge pinned for you:
 
 ```bash
-curl -fsSL <installer-url>/install.sh | sh -s -- --token <TOKEN> --adapter acp --acp-agent claude
+curl -fsSL <installer-url>/install.sh | sh -s -- --base <URL> --agent-id <MXID> --adapter acp --acp-agent claude
 ```
 
 **Presets never block you.** They live in code (`agent_connect/adapters/acp.py`)
@@ -285,7 +285,7 @@ The installer takes the same thing as a flag, so an agent no preset describes is
 still a one-liner:
 
 ```bash
-curl -fsSL <installer-url>/install.sh | sh -s -- --token <TOKEN> \
+curl -fsSL <installer-url>/install.sh | sh -s -- --base <URL> --agent-id <MXID> \
      --adapter acp --acp-command "my-agent --acp"
 ```
 
@@ -330,7 +330,7 @@ The adapter can also reach an ACP agent that is **already up**, over a WebSocket
 instead of starting one per message:
 
 ```bash
-./install.sh --token <token> --adapter acp \
+./install.sh --base <URL> --agent-id <MXID> --adapter acp \
   --acp-url ws://127.0.0.1:8802/acp --acp-token <the listener's token>
 pip install 'ag2-agent-connect[websocket]'   # the SDK's transport extra
 ```
@@ -580,6 +580,48 @@ its working directory can then send the copy. The permitted area is a boundary o
 paths, not a proof about contents — closing that needs a sandbox that refuses the
 first copy.
 
+## Connecting with a one-time code
+
+s.space shows a one-time code (it starts with `acp.`), the backend URL and the
+agent's Matrix id. The installer exchanges the code for the agent's relay token
+and writes the token only into the 0600 config file. The token is never shown,
+never typed, and never on a command line, so neither `ps` nor shell history
+holds it.
+
+```bash
+curl -fsSL <installer-url>/install.sh | sh -s -- --base <URL> --agent-id <MXID> \
+     --adapter acp --acp-command 'openclaw acp'
+```
+
+The installer asks for the code on the terminal without echoing it. Without a
+terminal (an agent running the setup for you), download the installer and pipe
+the code in:
+
+```bash
+curl -fsSLo install.sh <installer-url>/install.sh
+printf '%s\n' "$CODE" | sh install.sh --base <URL> --agent-id <MXID> --code - \
+     --adapter acp --acp-command 'openclaw acp'
+```
+
+`--code -` cannot be used with `curl … | sh`, because there stdin is the
+installer itself; the installer refuses it rather than read its own text.
+
+- **The code is spent last.** The installer checks its flags and installs the
+  worker first. A machine that cannot run the agent leaves the code unused.
+- **Checked before anything is written.** The installer refuses an answer that
+  names a different agent than `--agent-id`, or a relay that is not https on
+  the backend's host or a host under it (`--trust-relay-host <host>` accepts one
+  you expect). A refused code is spent, and nothing is written.
+- **Used, expired, busy.** A used or expired code says so; make a new one in
+  s.space. "Still redeeming" and a busy backend are retried with backoff.
+- **Re-running.** `install.sh --agent-id <MXID>` with no credential keeps the
+  token already in that install's config, for an upgrade or a changed setting.
+  A bare `install.sh` with no credential and no `--agent-id` or `--instance` is
+  refused, so it can never rewrite an install with the defaults.
+- **A token you already have.** `--token-stdin` reads it as one line from
+  stdin. `--token <TOKEN>` still works, and notes that `ps` and shell history
+  keep it.
+
 ## The config file: settings written down, not exported
 
 Everything below is an environment variable, which is a fine interface for a
@@ -669,8 +711,8 @@ Give each agent its own instance. The web setup flow passes the agent's full
 Matrix identity so the installer derives a stable name:
 
 ```sh
-./install.sh --token '<gateway>|<agent-one-token>' --adapter codex --agent-id '@owner-codex-one.agent:example.org'
-./install.sh --token '<gateway>|<agent-two-token>' --adapter codex --agent-id '@owner-codex-two.agent:example.org'
+./install.sh --base <URL> --adapter codex --agent-id '@owner-codex-one.agent:example.org'
+./install.sh --base <URL> --adapter codex --agent-id '@owner-codex-two.agent:example.org'
 ```
 
 Each gets its own private config, launcher, workspace, log and background
