@@ -28,6 +28,7 @@
 #   --collaborators AGENT_CONNECT_ACP_COLLABORATORS  exact Matrix ids, comma
 #             separated, of the agents and people allowed to use an ACP agent
 #             besides you (they also need Collaborator access in the room).
+#             "all" admits every sender the room grants Collaborator access.
 #             "" clears the list. Omitted on a re-run, the stored list is kept.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
 #   --instance AGENT_CONNECT_INSTANCE  separate config, workspace and service
@@ -76,7 +77,7 @@ START=1
 # here rather than left to pyproject because this line is what a fresh host
 # resolves: without it an installer run can settle on a pre-transport worker
 # that still expects task files.
-AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.4.0}"
+AC_PIP_SPEC="${AGENT_CONNECT_PIP_SPEC:-ag2-agent-connect>=0.5.0}"
 ACP_AGENT="${AGENT_CONNECT_ACP_AGENT:-}"
 # Empty means "not asked for". The default is settled after arg parsing,
 # because it depends on whether a command was supplied.
@@ -281,8 +282,14 @@ if [ "$INSTANCE" != default ]; then
 fi
 mkdir -p "$APP_DIR"
 # Exact Matrix ids only: a typo here would silently admit nobody, or the wrong id.
-if [ "$COLLABORATORS_GIVEN" -eq 1 ]; then
+_all_collab=0
+case "$(printf '%s' "$COLLABORATORS" | tr -d ' ')" in all|ALL|'*') _all_collab=1 ;; esac
+if [ "$COLLABORATORS_GIVEN" -eq 1 ] && [ "$_all_collab" -eq 1 ]; then
+  COLLABORATORS='*'
+  echo "install.sh: --collaborators all: every sender a room grants Collaborator access can use this agent with its normal tools. It does not make them owner." >&2
+elif [ "$COLLABORATORS_GIVEN" -eq 1 ]; then
   _clean=""
+  set -f
   for _id in $(printf '%s' "$COLLABORATORS" | tr ',' ' '); do
     printf '%s\n' "$_id" | grep -Eq '^@[^@:[:space:]]+:[^@:[:space:]]+(:[0-9]+)?$' || {
       echo "install.sh: --collaborators: not a Matrix id: $_id (expected @name:server)" >&2
@@ -290,6 +297,7 @@ if [ "$COLLABORATORS_GIVEN" -eq 1 ]; then
     }
     _clean="${_clean:+$_clean,}$_id"
   done
+  set +f
   COLLABORATORS="$_clean"
 fi
 # Named here rather than at 1c: the ACP decisions below need to read it.

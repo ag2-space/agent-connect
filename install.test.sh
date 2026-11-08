@@ -626,6 +626,25 @@ PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
 ! grep -q '^AGENT_CONNECT_ACP_COLLABORATORS=' "$ACPCFG" \
   && ok '--collaborators "" clears the list' \
   || { sed 's/^/    /' "$ACPCFG"; bad "--collaborators \"\" left a list behind"; }
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborators all --no-start >/dev/null 2>&1 \
+  || bad "--collaborators all failed"
+grep -q '^AGENT_CONNECT_ACP_COLLABORATORS="\*"$' "$ACPCFG" \
+  && ok '--collaborators all writes "*"' \
+  || { sed 's/^/    /' "$ACPCFG"; bad "--collaborators all not written as *"; }
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T2 --adapter acp --no-start >/dev/null 2>&1 || bad "re-run failed"
+grep -q '^AGENT_CONNECT_ACP_COLLABORATORS="\*"$' "$ACPCFG" \
+  && ok "a re-run keeps all" \
+  || { sed 's/^/    /' "$ACPCFG"; bad "a re-run dropped all"; }
+if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
+     --collaborators "@a:s.space,*" --no-start >/dev/null 2>&1; then
+  bad "a * mixed with ids was accepted"
+else
+  ok "a * mixed with ids is refused"
+fi
+PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+  sh "$SCRIPT" --token T --adapter acp --collaborators "" --no-start >/dev/null 2>&1
 if PATH="$TMP:$PATH" HOME="$TMP" sh "$SCRIPT" --token T --adapter acp \
      --collaborators "mark-cloud-6d4e" --no-start >/dev/null 2>&1; then
   bad "a collaborator that is not a Matrix id was accepted"

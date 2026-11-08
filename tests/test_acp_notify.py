@@ -227,7 +227,7 @@ async def _adapter_declares_and_posts():
                 posted.append((destination, text))
 
             adapter.set_notifier(post)
-            text = await worker.run_turn(adapter, ctx)
+            text = (await worker.run_turn(adapter, ctx)).body
             await until(lambda: len(posted) >= 1, 2)
             sent = door.agents[0].report["sessions"][0]["params"]
             return text, sent, posted
@@ -288,7 +288,7 @@ async def _startup_is_a_probe_and_then_a_receiver():
                                  store=SessionStore(Path(tmp) / "sessions.json"))
             problem = await adapter.preflight()
             await asyncio.sleep(0.05)
-            text = await worker.run_turn(adapter, ctx)
+            text = (await worker.run_turn(adapter, ctx)).body
             await asyncio.sleep(0.05)
             ops = FakeOps()
             link = worker.start_listener_link(adapter, ops)
