@@ -37,9 +37,9 @@ from agent_connect.reporter import (
 from agent_connect.worker import handle_one
 from _taskqueue import FakeClient, task
 
-ROOM = "!room:ag2.space"
-REQUESTER = "@peer.agent:ag2.space"
-MEMBER = "@ada:ag2.space"
+ROOM = "!room:s.space"
+REQUESTER = "@peer.agent:s.space"
+MEMBER = "@ada:s.space"
 
 fails = 0
 
@@ -143,7 +143,7 @@ check(not any(line in run(*said("all of it")).body for line in STOP_LINES.values
 print("\n-- notices --")
 
 ops = Ops()
-text = f"the context was reset; ask {MEMBER} or {REQUESTER}, not @stranger:ag2.space"
+text = f"the context was reset; ask {MEMBER} or {REQUESTER}, not @stranger:s.space"
 out = run(Notice(text=text), *said("done"), ops=ops)
 check(len(ops.messages) == 1 and ops.messages[0][1] == text and ops.edits == [],
       "a notice is posted as its own message")

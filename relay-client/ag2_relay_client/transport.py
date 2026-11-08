@@ -326,7 +326,7 @@ class RelayHTTP:
         - The bearer goes out **only** when `under_base` says the URL is the
           gateway's own — exact parsed origin, at or under the base path with a
           real `/` boundary. Everything else is fetched anonymously. There is no
-          second credential here: on the AG2 Space wire the broker downloads
+          second credential here: on the s.space wire the broker downloads
           from the homeserver box-side as the agent, so a worker never needs a
           Matrix token to read an attachment.
         - **No redirect is followed, credentialed or not.** urllib re-sends the

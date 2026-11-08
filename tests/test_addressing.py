@@ -38,31 +38,31 @@ def check(cond, name):
         fails += 1
 
 
-ROSTER = ("@ada:ag2.space", "@codex.agent:ag2.space", "@sutando-b.agent:ag2.space")
-PEER = "@sutando-b.agent:ag2.space"
+ROSTER = ("@ada:s.space", "@codex.agent:s.space", "@sutando-b.agent:s.space")
+PEER = "@sutando-b.agent:s.space"
 
 
 # --- inbound: the broker's routing facts reach the Turn, verbatim -----------
 
 ctx = turn_context(
-    task("t1", "hand this to the other agent", room="!room:ag2.space",
-         user_id="@ada:ag2.space", addressed_to=PEER, reply_to_me=True,
-         reply_to_sender="@codex.agent:ag2.space", room_members=list(ROSTER),
+    task("t1", "hand this to the other agent", room="!room:s.space",
+         user_id="@ada:s.space", addressed_to=PEER, reply_to_me=True,
+         reply_to_sender="@codex.agent:s.space", room_members=list(ROSTER),
          room_member_count=5),
     "/repo")
 check(ctx.addressed_to == PEER, "addressed_to crosses")
 check(ctx.reply_to_me is True, "reply_to_me crosses — it used to be dropped here")
-check(ctx.reply_to_sender == "@codex.agent:ag2.space", "reply_to_sender crosses")
+check(ctx.reply_to_sender == "@codex.agent:s.space", "reply_to_sender crosses")
 check(ctx.room_members == ROSTER, "the roster crosses, as a tuple of full mxids")
 check(ctx.room_member_count == 5, "and the count beside it")
 check(ctx.prompt == "hand this to the other agent",
       "and none of it touches what the person typed")
 
 capped = turn_context(
-    task("t2", "x", room_members="@ada:ag2.space, @codex.agent:ag2.space (+3 more)",
+    task("t2", "x", room_members="@ada:s.space, @codex.agent:s.space (+3 more)",
          room_member_count=5),
     "/repo")
-check(capped.room_members == ("@ada:ag2.space", "@codex.agent:ag2.space"),
+check(capped.room_members == ("@ada:s.space", "@codex.agent:s.space"),
       "the broker's capped string form arrives as the members it names")
 
 plain = turn_context(task("t3", "hi"), "/repo")
@@ -108,7 +108,7 @@ p = sandbox_preamble("workspace-write", "owner", room_members=ROSTER,
                      addressed_to=PEER, room_member_count=3)
 check(p.startswith("[agent-connect: this run's sandbox is 'workspace-write'"),
       "the sandbox line still leads")
-check("Others in this room: @ada:ag2.space" in p and f"addressed to {PEER}" in p,
+check("Others in this room: @ada:s.space" in p and f"addressed to {PEER}" in p,
       "the addressing lines follow it")
 check(p.index("[file:") < p.index("Others in this room"),
       "after the file instruction, which is about this run rather than the room")
@@ -119,7 +119,7 @@ check(sandbox_preamble("workspace-write", "owner")
 check("Others in this room" not in sandbox_preamble("read-only", "guest")
       and "addressed to" not in sandbox_preamble("read-only", "guest"),
       "a Task with no roster says nothing about one")
-check("Others in this room: @ada:ag2.space" in
+check("Others in this room: @ada:s.space" in
       sandbox_preamble("read-only", "guest", room_members=ROSTER),
       "a read-only run is told who is there too — addressing is routing, not "
       "privilege")
@@ -136,27 +136,27 @@ class StubAdapter:
 
 stub = StubAdapter()
 asyncio.run(process_one(
-    task("t4", "who is here?", room="!room:ag2.space", room_members=list(ROSTER),
-         room_member_count=3, addressed_to="@codex.agent:ag2.space"),
+    task("t4", "who is here?", room="!room:s.space", room_members=list(ROSTER),
+         room_member_count=3, addressed_to="@codex.agent:s.space"),
     ShimAdapter("stub", stub), "/repo"))
 sent = stub.calls[0]
 check("Others in this room: " + ", ".join(ROSTER) + "." in sent,
       "through the Worker, a shimmed Adapter is handed the roster")
-check("addressed to @codex.agent:ag2.space" in sent, "and the addressee")
+check("addressed to @codex.agent:s.space" in sent, "and the addressee")
 check(sent.endswith("\n\nwho is here?"), "and the person's words, last and untouched")
 
 
 # --- outbound: the mxids a body names ---------------------------------------
 
-check(mentioned_mxids(f"{PEER} can you take this? cc @ada:ag2.space.")
-      == [PEER, "@ada:ag2.space"],
+check(mentioned_mxids(f"{PEER} can you take this? cc @ada:s.space.")
+      == [PEER, "@ada:s.space"],
       "full mxids are found in an answer, in order, punctuation aside")
 check(mentioned_mxids("ask sutando-b.agent or @sutando-b about it") == [],
       "a localpart or a display name is not an address — only a full mxid routes")
-check(mentioned_mxids("@ada:ag2.space and @ada:ag2.space again") == ["@ada:ag2.space"],
+check(mentioned_mxids("@ada:s.space and @ada:s.space again") == ["@ada:s.space"],
       "each once")
-check(mentioned_mxids("@ada:ag2.space and @nobody:elsewhere.example", ROSTER)
-      == ["@ada:ag2.space"],
+check(mentioned_mxids("@ada:s.space and @nobody:elsewhere.example", ROSTER)
+      == ["@ada:s.space"],
       "with a roster, only members are kept — a stranger is a mention nobody "
       "receives")
 check(mentioned_mxids("@nobody:elsewhere.example", ()) == ["@nobody:elsewhere.example"],

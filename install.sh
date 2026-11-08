@@ -3,7 +3,7 @@
 #
 # Turns "clone the repo, configure, run" into a single paste: installs the
 # worker, writes its config file and a launcher, and starts your local agent as
-# a first-class AG2 Space room agent.
+# a first-class s.space room agent.
 #
 # ONE PROCESS. The worker carries its own relay client (workspace ADR 0001), so
 # the launcher this writes starts the worker and nothing else. It used to start
@@ -53,7 +53,7 @@
 #   ollama   → local model via Ollama HTTP API      — no provider auth
 #   acp      → any Agent Client Protocol agent       — `--adapter acp --acp-agent claude`
 #              (owner-tier only, cooperative confinement — see README)
-# You still log into the underlying tool yourself; the token is your AG2 Space
+# You still log into the underlying tool yourself; the token is your s.space
 # *identity*, never a model API key.
 set -eu
 
@@ -194,7 +194,7 @@ if [ "${#INSTANCE}" -gt 32 ]; then
 fi
 
 if [ -z "$TOKEN" ]; then
-  echo "install.sh: --token is required (get it from the AG2 Space Agent Portal)." >&2
+  echo "install.sh: --token is required (get it from the s.space Agent Portal)." >&2
   exit 2
 fi
 
@@ -676,7 +676,7 @@ elif command -v systemctl >/dev/null 2>&1; then
   fi
   cat > "$UNIT_DIR/$SERVICE_UNIT" <<UNIT
 [Unit]
-Description=AG2 Space agent-connect worker ($INSTANCE)
+Description=s.space agent-connect worker ($INSTANCE)
 After=network-online.target
 [Service]
 # No token in the unit file: it is in a private file the launcher reads.
@@ -707,4 +707,4 @@ else
   say "started (pid $!). Logs: $APP_DIR/agent-connect.log"
 fi
 
-say "done. Your agent should appear in AG2 Space shortly — @-mention it in an allowed room."
+say "done. Your agent should appear in s.space shortly — @-mention it in an allowed room."

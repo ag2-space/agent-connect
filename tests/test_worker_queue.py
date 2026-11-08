@@ -153,7 +153,7 @@ def deliver(relay, http, *raw):
 print("\n-- an answered Task reaches /v1/results, through the real client --")
 
 relay, http = client()
-deliver(relay, http, wire("q-1", "summarise it", room="!room:ag2.space"))
+deliver(relay, http, wire("q-1", "summarise it", room="!room:s.space"))
 adapter = Answers()
 results = outgoing()
 
@@ -206,7 +206,7 @@ check(http.results()[0] == {"id": "q-1", "body": "the answer", "status": "comple
 check(relay.inflight() == [],
       "and the ledger of ids owed an answer is empty again — an id left in it "
       "is a lease left to expire and a Turn that runs a second time")
-check(adapter.seen and adapter.seen[0].room == "!room:ag2.space",
+check(adapter.seen and adapter.seen[0].room == "!room:s.space",
       "the Turn was built from the delivered Task, room and all")
 
 
@@ -239,7 +239,7 @@ print("\n-- an upload with no caption is not one of them --")
 relay, http = client()
 deliver(relay, http, wire("q-6", "[ag2space-media: https://broker.example/media/1 "
                                  "name=Screenshot.png mime=image/png]",
-                          room="!shot:ag2.space"))
+                          room="!shot:s.space"))
 adapter = Answers()
 results = outgoing()
 asyncio.run(_one_pass(relay, adapter, lambda: bool(http.results())))
@@ -287,8 +287,8 @@ print("\n-- one Task, one answer, whatever the Turn did --")
 
 relay, http = client()
 deliver(relay, http,
-        wire("q-4", "explode", room="!a:ag2.space"),
-        wire("q-5", "fine", room="!b:ag2.space"))
+        wire("q-4", "explode", room="!a:s.space"),
+        wire("q-5", "fine", room="!b:s.space"))
 
 
 class Selective:

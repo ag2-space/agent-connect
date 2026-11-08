@@ -1,6 +1,6 @@
 """Owner questions: a private multiple-choice question to this agent's owner.
 
-AG2 Space's room questions (`room.question.ask` / `room.question.inspect`) are
+s.space's room questions (`room.question.ask` / `room.question.inspect`) are
 core Actions. They are room-visible, so a question is asked only in the owner's
 DM with this agent, and only after its membership is checked to be the agent and
 the owner alone. The Actions are reached the way sparrow reaches them:

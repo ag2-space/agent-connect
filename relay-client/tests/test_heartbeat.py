@@ -35,8 +35,8 @@ def check(cond, name):
 
 
 def wire_task(wire_id, **over):
-    task = {"id": wire_id, "task": "do it", "channel_id": "!room:ag2.space",
-            "user_id": "@alice:ag2.space", "access_tier": "owner"}
+    task = {"id": wire_id, "task": "do it", "channel_id": "!room:s.space",
+            "user_id": "@alice:s.space", "access_tier": "owner"}
     task.update(over)
     return task
 
@@ -238,7 +238,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(resumed.inflight() == ["task-carried"],
           "the id is inherited from the journal, as an id this run never "
           "accepted from the wire")
-    check(resumed.journal.room_for("task-carried") == "!room:ag2.space",
+    check(resumed.journal.room_for("task-carried") == "!room:s.space",
           "with the room sidecar E3 would take with it (F7)")
 
     resumed.hold("task-carried")
@@ -246,7 +246,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
         resumed.heartbeat()
     check(resumed.inflight() == ["task-carried"],
           "a held id is never reconciled away, however many passes go by (C4)")
-    check(resumed.journal.room_for("task-carried") == "!room:ag2.space",
+    check(resumed.journal.room_for("task-carried") == "!room:s.space",
           "so the room a media answer has to target is still there")
 
     broker.on("POST", "/v1/results", json={"ok": True})

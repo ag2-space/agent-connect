@@ -39,8 +39,8 @@ def check(cond, name):
 
 
 def wire_task(wire_id="task-1"):
-    return {"id": wire_id, "task": "do it", "channel_id": "!room:ag2.space",
-            "user_id": "@alice:ag2.space", "access_tier": "owner"}
+    return {"id": wire_id, "task": "do it", "channel_id": "!room:s.space",
+            "user_id": "@alice:s.space", "access_tier": "owner"}
 
 
 def state_of(client):

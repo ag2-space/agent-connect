@@ -274,7 +274,7 @@ check(attachments.max_bytes({"AGENT_CONNECT_ATTACHMENT_MAX_BYTES": "-1"})
 shot = Resolved(path=str(real), mime="image/png", name="shot.png", ok=True)
 ctx = turn_context(
     task("t9", f"what is wrong with this?\n[Photo attached: {real}]",
-         room="!room:ag2.space", attachments=(shot,)),
+         room="!room:s.space", attachments=(shot,)),
     "/repo")
 check(len(ctx.attachments) == 1 and ctx.attachments[0].mime == "image/png",
       "a Task's attachments reach the Adapter boundary on the TurnContext")
@@ -309,7 +309,7 @@ class OnlyText:
 impl = OnlyText()
 shimmed = ShimAdapter("codex", impl)
 shim_out = asyncio.run(handle_one(
-    task("s1", "what is wrong with this?", room="!room:ag2.space",
+    task("s1", "what is wrong with this?", room="!room:s.space",
          attachments=(
              Resolved(path=str(real), mime="image/png", name="shot.png", ok=True),
              Resolved(path=str(real), mime="application/pdf", name="notes.pdf",
@@ -335,7 +335,7 @@ check(str(real) not in (impl.seen or ""),
 # the two happened.
 impl = OnlyText()
 shim_gone = asyncio.run(handle_one(
-    task("s2", "what is wrong with this?", room="!room:ag2.space",
+    task("s2", "what is wrong with this?", room="!room:s.space",
          attachments=(Resolved(mime="image/jpeg", name="photo.jpg", ok=False,
                                reason=UNREACHABLE),)),
     ShimAdapter("codex", impl), str(base)))

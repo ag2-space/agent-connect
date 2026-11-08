@@ -1,6 +1,6 @@
 # ag2-relay-client
 
-The AG2 Space relay wire, as a library: one bearer's whole conversation with the
+The s.space relay wire, as a library: one bearer's whole conversation with the
 broker — poll, lease, ack, results, heartbeat, media in both directions, Room
 Ops — behind one seam. A consumer takes Tasks out of an in-memory queue and
 hands answers back through `complete` / `reject`; everything that touches the
@@ -349,7 +349,7 @@ qid = q.ask("Post this reply?", [("release", "Post it"), ("discard", "Discard")]
 answer = q.inspect(qid)   # Answer(status, option, revision); status pending|answered|expired|cancelled|held
 ```
 
-AG2 Space questions are room-visible, so a question is asked only in the owner's
+s.space questions are room-visible, so a question is asked only in the owner's
 DM with the agent (`owner_dm_room` from `/v1/agents`), and only after its members
 are checked to be the agent and the owner alone. It is targeted at the owner, who
 alone may answer, with no free text. The Actions (`room.question.ask`,

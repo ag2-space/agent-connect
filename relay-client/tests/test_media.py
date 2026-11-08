@@ -70,10 +70,10 @@ def marker(url, **hints):
 def wire_task(wire_id="task-1", body="what is the status?", **over):
     task = {
         "id": wire_id,
-        "task": f"[AG2Space @alice:ag2.space] {body}",
+        "task": f"[AG2Space @alice:s.space] {body}",
         "source": "ag2space",
-        "channel_id": "!room:ag2.space",
-        "user_id": "@alice:ag2.space",
+        "channel_id": "!room:s.space",
+        "user_id": "@alice:s.space",
         "access_tier": "owner",
     }
     task.update(over)
@@ -245,8 +245,8 @@ with tempfile.TemporaryDirectory() as tmp:
 # --- a marker becomes a file, end to end ------------------------------------
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     client = client_for(broker, tmp)
-    url = f"{broker.url}/v1/media/ag2.space/abc?room_id=%21room%3Aag2.space"
-    broker.on("GET", "/v1/media/ag2.space/abc", body=PNG,
+    url = f"{broker.url}/v1/media/s.space/abc?room_id=%21room%3As.space"
+    broker.on("GET", "/v1/media/s.space/abc", body=PNG,
               headers={"Content-Type": "image/png"})
     broker.on("GET", "/v1/tasks", json={"tasks": [wire_task(
         body=marker(url, mime="application/octet-stream", name="cat.png",
@@ -271,15 +271,15 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(got.size == len(PNG) and got.reason == "", "and the size that was read")
     check("ag2space-media" not in task.body and broker.url not in task.body,
           "the body carries no marker and no URL")
-    check(task.body == "[AG2Space @alice:ag2.space] what is this?",
+    check(task.body == "[AG2Space @alice:s.space] what is this?",
           "only the words the sender typed")
 
-    fetch = broker.took("GET", "/v1/media/ag2.space/abc")[0]
+    fetch = broker.took("GET", "/v1/media/s.space/abc")[0]
     check(fetch.header("Authorization") == "Bearer SECRET",
           "the fetch carried the poll bearer — it is the gateway's own URL")
     check(fetch.header("User-Agent") and "python-urllib" not in fetch.header("User-Agent"),
           "and the explicit User-Agent the edge requires (B1)")
-    check(fetch.query == "room_id=%21room%3Aag2.space",
+    check(fetch.query == "room_id=%21room%3As.space",
           "with the room_id the marker carried — the membership gate reads it")
 
     # Delete-on-complete, through the client this time.
@@ -321,7 +321,7 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     check(not task.attachments[0].ok and "502" in task.attachments[0].reason,
           "with the attachment marked failed and the status carried")
     check(task.attachments[0].path == "", "and no path, because there is no file")
-    check(task.body == "[AG2Space @alice:ag2.space] please look",
+    check(task.body == "[AG2Space @alice:s.space] please look",
           "the body is the sender's words, marker gone, however the fetch went")
     check(broker.url not in task.attachments[0].reason,
           "the reason names no URL — that is what must not cross the seam")

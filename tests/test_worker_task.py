@@ -67,18 +67,18 @@ check(turn_context(task("tb", "x", access_tier={"trust": "me"}), "/repo").access
 
 owner = turn_context(
     task("task-123", "create a file called write-test.txt with content hi",
-         room="!room:ag2.space", room_name="qingyun", sender_name="qingyun",
-         user_id="@qingyun:ag2.space", source_message_id="$abc123:ag2.space",
+         room="!room:s.space", room_name="qingyun", sender_name="qingyun",
+         user_id="@qingyun:s.space", source_message_id="$abc123:s.space",
          timestamp="2026-07-13T02:21:31Z", priority="normal"),
     "/repo")
 check(owner.access_tier == "owner" and owner.sandbox == "workspace-write",
       "the owner's own Task: owner tier, workspace-write")
 check(owner.prompt == "create a file called write-test.txt with content hi",
       "the prompt is what the person typed, and nothing about the envelope")
-check((owner.room, owner.room_name) == ("!room:ag2.space", "qingyun"),
+check((owner.room, owner.room_name) == ("!room:s.space", "qingyun"),
       "the room is the broker's channel_id; the name beside it is for display")
 check((owner.sender_name, owner.user_id, owner.source_message_id)
-      == ("qingyun", "@qingyun:ag2.space", "$abc123:ag2.space"),
+      == ("qingyun", "@qingyun:s.space", "$abc123:s.space"),
       "who asked, under which identity, in which message — all carried")
 check(owner.task_id == "task-123",
       "and the Task travels under the broker's own id, which is what gets answered")

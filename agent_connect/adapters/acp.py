@@ -283,7 +283,7 @@ PRESETS: Dict[str, Preset] = {
 }
 
 #: Who `trust` is a command *to*. It is a message to the concierge and nothing
-#: else: `relay_allowlist.parse_command` on the AG2 Space side is only ever
+#: else: `relay_allowlist.parse_command` on the s.space side is only ever
 #: reached from a direct message to that user, so the same words typed in a room
 #: — or in a DM to the agent — arrive here as an ordinary prompt and are answered
 #: as a question. Named here rather than left to the reader because ticket 14

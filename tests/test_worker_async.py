@@ -80,19 +80,19 @@ class NativeStub:
 # -- the context reaches the Adapter, carrying every field -------------------
 
 ctx = turn_context(
-    task("task-c1", "summarise worker.py", room="!room:ag2.space",
-         room_name="qingyun", sender_name="Nikita", user_id="@nikita:ag2.space",
+    task("task-c1", "summarise worker.py", room="!room:s.space",
+         room_name="qingyun", sender_name="Nikita", user_id="@nikita:s.space",
          source_message_id="$msg-42"),
     "/repo")
-check(ctx.room == "!room:ag2.space", "context carries the room")
+check(ctx.room == "!room:s.space", "context carries the room")
 check(ctx.access_tier == "owner", "context carries the Access Tier")
 check(ctx.sender_name == "Nikita", "context carries the sender name")
-check(ctx.user_id == "@nikita:ag2.space", "context carries the user identifier")
+check(ctx.user_id == "@nikita:s.space", "context carries the user identifier")
 check(ctx.source_message_id == "$msg-42", "context carries the source message identifier")
 check(ctx.prompt == "summarise worker.py", "context carries the prompt, preamble-free")
 check(ctx.sandbox == "workspace-write", "the Sandbox is derived from the Tier, here")
 check(ctx.cwd == "/repo", "context carries the working directory")
-check(ctx.session_key == ("!room:ag2.space", "owner"), "Session key is room + Tier, never room alone")
+check(ctx.session_key == ("!room:s.space", "owner"), "Session key is room + Tier, never room alone")
 check(
     turn_context(task("task-r0", "x"), "/repo").session_key
     != turn_context(task("task-r1", "x"), "/repo").session_key,
@@ -101,14 +101,14 @@ check(
 
 native = NativeStub()
 client = FakeClient()
-tf = task("c2", "do it", room="!r2:ag2.space", sender_name="Nikita",
-          user_id="@n:ag2.space", source_message_id="$m2")
+tf = task("c2", "do it", room="!r2:s.space", sender_name="Nikita",
+          user_id="@n:s.space", source_message_id="$m2")
 asyncio.run(handle_one(tf, native, "/repo", client=client))
 seen = native.seen[0]
 check(isinstance(seen, TurnContext), "the Adapter is handed a TurnContext")
 check(
     (seen.room, seen.access_tier, seen.sender_name, seen.user_id, seen.source_message_id)
-    == ("!r2:ag2.space", "owner", "Nikita", "@n:ag2.space", "$m2"),
+    == ("!r2:s.space", "owner", "Nikita", "@n:s.space", "$m2"),
     "every carried field reaches the Adapter",
 )
 check(client.answer("c2") == "hi",
@@ -176,7 +176,7 @@ check(get_adapter("codex").impl is ADAPTERS["codex"], "codex is driven by its ow
 # that prose through verbatim rather than classify it — the error text a person
 # sees for a missing CLI or a timeout is unchanged.
 errs = ShimAdapter("codex-ish", SyncStub(output="agent-connect: codex timed out after 600s."))
-out = asyncio.run(process_one(task("x1", "do it", room="!e:ag2.space"),
+out = asyncio.run(process_one(task("x1", "do it", room="!e:s.space"),
                               errs, "/repo"))
 check(
     out.body == "agent-connect: codex timed out after 600s.",
@@ -224,8 +224,8 @@ check(
 
 slow = ShimAdapter("slow", SyncStub(delay=0.4))
 client = FakeClient()
-a = task("r1", "slow one", room="!a:ag2.space")
-b = task("r2", "slow two", room="!b:ag2.space")
+a = task("r1", "slow one", room="!a:s.space")
+b = task("r2", "slow two", room="!b:s.space")
 
 
 async def _two_rooms():
@@ -244,8 +244,8 @@ check(slow.impl.peak == 2, "both Tasks were genuinely in flight together")
 check(client.answered == {"r1", "r2"}, "both rooms got an answer")
 
 same = ShimAdapter("same", SyncStub(delay=0.2))
-c = task("s1", "first", room="!same:ag2.space")
-d = task("s2", "second", room="!same:ag2.space")
+c = task("s1", "first", room="!same:s.space")
+d = task("s2", "second", room="!same:s.space")
 
 
 async def _one_session():
@@ -263,8 +263,8 @@ check(same.impl.peak == 1, "one Session runs one Turn at a time")
 # -- a failing Task is one Task's problem ------------------------------------
 
 client = FakeClient()
-boom = task("b1", "explode", room="!x:ag2.space")
-fine = task("b2", "fine", room="!y:ag2.space")
+boom = task("b1", "explode", room="!x:s.space")
+fine = task("b2", "fine", room="!y:s.space")
 
 
 class Selective:
@@ -316,7 +316,7 @@ check(client.refusal("e2") == EMPTY_TASK,
       "refusal, and still never reaches the Adapter")
 check(counted.seen == [], "— still nothing handed to the Local Agent")
 
-answered = asyncio.run(handle_one(task("e3", "hello", room="!z:ag2.space"),
+answered = asyncio.run(handle_one(task("e3", "hello", room="!z:s.space"),
                                   Selective(), "/repo", client=client))
 check(answered == "ok" and client.answer("e3") == "ok",
       "and an ordinary Task is completed with what the Turn returned")
@@ -379,7 +379,7 @@ class Wedged:
 async def _cancelled():
     adapter = Wedged()
     fut = asyncio.ensure_future(
-        handle_one(task("c9", "take your time", room="!c:ag2.space"), adapter,
+        handle_one(task("c9", "take your time", room="!c:s.space"), adapter,
                    "/repo", client=client))
     for _ in range(200):
         await asyncio.sleep(0.01)
@@ -415,7 +415,7 @@ class Sluggish(FakeClient):
 
 async def _answering_at_the_stop():
     fut = asyncio.ensure_future(
-        handle_one(task("s1", "quick", room="!s:ag2.space"), NativeStub(),
+        handle_one(task("s1", "quick", room="!s:s.space"), NativeStub(),
                    "/repo", client=Sluggish()))
     await asyncio.sleep(0.15)                # the answer is on its thread now
     fut.cancel()                             # what the teardown does on SIGTERM
@@ -500,8 +500,8 @@ check(not to_thread_users,
 
 # -- the drain loop keeps going -----------------------------------------------
 
-client = FakeClient().offer(task("l1", "explode", room="!l1:ag2.space"),
-                            task("l2", "fine", room="!l2:ag2.space"))
+client = FakeClient().offer(task("l1", "explode", room="!l1:s.space"),
+                            task("l2", "fine", room="!l2:s.space"))
 
 
 async def _drain():

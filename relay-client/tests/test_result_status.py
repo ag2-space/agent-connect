@@ -27,7 +27,7 @@ def check(cond, what):
 
 def wire_task(wire_id="task-1", **over):
     task = {"id": wire_id, "task": "what is the status?", "source": "ag2space",
-            "channel_id": "!room:ag2.space", "user_id": "@alice:ag2.space",
+            "channel_id": "!room:s.space", "user_id": "@alice:s.space",
             "access_tier": "owner", "lease_id": "lease-1", "execution_generation": 3}
     task.update(over)
     return task

@@ -43,7 +43,7 @@ check(markers.parse("[replied]").skip == "",
       "[replied] is not [REPLIED] — the deliverer reads it case-sensitively, and "
       "stripping a marker the broker will not honour is how literal text leaks")
 
-terminal = markers.parse("[no-send]\n[channel: !other:ag2.space]\n[file: /etc/passwd]")
+terminal = markers.parse("[no-send]\n[channel: !other:s.space]\n[file: /etc/passwd]")
 check(terminal.skip == markers.SKIP_NO_SEND, "skip wins over everything after it")
 check(terminal.redirect == "" and terminal.attachments == (),
       "and nothing else is parsed out of a body nobody will see")
@@ -55,9 +55,9 @@ check(markers.parse("the answer\n[no-send]").skip == "",
 
 # --- dm-only: detected ANYWHERE, so marker order cannot defeat it
 both_ways = (
-    "[dm-only]\n[channel: !shared:ag2.space]\nthe private answer",
-    "[channel: !shared:ag2.space]\n[dm-only]\nthe private answer",
-    "[channel: !shared:ag2.space]\nthe private answer\n\n[dm-only]\n",
+    "[dm-only]\n[channel: !shared:s.space]\nthe private answer",
+    "[channel: !shared:s.space]\n[dm-only]\nthe private answer",
+    "[channel: !shared:s.space]\nthe private answer\n\n[dm-only]\n",
 )
 for text in both_ways:
     parsed = markers.parse(text)
@@ -103,15 +103,15 @@ check(markers.parse("[channel: not-a-room]\nthe answer").redirect == "",
 check(markers.restitch("the answer", "!a:b\nx") == "the answer",
       "restitch will not build a first line with a newline in it — the deliverer "
       "would read the remainder as the body's opening")
-check(markers.restitch("the answer", "!ok:ag2.space")
-      == "[channel: !ok:ag2.space]\nthe answer", "a real room id restitches")
+check(markers.restitch("the answer", "!ok:s.space")
+      == "[channel: !ok:s.space]\nthe answer", "a real room id restitches")
 
 # --- redirect (H3): stripped for the consumer, re-stitched for the wire
-parsed = markers.parse("[channel: !other:ag2.space]\nthe answer")
-check(parsed.redirect == "!other:ag2.space", "the redirect names its room")
+parsed = markers.parse("[channel: !other:s.space]\nthe answer")
+check(parsed.redirect == "!other:s.space", "the redirect names its room")
 check(parsed.body == "the answer", "and is stripped out of the body")
 check(markers.restitch(parsed.body, parsed.redirect)
-      == "[channel: !other:ag2.space]\nthe answer",
+      == "[channel: !other:s.space]\nthe answer",
       "restitch puts it back on the first line — the broker performs the move")
 check(markers.restitch("the answer", "") == "the answer",
       "restitching nothing changes nothing")
@@ -261,21 +261,21 @@ check(r.body == "", "a body that is only an unterminated marker degrades to empt
 # roster entry only if it is one; both ask this pattern, so the two cannot
 # disagree about what an address is. The prose form is what a consumer stamps
 # out of an answer and what the broker's capped roster string actually names.
-for good in ("@alice:ag2.space", "@bassil-s-sutando.agent:ag2.space",
+for good in ("@alice:s.space", "@bassil-s-sutando.agent:s.space",
              "@a=b/c+d:example.org", "@x:localhost"):
     check(markers.MXID_RE.match(good) is not None, f"{good} is a full mxid")
-for bad in ("@alice", "alice:ag2.space", "@alice:ag2.space/extra", "@:x", "@x:",
-            "@alice: ag2.space", "@al ice:ag2.space", "@alice:ag2:space", ""):
+for bad in ("@alice", "alice:s.space", "@alice:s.space/extra", "@:x", "@x:",
+            "@alice: s.space", "@al ice:s.space", "@alice:ag2:space", ""):
     check(markers.MXID_RE.match(bad) is None, f"{bad!r} is not")
 
-check(markers.mxids_in("ask @bob:ag2.space, then @ann:ag2.space.")
-      == ["@bob:ag2.space", "@ann:ag2.space"],
+check(markers.mxids_in("ask @bob:s.space, then @ann:s.space.")
+      == ["@bob:s.space", "@ann:s.space"],
       "mxids are found in prose, in order, without the punctuation around them")
-check(markers.mxids_in("(@bob:ag2.space) and <@ann:ag2.space> and `@cat:ag2.space`")
-      == ["@bob:ag2.space", "@ann:ag2.space", "@cat:ag2.space"],
+check(markers.mxids_in("(@bob:s.space) and <@ann:s.space> and `@cat:s.space`")
+      == ["@bob:s.space", "@ann:s.space", "@cat:s.space"],
       "brackets and code ticks around an mxid are prose too")
-check(markers.mxids_in("@bob:ag2.space's turn; @bob:ag2.space... go")
-      == ["@bob:ag2.space"],
+check(markers.mxids_in("@bob:s.space's turn; @bob:s.space... go")
+      == ["@bob:s.space"],
       "a possessive or an ellipsis after the server name is not part of it, and "
       "each mxid is named once however often it is written")
 check(markers.mxids_in("mail bob@example.com:8080 or ping @bob and @bob:") == [],

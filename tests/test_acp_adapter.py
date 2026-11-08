@@ -120,7 +120,7 @@ bench = Bench(
                 "stopReason": "end_turn"}]}
 )
 out = bench.handle("a1", "what does worker.py do?",
-                   channel_id="!room:ag2.space", sender_name="Ada", room_name="dev")
+                   channel_id="!room:s.space", sender_name="Ada", room_name="dev")
 report = bench.report()
 
 check(out.strip() == "worker.py turns Tasks into runs.",
@@ -142,16 +142,16 @@ check("session/set_mode" not in report["methods"],
 
 bench = Bench({"turns": [{"actions": [{"type": "message", "text": "on it"}],
                           "stopReason": "end_turn"}]})
-bench.handle("a2", "hand this to the other agent", channel_id="!room:ag2.space",
+bench.handle("a2", "hand this to the other agent", channel_id="!room:s.space",
              sender_name="Ada",
-             room_members=["@ada:ag2.space", "@sutando-b.agent:ag2.space"],
-             room_member_count=2, addressed_to="@sutando-b.agent:ag2.space")
+             room_members=["@ada:s.space", "@sutando-b.agent:s.space"],
+             room_member_count=2, addressed_to="@sutando-b.agent:s.space")
 roomful = bench.report()["prompts"][0]["prompt"][0]["text"]
-check("Others in this room: @ada:ag2.space, @sutando-b.agent:ag2.space." in roomful,
+check("Others in this room: @ada:s.space, @sutando-b.agent:s.space." in roomful,
       "the ACP framing names who else is in the room, by full mxid")
 check("write its full mxid in your answer" in roomful,
       "and says how a hand-off is delivered — the mxid is the address")
-check("addressed to @sutando-b.agent:ag2.space" in roomful,
+check("addressed to @sutando-b.agent:s.space" in roomful,
       "and whom the message was addressed to, for the agent to read")
 check(roomful.endswith("hand this to the other agent"),
       "with the person's words last and untouched")

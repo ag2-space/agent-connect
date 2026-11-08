@@ -36,7 +36,7 @@ current. The file is the contract; the Relay Client underneath it is not.
         "state": "connected",          // connected | reconnecting | auth-wait
                                        // | fatal | standby | displaced | stopped
         "connected": true,
-        "gateway": "https://chat.ag2.space/relay",   // redacted by the library
+        "gateway": "https://chat.s.space/relay",   // redacted by the library
         "last_ok_ts": 1755600120.0,    // unix seconds of the last healthy poll
         "backoff_s": 0.0,              // waiting because something FAILED
         "recheck_s": 0.0,              // waiting because another poller holds

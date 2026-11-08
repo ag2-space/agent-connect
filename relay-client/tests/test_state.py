@@ -104,14 +104,14 @@ with tempfile.TemporaryDirectory() as tmp:
     check(Path(prod.root).is_dir(), "ensure() is idempotent")
 
 # --- D3: redact before persist — userinfo, query and fragment never land
-check(redact_url("https://user:pass@chat.ag2.space/relay") ==
-      "https://chat.ag2.space/relay", "userinfo is stripped")
-check(redact_url("https://chat.ag2.space/relay?token=abc") ==
-      "https://chat.ag2.space/relay", "query is stripped")
-check(redact_url("https://chat.ag2.space/relay#frag") ==
-      "https://chat.ag2.space/relay", "fragment is stripped")
-check(redact_url("https://chat.ag2.space:8443/relay") ==
-      "https://chat.ag2.space:8443/relay", "a non-default port survives")
+check(redact_url("https://user:pass@chat.s.space/relay") ==
+      "https://chat.s.space/relay", "userinfo is stripped")
+check(redact_url("https://chat.s.space/relay?token=abc") ==
+      "https://chat.s.space/relay", "query is stripped")
+check(redact_url("https://chat.s.space/relay#frag") ==
+      "https://chat.s.space/relay", "fragment is stripped")
+check(redact_url("https://chat.s.space:8443/relay") ==
+      "https://chat.s.space:8443/relay", "a non-default port survives")
 check(redact_url("not a url") == "not a url", "a non-URL is passed through")
 check(redact_url("") == "", "the empty string is not a crash")
 check("pass" not in redact_url("https://user:pass@host/p?token=t#f"),

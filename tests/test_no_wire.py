@@ -4,7 +4,7 @@ The Relay Client is a library this repository owns and this process runs
 (workspace `docs/adr/0001`), and the whole value of that is that there is **one**
 speaker. The failure it replaced is not hypothetical and not old: `roomops.py`
 independently reimplemented the combined-token parse and the CloudFlare
-User-Agent workaround, hardcoded `https://chat.ag2.space/relay`, and let a stale
+User-Agent workaround, hardcoded `https://chat.s.space/relay`, and let a stale
 `REMOTE_TASK_URL` outrank the gateway that travels inside the token — so one
 process spoke to two gateways, the Ladder at one and every Task at the other,
 with a log line about it. The combined-token parse existed four times in the
@@ -107,7 +107,8 @@ AUTH_NEEDLES = ("Bearer ", "Authorization")
 #: Substrings that have no business in a string this package evaluates —
 #: anywhere, Adapters included.
 FORBIDDEN_TEXT = {
-    "ag2.space": "the relay's own host, compiled in (I3)",
+    "chat.s.space": "the relay's own host, compiled in (I3)",
+    "ag2.space": "the relay's former host, compiled in (I3)",
     "ag2space": "the relay's own host, compiled in (I3)",
     "/v1/": "a relay endpoint path, spoken outside the library",
     "Bearer ": "a bearer header assembled outside the library",

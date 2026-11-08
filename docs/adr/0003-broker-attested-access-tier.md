@@ -79,7 +79,7 @@ only the owner, can write an agent's card. Only the owner can, on their machine,
 `AGENT_CONNECT_UNCHECKED_COLLABORATORS`. The flag is still passed to the agent.
 A reply matching a known secret format, carrying a `[file:]`, or failing the scan is
 held. It is stored owner-only in the Worker's workspace (`agent_connect.withheld`), and
-the owner is asked privately, with AG2 Space's `room.question.ask` in their DM with the
+the owner is asked privately, with s.space's `room.question.ask` in their DM with the
 agent, whether to post it. When that DM cannot be used, the room message says how to act
 instead: reply `release` or `discard` to it, which only an owner-attested sender can do.
 The reply is posted only if the stored copy is unchanged (an HMAC keyed in the Worker
