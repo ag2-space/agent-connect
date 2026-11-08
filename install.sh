@@ -28,8 +28,12 @@
 #   --collaborators AGENT_CONNECT_ACP_COLLABORATORS  exact Matrix ids, comma
 #             separated, of the agents and people allowed to use an ACP agent
 #             besides you (they also need Collaborator access in the room).
-#             "all" admits every sender the room grants Collaborator access.
+#             "all" admits every sender any room grants Collaborator access; a
+#             private room with no Agent Native card grants it to every member.
 #             "" clears the list. Omitted on a re-run, the stored list is kept.
+#   --collaborator-rooms AGENT_CONNECT_ACP_COLLABORATOR_ROOMS  room ids, comma
+#             separated, in which every sender with Collaborator access may use
+#             an ACP agent. "" clears them. Omitted on a re-run, they are kept.
 #   --repo    AGENT_CONNECT_REPO     repo the agent works in       [default: ~/agents]
 #   --instance AGENT_CONNECT_INSTANCE  separate config, workspace and service
 #                                    [default: default, the legacy single-agent install]
@@ -92,6 +96,9 @@ ACP_TOKEN_GIVEN=0
 COLLABORATORS="${AGENT_CONNECT_ACP_COLLABORATORS:-}"
 COLLABORATORS_GIVEN=0
 [ -z "${AGENT_CONNECT_ACP_COLLABORATORS+x}" ] || COLLABORATORS_GIVEN=1
+COLLAB_ROOMS="${AGENT_CONNECT_ACP_COLLABORATOR_ROOMS:-}"
+COLLAB_ROOMS_GIVEN=0
+[ -z "${AGENT_CONNECT_ACP_COLLABORATOR_ROOMS+x}" ] || COLLAB_ROOMS_GIVEN=1
 # Supplied is supplied: the documented interface is a flag *or* the environment
 # variable, and an operator who exported a fresh bearer and re-ran the installer
 # has rotated it just as much as one who typed the flag. Reading only the flag
@@ -142,6 +149,7 @@ while [ $# -gt 0 ]; do
     --acp-url) ACP_URL="$2"; shift 2 ;;
     --acp-token) ACP_TOKEN="$2"; ACP_TOKEN_GIVEN=1; shift 2 ;;
     --collaborators) COLLABORATORS="${2-}"; COLLABORATORS_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --collaborators needs a list (or "").' >&2; exit 2; }; shift 2 ;;
+    --collaborator-rooms) COLLAB_ROOMS="${2-}"; COLLAB_ROOMS_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --collaborator-rooms needs a list (or "").' >&2; exit 2; }; shift 2 ;;
     --repo)    REPO="$2"; shift 2 ;;
     --instance) INSTANCE="${2:-}"; INSTANCE_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --instance needs a name.' >&2; exit 2; }; shift 2 ;;
     --agent-id) AGENT_ID="${2:-}"; AGENT_ID_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --agent-id needs a Matrix id.' >&2; exit 2; }; shift 2 ;;
@@ -154,6 +162,7 @@ while [ $# -gt 0 ]; do
     --acp-url=*) ACP_URL="${1#*=}"; shift ;;
     --acp-token=*) ACP_TOKEN="${1#*=}"; ACP_TOKEN_GIVEN=1; shift ;;
     --collaborators=*) COLLABORATORS="${1#*=}"; COLLABORATORS_GIVEN=1; shift ;;
+    --collaborator-rooms=*) COLLAB_ROOMS="${1#*=}"; COLLAB_ROOMS_GIVEN=1; shift ;;
     --repo=*)    REPO="${1#*=}"; shift ;;
     --instance=*) INSTANCE="${1#*=}"; INSTANCE_GIVEN=1; shift ;;
     --agent-id=*) AGENT_ID="${1#*=}"; AGENT_ID_GIVEN=1; shift ;;
@@ -283,10 +292,10 @@ fi
 mkdir -p "$APP_DIR"
 # Exact Matrix ids only: a typo here would silently admit nobody, or the wrong id.
 _all_collab=0
-case "$(printf '%s' "$COLLABORATORS" | tr -d ' ')" in all|ALL|'*') _all_collab=1 ;; esac
+case "$(printf '%s' "$COLLABORATORS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')" in all|'*') _all_collab=1 ;; esac
 if [ "$COLLABORATORS_GIVEN" -eq 1 ] && [ "$_all_collab" -eq 1 ]; then
   COLLABORATORS='*'
-  echo "install.sh: --collaborators all: every sender a room grants Collaborator access can use this agent with its normal tools. It does not make them owner." >&2
+  echo "install.sh: --collaborators all: every sender any room grants Collaborator access can use this agent with its normal tools, in every room it is in. A private room with no Agent Native card grants that to every member, and room moderators can change it. It does not make anyone owner." >&2
 elif [ "$COLLABORATORS_GIVEN" -eq 1 ]; then
   _clean=""
   set -f
@@ -299,6 +308,19 @@ elif [ "$COLLABORATORS_GIVEN" -eq 1 ]; then
   done
   set +f
   COLLABORATORS="$_clean"
+fi
+if [ "$COLLAB_ROOMS_GIVEN" -eq 1 ]; then
+  _clean=""
+  set -f
+  for _id in $(printf '%s' "$COLLAB_ROOMS" | tr ',' ' '); do
+    printf '%s\n' "$_id" | grep -Eq '^![^!:[:space:]]+:[^!:[:space:]]+(:[0-9]+)?$' || {
+      echo "install.sh: --collaborator-rooms: not a room id: $_id (expected !id:server)" >&2
+      exit 2
+    }
+    _clean="${_clean:+$_clean,}$_id"
+  done
+  set +f
+  COLLAB_ROOMS="$_clean"
 fi
 # Named here rather than at 1c: the ACP decisions below need to read it.
 CONFIG="$APP_DIR/config.env"
@@ -501,6 +523,7 @@ if [ -f "$CONFIG" ]; then
     MANAGED="$MANAGED|AGENT_CONNECT_ACP_TOKEN"
   fi
   [ "$COLLABORATORS_GIVEN" -eq 0 ] || MANAGED="$MANAGED|AGENT_CONNECT_ACP_COLLABORATORS"
+  [ "$COLLAB_ROOMS_GIVEN" -eq 0 ] || MANAGED="$MANAGED|AGENT_CONNECT_ACP_COLLABORATOR_ROOMS"
   KEPT="$(grep -v -E "^[[:space:]]*($MANAGED)[[:space:]]*=" "$CONFIG" \
           | grep -v -E '^[[:space:]]*(#|$)' || true)"
 fi
@@ -531,6 +554,9 @@ say "writing config $CONFIG (mode 0600 — it holds your token)"
     [ -z "$ACP_TOKEN_KV" ] || printf '%s\n' "AGENT_CONNECT_ACP_TOKEN=\"$ACP_TOKEN\""
     if [ "$COLLABORATORS_GIVEN" -eq 1 ] && [ -n "$COLLABORATORS" ]; then
       printf '%s\n' "AGENT_CONNECT_ACP_COLLABORATORS=\"$COLLABORATORS\""
+    fi
+    if [ "$COLLAB_ROOMS_GIVEN" -eq 1 ] && [ -n "$COLLAB_ROOMS" ]; then
+      printf '%s\n' "AGENT_CONNECT_ACP_COLLABORATOR_ROOMS=\"$COLLAB_ROOMS\""
     fi
     if [ -n "$KEPT" ]; then
       printf '\n'

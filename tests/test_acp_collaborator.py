@@ -6,7 +6,8 @@ import uuid
 from types import SimpleNamespace
 
 from agent_connect.adapters.acp import (COLLABORATORS_ENV, REFUSAL, REFUSAL_ALL, AcpAdapter,
-                                        admitted, collaborators_enabled, refusal)
+                                        COLLABORATOR_ROOMS_ENV, admitted, allowed_collaborators,
+                                        collaborators_enabled, refusal)
 from agent_connect.events import REFUSED, TurnContext
 from agent_connect.worker import GUEST, OWNER, attested_collaborator
 
@@ -84,8 +85,29 @@ check(admitted(ctx(tier=OWNER, collaborator=False, user=""), ALL), "with *, the 
 mixed = {COLLABORATORS_ENV: f"{AGENT}, *"}
 check(admitted(ctx(), mixed) and not admitted(ctx(user="@stranger:s.space"), mixed),
       "a * among ids is ignored: the list narrows, it never widens")
-check(collaborators_enabled(ALL) and collaborators_enabled(ENV) and not collaborators_enabled({}),
-      "collaborators are enabled by a list or by *")
+ROOMS = {COLLABORATOR_ROOMS_ENV: "!r:s.space, !other:s.space"}
+check(admitted(ctx(user="@stranger:s.space"), ROOMS), "in a listed room, any room-approved collaborator is admitted")
+check(not admitted(TurnContext(prompt="hi", room="!elsewhere:s.space", access_tier=GUEST,
+                               collaborator=True, user_id=AGENT), ROOMS),
+      "in a room not listed, they are refused")
+check(not admitted(ctx(collaborator=False), ROOMS), "in a listed room, a sender without Team collaborator is refused")
+check(not admitted(TurnContext(prompt="hi", room="", access_tier=GUEST, collaborator=True,
+                               user_id=AGENT), {COLLABORATOR_ROOMS_ENV: "!r:s.space"}),
+      "a Turn with no room is not in a listed room")
+check(admitted(TurnContext(prompt="hi", room="!elsewhere:s.space", access_tier=GUEST,
+                           collaborator=True, user_id=AGENT), {**ENV, **ROOMS}),
+      "ids and rooms combine: a listed id is admitted in any room")
+check(collaborators_enabled(ALL) and collaborators_enabled(ENV) and collaborators_enabled(ROOMS)
+      and not collaborators_enabled({}),
+      "collaborators are enabled by a list, by rooms or by *")
+import contextlib as _cl, io as _io
+for wild in ("all", "* *", "**"):
+    err = _io.StringIO()
+    with _cl.redirect_stderr(err):
+        got = allowed_collaborators({COLLABORATORS_ENV: wild})
+    check(not got and not admitted(ctx(user="@stranger:s.space"), {COLLABORATORS_ENV: wild})
+          and "looks like a wildcard" in err.getvalue(),
+          f"{wild!r} is not *: nobody is admitted, and the log says why")
 
 
 async def first_event(c, env):
@@ -112,6 +134,10 @@ import os as _os
 _os.environ[COLLABORATORS_ENV] = "*"
 check(refusal(ctx(collaborator=False)).startswith(REFUSAL_ALL.split("{")[0]), "refusal() picks the * wording")
 _os.environ.pop(COLLABORATORS_ENV, None)
+_os.environ[COLLABORATOR_ROOMS_ENV] = "!r:s.space"
+check(refusal(ctx(collaborator=False)).startswith(REFUSAL_ALL.split("{")[0]),
+      "in a listed room, the refusal asks only for the room grant")
+_os.environ.pop(COLLABORATOR_ROOMS_ENV, None)
 passed = asyncio.run(first_event(ctx(), ENV))
 check(getattr(passed, "reason", None) != REFUSED, "turn does not refuse a listed collaborator")
 

@@ -57,7 +57,7 @@ The broker sends Team as `access_tier: guest` with `requested_access_tier: team`
 `collaborator: true`. In a private room with no Agent Native card this is the default
 for every member, so the flag alone cannot mean "the owner chose this sender".
 
-The ACP adapter therefore admits a non-owner only when both hold:
+The ACP adapter therefore admits a non-owner only when both hold (widened by the owner's choice in the 0.5.0 amendment below):
 
 - the broker attested `requested_access_tier: team` and the exact boolean
   `collaborator: true`; and
@@ -95,3 +95,21 @@ for example, changing and running one of the owner's scheduled tasks, whose outc
 posted unchecked. Scoping such tools by requester belongs to the agent. Everyone else is refused as
 before. This matches sparrow's per-adapter `--allow-collaborator` opt-in, narrowed to
 named senders because the room default cannot be told apart from an owner's choice.
+
+## Amendment: owner-chosen collaborator scope (0.5.0)
+
+The list above is one of three ways the owner can scope admission, and they combine
+(a sender is admitted if any lets them in). Each still requires the broker's Team and
+exact `collaborator: true`, and a non-empty sender id:
+
+- **By sender:** the sender's Matrix id is in `AGENT_CONNECT_ACP_COLLABORATORS`.
+- **By room:** the Turn's room is in `AGENT_CONNECT_ACP_COLLABORATOR_ROOMS`.
+- **Every room:** `AGENT_CONNECT_ACP_COLLABORATORS` is exactly `*`.
+
+The room and `*` scopes admit senders the owner did not name. Because a private room
+with no Agent Native card makes every member a collaborator, and a room moderator can
+change a room's grants, they mean "every collaborator those rooms grant", not "everyone
+the owner chose". That is the owner's decision to make on their machine; the README and
+the installer say so, and none of it is turned on by default or by an upgrade. Anything
+that is not exactly `*` (a `*` among ids, `**`, `all`) admits only listed ids. What an
+admitted sender can do is unchanged by the scope.
