@@ -642,8 +642,10 @@ deadline = time.monotonic() + limit
 backoff = iter((1, 2, 4, 8, 16))
 while True:
     left = deadline - time.monotonic()
+    # The edge refuses urllib's default User-Agent (Cloudflare 1010, a 403).
     req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Content-Type": "application/json", "Accept": "application/json"})
+        "Content-Type": "application/json", "Accept": "application/json",
+        "User-Agent": "agent-connect-installer/1.0"})
     try:
         with opener.open(req, timeout=min(15.0, max(1.0, left)) if rotating else 15) as resp:
             status, raw = resp.status, resp.read(65536)
