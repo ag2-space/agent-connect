@@ -20,7 +20,7 @@
 # Credential, one of (a re-run with none keeps the instance's stored token):
 #   --base    AGENT_CONNECT_BASE     s.space backend URL that redeems a one-time code;
 #                                    needs --agent-id
-#   --code    AGENT_CONNECT_CODE     the acp. code: `-` reads one line from stdin; with
+#   --code    AGENT_CONNECT_CODE     the acp. (or rot.) code: `-` reads one line from stdin; with
 #                                    neither, it is asked for on the terminal. A code
 #                                    typed here works once, but shell history keeps it
 #   --trust-relay-host HOST          accept a relay the code names on another host
@@ -277,8 +277,8 @@ fi
 CODE="$(printf '%s' "$CODE" | tr -d '[:space:]')"
 if [ -n "$BASE" ]; then
   case "$CODE" in
-    acp.?*) : ;;
-    *) echo "install.sh: that is not an agent code (it starts with acp.); copy it from s.space again. The code was not used." >&2; exit 2 ;;
+    acp.?*|rot.?*) : ;;
+    *) echo "install.sh: that is not an agent code (it starts with acp. or rot.); copy it from s.space again. The code was not used." >&2; exit 2 ;;
   esac
 fi
 
@@ -625,7 +625,9 @@ if not clean(agent_id):
 opener = urllib.request.build_opener(NoRedirect)
 url = base.rstrip("/") + "/connect/poll"
 body = json.dumps({"device_code": code}).encode()
-for wait in (1, 2, 4, 8, 16, None):
+# A rot. code waits for the owner to confirm on the verify page.
+waits = (5,) * 36 if code.startswith("rot.") else (1, 2, 4, 8, 16)
+for wait in waits + (None,):
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Content-Type": "application/json", "Accept": "application/json"})
     try:
@@ -647,6 +649,8 @@ for wait in (1, 2, 4, 8, 16, None):
         time.sleep(min(max(float(after), 1.0), 30.0) if ok else wait)
         continue
     break
+if status == 202 and code.startswith("rot."):
+    die("the rotation is not confirmed yet; confirm it on s.space's verify page, then run this again with the same code")
 if status == 202:
     die("s.space is still redeeming the code; run this again with the same code in a minute")
 if status == 503:
