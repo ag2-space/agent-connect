@@ -577,7 +577,10 @@ if [ -n "$BASE" ]; then
   say "redeeming the one-time code with $BASE"
   REDEEM_PY="$APP_DIR/.redeem.py"
   cat > "$REDEEM_PY" <<'PY'
-import json, re, sys, time, urllib.error, urllib.parse, urllib.request
+import json, os, re, signal, sys, time, urllib.error, urllib.parse, urllib.request
+
+for _sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(_sig, lambda *_: sys.exit(130))
 
 base, agent_id, trusted = sys.argv[1], sys.argv[2], sys.argv[3].strip().rstrip(".").lower()
 code = sys.stdin.readline().strip()
@@ -625,13 +628,21 @@ if not clean(agent_id):
 opener = urllib.request.build_opener(NoRedirect)
 url = base.rstrip("/") + "/connect/poll"
 body = json.dumps({"device_code": code}).encode()
-# A rot. code waits for the owner to confirm on the verify page.
-waits = (5,) * 36 if code.startswith("rot.") else (1, 2, 4, 8, 16)
-for wait in waits + (None,):
+# A rot. code waits, up to a hard deadline, for the owner to confirm on the
+# verify page; any other code gets five backoff retries.
+rotating = code.startswith("rot.")
+try:
+    limit = float(os.environ.get("AGENT_CONNECT_ROTATE_WAIT_S") or 180)
+except ValueError:
+    limit = 180.0
+deadline = time.monotonic() + limit
+backoff = iter((1, 2, 4, 8, 16))
+while True:
+    left = deadline - time.monotonic()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Content-Type": "application/json", "Accept": "application/json"})
     try:
-        with opener.open(req, timeout=15) as resp:
+        with opener.open(req, timeout=min(15.0, max(1.0, left)) if rotating else 15) as resp:
             status, raw = resp.status, resp.read(65536)
     except urllib.error.HTTPError as e:
         status, raw = e.code, (e.read(65536) or b"")
@@ -643,11 +654,16 @@ for wait in waits + (None,):
     except ValueError:
         answer = {}
     answer = answer if isinstance(answer, dict) else {}
-    if status in (202, 503) and wait is not None:
+    if status in (202, 503):
         after = answer.get("retry_after")
         ok = status == 202 and isinstance(after, (int, float)) and not isinstance(after, bool) and after == after
-        time.sleep(min(max(float(after), 1.0), 30.0) if ok else wait)
-        continue
+        wait = min(max(float(after), 1.0), 30.0) if ok else (5.0 if rotating else next(backoff, None))
+        if rotating:
+            left = deadline - time.monotonic()
+            wait = min(wait, left) if left > 0 else None
+        if wait is not None:
+            time.sleep(wait)
+            continue
     break
 if status == 202 and code.startswith("rot."):
     die("the rotation is not confirmed yet; confirm it on s.space's verify page, then run this again with the same code")
@@ -683,9 +699,12 @@ if not clean(bearer):
     die("s.space's answer held a malformed credential; the code is spent and nothing was written")
 sys.stdout.write(relay + "|" + bearer)
 PY
+  trap 'rm -f "$REDEEM_PY"' EXIT
+  trap 'rm -f "$REDEEM_PY"; exit 130' INT TERM
   _rc=0
   TOKEN="$(printf '%s\n' "$CODE" | python3 -I "$REDEEM_PY" "$BASE" "$AGENT_ID" "$TRUST_RELAY_HOST")" || _rc=$?
   rm -f "$REDEEM_PY"
+  trap - EXIT INT TERM
   [ "$_rc" -eq 0 ] || exit 1
   # Backstop: exactly one `|`, and nothing that could end the config line.
   reject_multiline --token "$TOKEN"

@@ -133,13 +133,52 @@ class InstallerCode(unittest.TestCase):
         self.assertEqual(self.stored_token(), f"{other}|{SECRET}")
 
     def test_a_rotation_code_waits_for_confirmation(self):
-        self.backend.replies.append((202, {"retry_after": 1}, {}))
+        rot = "rot.Qq7-rotate"
+        for _ in range(6):
+            self.backend.replies.append((202, {"retry_after": 1}, {}))
         self.backend.ok(intent="rotate", env_line="x", remote_task_token_line="y")
-        result = self.with_code(stdin="rot.Qq7-rotate\n")
+        result = self.with_code(stdin=rot + "\n")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.backend.calls[-1], ("/api/connect/poll", {"device_code": "rot.Qq7-rotate"}))
+        self.assertEqual(len(self.backend.calls), 7)
+        self.assertEqual(self.backend.calls[-1], ("/api/connect/poll", {"device_code": rot}))
         self.assertEqual(self.stored_token(), f"{self.backend.relay}|{SECRET}")
         self.assertNotIn(SECRET, result.stdout + result.stderr)
+        self.assertNotIn(rot, result.stdout + result.stderr)
+
+    def test_an_unconfirmed_rotation_stops_at_the_deadline(self):
+        rot = "rot.Qq7-rotate"
+        for _ in range(40):
+            self.backend.replies.append((202, {"retry_after": 30}, {}))
+        result = self.with_code(stdin=rot + "\n", env={"AGENT_CONNECT_ROTATE_WAIT_S": "3"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("rotation is not confirmed yet", result.stderr)
+        self.assertLessEqual(len(self.backend.calls), 3)
+        self.assertNotIn(rot, result.stdout + result.stderr)
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.config.parent / ".redeem.py").exists())
+
+    def test_ctrl_c_while_waiting_leaves_nothing_behind(self):
+        import signal, time
+        for _ in range(40):
+            self.backend.replies.append((202, {"retry_after": 1}, {}))
+        flags = ["--adapter", "acp", "--acp-command", "openclaw acp", "--no-start",
+                 "--base", self.backend.base, "--agent-id", AGENT, "--code", "-"]
+        proc = subprocess.Popen(["sh", str(ROOT / "install.sh"), *flags], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env=self.env, start_new_session=True)
+        proc.stdin.write("rot.Qq7-rotate\n")
+        proc.stdin.close()
+        deadline = time.monotonic() + 30
+        while not self.backend.calls and time.monotonic() < deadline:
+            time.sleep(0.1)
+        os.killpg(proc.pid, signal.SIGINT)
+        proc.wait(timeout=30)
+        out, err = proc.stdout.read(), proc.stderr.read()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("rot.Qq7-rotate", out + err)
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.config.parent / ".redeem.py").exists())
 
     def test_a_used_code_says_so(self):
         self.backend.replies.append((404, {"error": "unknown"}, {}))
