@@ -23,13 +23,14 @@ class FakeBackend:
     """Answers POST /api/connect/poll from a script of (status, body) replies."""
 
     def __init__(self):
-        self.replies, self.calls, self.delay = [], [], 0
+        self.replies, self.calls, self.delay, self.agents = [], [], 0, []
         backend = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 backend.calls.append((self.path, json.loads(self.rfile.read(length) or b"{}")))
+                backend.agents.append(self.headers.get("User-Agent", ""))
                 time.sleep(backend.delay)
                 status, body, headers = backend.replies.pop(0) if backend.replies else (500, {}, {})
                 data = json.dumps(body).encode()
@@ -113,6 +114,10 @@ class InstallerCode(unittest.TestCase):
         self.assertNotIn(CODE, result.stdout + result.stderr)
         self.assertFalse((self.config.parent / ".redeem.py").exists())
         self.assertIn('AGENT_CONNECT_ACP_COMMAND="openclaw acp"', self.config.read_text())
+        # The edge 403s urllib's default agent; every poll names the installer.
+        self.assertTrue(self.backend.agents)
+        for agent in self.backend.agents:
+            self.assertTrue(agent.startswith("agent-connect-installer/"), agent)
 
     def test_a_code_for_another_agent_is_refused_and_nothing_is_written(self):
         self.backend.ok(agent_id="@someone-else.agent:example.org")
