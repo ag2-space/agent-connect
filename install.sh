@@ -650,6 +650,9 @@ while True:
     except urllib.error.HTTPError as e:
         status, raw = e.code, (e.read(65536) or b"")
     except (urllib.error.URLError, OSError, ValueError) as e:
+        if rotating and deadline - time.monotonic() <= 1:
+            status = 202
+            break
         die("could not reach %s (%s); the code is still valid until it expires, run this again" %
             (base, type(e).__name__))
     try:

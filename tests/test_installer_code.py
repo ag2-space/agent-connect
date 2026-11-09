@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,13 +23,14 @@ class FakeBackend:
     """Answers POST /api/connect/poll from a script of (status, body) replies."""
 
     def __init__(self):
-        self.replies, self.calls = [], []
+        self.replies, self.calls, self.delay = [], [], 0
         backend = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 backend.calls.append((self.path, json.loads(self.rfile.read(length) or b"{}")))
+                time.sleep(backend.delay)
                 status, body, headers = backend.replies.pop(0) if backend.replies else (500, {}, {})
                 data = json.dumps(body).encode()
                 self.send_response(status)
@@ -156,6 +158,14 @@ class InstallerCode(unittest.TestCase):
         self.assertNotIn(rot, result.stdout + result.stderr)
         self.assertFalse(self.config.exists())
         self.assertFalse((self.config.parent / ".redeem.py").exists())
+
+    def test_a_slow_answer_at_the_deadline_says_not_confirmed(self):
+        self.backend.delay = 4
+        self.backend.replies.append((202, {"retry_after": 1}, {}))
+        result = self.with_code(stdin="rot.Qq7-rotate\n", env={"AGENT_CONNECT_ROTATE_WAIT_S": "2"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("rotation is not confirmed yet", result.stderr)
+        self.assertNotIn("could not reach", result.stderr)
 
     def test_ctrl_c_while_waiting_leaves_nothing_behind(self):
         import signal, time
