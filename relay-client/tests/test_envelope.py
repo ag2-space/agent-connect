@@ -332,6 +332,28 @@ check("\n" not in parse_task(task_dict(
       "and a newline cannot ride in — a consumer writes these into a "
       "line-oriented file where one would forge a second header")
 
+# --- AgentTrigger fields: every type crosses, known or not -----------------
+
+join = parse_task(task_dict(interaction_type="system_event", event_type="room.joined",
+                            agent_trigger_id="join|@a:x|!r:x", playbook="room-onboard"))
+check(join.event_type == "room.joined" and join.agent_trigger_id == "join|@a:x|!r:x"
+      and join.playbook == "room-onboard",
+      "a room.joined trigger crosses with its type, id and playbook")
+check(parse_task(task_dict(event_type="room.future.v9")).event_type == "room.future.v9",
+      "a type added after this release is carried, not dropped")
+check(all(getattr(plain, f) == "" for f in ("event_type", "agent_trigger_id", "playbook"))
+      and plain.trigger is None and plain.summon is None and plain.hook is None,
+      "a payload with no trigger reads every trigger field as absent")
+blocks = parse_task(task_dict(
+    summon={"task_id": "s1", "row_id": "r1", "deep": {"x": 1}, 3: "k"},
+    trigger={"kind": "room.joined", "n": 2, "ok": True, "line": "a\nb"},
+    hook="not a mapping"))
+check(blocks.summon == {"task_id": "s1", "row_id": "r1"},
+      "a summon block crosses flat: nested values and non-string keys are dropped")
+check(blocks.trigger == {"kind": "room.joined", "n": 2, "ok": True, "line": "a b"},
+      "a trigger block keeps its scalars, one line each")
+check(blocks.hook is None, "a block that is not a mapping reads as absent")
+
 CARD = {"card_url": "https://x/card.json", "card_sha256": "abc",
         "sig": "sig", "key_id": "k1", "alg": "ed25519"}
 

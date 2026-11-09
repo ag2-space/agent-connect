@@ -263,6 +263,13 @@ def turn_context(task, repo: str) -> TurnContext:
         sandbox=tier_to_sandbox(tier),
         cwd=repo,
         attachments=attachments,
+        event_type=getattr(task, "event_type", "") or "",
+        interaction_type=getattr(task, "interaction_type", "") or "",
+        agent_trigger_id=getattr(task, "agent_trigger_id", "") or "",
+        playbook=getattr(task, "playbook", "") or "",
+        trigger_context=tuple((name, tuple(block.items()))
+                              for name in ("trigger", "summon", "hook")
+                              if (block := getattr(task, name, None))),
     )
 
 

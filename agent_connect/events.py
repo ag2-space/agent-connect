@@ -138,6 +138,13 @@ class TurnContext:
     sandbox: str = "read-only"
     cwd: str = ""
     attachments: Tuple[Attachment, ...] = ()
+    #: The AgentTrigger behind the Task, as the broker sent it; "" for a plain message.
+    event_type: str = ""
+    interaction_type: str = ""
+    agent_trigger_id: str = ""
+    playbook: str = ""
+    #: The broker's `trigger`, `summon` and `hook` blocks, by name, when sent.
+    trigger_context: Tuple[Tuple[str, Any], ...] = ()
 
     @property
     def session_key(self) -> Tuple[str, str]:
