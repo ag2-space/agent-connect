@@ -47,7 +47,9 @@ delivered as the mxids it names in both.
 **And so is the rest of what the broker enriches a task with.** `session_scope`,
 `source`, `interaction_type`, `platform_card`, `thread_root` and
 `source_room_id` are fields a consumer (sutando's task files) has serialized
-since before this package existed; a library that dropped them would make
+since before this package existed, and so are the AgentTrigger fields
+(`event_type`, `agent_trigger_id`, `playbook`) and the `trigger`, `summon` and
+`hook` context blocks; a library that dropped them would make
 migrating onto it a quiet loss of context that no test on either side would
 catch. Carried, never interpreted: no vocabulary is enforced, no default is
 substituted, nothing is gated on them.
@@ -212,6 +214,7 @@ class Task:
         # see the block comment in `__init__` below.
         "session_scope", "source", "interaction_type", "platform_card",
         "thread_root", "source_room_id",
+        "event_type", "agent_trigger_id", "playbook", "trigger", "summon", "hook",
     )
 
     def __init__(
@@ -244,6 +247,12 @@ class Task:
         platform_card: Optional[Mapping[str, str]] = None,
         thread_root: str = "",
         source_room_id: str = "",
+        event_type: str = "",
+        agent_trigger_id: str = "",
+        playbook: str = "",
+        trigger: Optional[Mapping[str, Any]] = None,
+        summon: Optional[Mapping[str, Any]] = None,
+        hook: Optional[Mapping[str, Any]] = None,
     ):
         self.id = id
         #: The message text, metadata blocks removed (G2).
@@ -334,6 +343,15 @@ class Task:
         #: asked in.
         self.thread_root = thread_root
         self.source_room_id = source_room_id
+        #: The AgentTrigger behind this task (`room.mention`, `room.joined`, or a
+        #: type added later), its idempotency id and the playbook it names.
+        self.event_type = event_type
+        self.agent_trigger_id = agent_trigger_id
+        self.playbook = playbook
+        #: Structured context blocks, flat and bounded; `None` when not sent.
+        self.trigger = trigger
+        self.summon = summon
+        self.hook = hook
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
         return f"<Task {self.id} room={self.room_id} tier={self.access_tier!r}>"
@@ -402,6 +420,12 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
         platform_card=_platform_card(raw.get("platform_card")),
         thread_root=_text(raw.get("thread_root")),
         source_room_id=_text(raw.get("source_room_id")),
+        event_type=_text(raw.get("event_type")),
+        agent_trigger_id=_text(raw.get("agent_trigger_id")),
+        playbook=_text(raw.get("playbook")),
+        trigger=_context_block(raw.get("trigger")),
+        summon=_context_block(raw.get("summon")),
+        hook=_context_block(raw.get("hook")),
     )
 
 
@@ -444,6 +468,31 @@ def _platform_card(value: Any) -> Optional[Mapping[str, str]]:
             return None
         card[key] = _text(held)
     return card
+
+
+#: A context block's bounds: how many keys it keeps and how long a key may be.
+MAX_BLOCK_KEYS = 32
+
+
+def _context_block(value: Any) -> Optional[Mapping[str, Any]]:
+    """A flat context block (`trigger`, `summon`, `hook`), or `None`.
+
+    String keys and scalar values only, each bounded like any wire string; a
+    nested value or a non-string key is dropped rather than guessed at.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    block = {}
+    for key, held in value.items():
+        if len(block) >= MAX_BLOCK_KEYS:
+            break
+        if not isinstance(key, str) or not _text(key, 64):
+            continue
+        if isinstance(held, str):
+            block[_text(key, 64)] = _text(held)
+        elif held is None or isinstance(held, (bool, int, float)):
+            block[_text(key, 64)] = held
+    return block or None
 
 
 def _members(value: Any) -> Tuple[str, ...]:

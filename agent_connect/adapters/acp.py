@@ -149,7 +149,8 @@ from ..acp.core import (
 from ..acp.policy import WorkingDirectoryPolicy
 from ..link import receiver_meta, room_message
 from ..addressing import addressing_preamble
-from ..routing import admitted_as as routing_admitted_as, requester_line, routing_preamble
+from ..routing import (admitted_as as routing_admitted_as, reply_rule, requester_line,
+                       routing_preamble)
 from ..events import (
     CANCELLED,
     COMPLETED,
@@ -930,9 +931,8 @@ def preamble(ctx: TurnContext, attached: Sequence[str] = (),
     lines. This is a plain-text convention, not an authorization boundary.
     """
     framing = (
-        f"{requester_line(ctx)} "
-        "Answer in chat: prose, no more than a few short paragraphs unless asked "
-        "for more. You are working in the directory this session was opened in. "
+        f"{requester_line(ctx)} {reply_rule(ctx)} "
+        "You are working in the directory this session was opened in. "
         "Your host may ask the owner to approve some commands before they run; "
         "nothing else limits which files you can reach, so stay within the task. "
         "If your host asks for approval, wait for the answer, and do not work "
