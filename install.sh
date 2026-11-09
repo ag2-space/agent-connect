@@ -631,9 +631,12 @@ body = json.dumps({"device_code": code}).encode()
 # A rot. code waits, up to a hard deadline, for the owner to confirm on the
 # verify page; any other code gets five backoff retries.
 rotating = code.startswith("rot.")
+# AGENT_CONNECT_ROTATE_WAIT_S is a test seam, not a supported setting.
 try:
     limit = float(os.environ.get("AGENT_CONNECT_ROTATE_WAIT_S") or 180)
 except ValueError:
+    limit = 180.0
+if not 0 < limit <= 180:
     limit = 180.0
 deadline = time.monotonic() + limit
 backoff = iter((1, 2, 4, 8, 16))
@@ -657,7 +660,8 @@ while True:
     if status in (202, 503):
         after = answer.get("retry_after")
         ok = status == 202 and isinstance(after, (int, float)) and not isinstance(after, bool) and after == after
-        wait = min(max(float(after), 1.0), 30.0) if ok else (5.0 if rotating else next(backoff, None))
+        step = 5.0 if rotating else next(backoff, None)
+        wait = None if step is None else (min(max(float(after), 1.0), 30.0) if ok else step)
         if rotating:
             left = deadline - time.monotonic()
             wait = min(wait, left) if left > 0 else None

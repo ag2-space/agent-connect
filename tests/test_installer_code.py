@@ -194,6 +194,16 @@ class InstallerCode(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.backend.calls), 2)
 
+    def test_still_redeeming_with_retry_after_gives_up(self):
+        for _ in range(8):
+            self.backend.replies.append((202, {"state": "redeeming", "retry_after": 1}, {}))
+        self.backend.ok()
+        result = self.with_code()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("still redeeming", result.stderr)
+        self.assertEqual(len(self.backend.calls), 6)
+        self.assertFalse(self.config.exists())
+
     def test_a_redirect_is_not_followed(self):
         self.backend.replies.append((302, {}, {"Location": "http://127.0.0.1:1/elsewhere"}))
         result = self.with_code()
