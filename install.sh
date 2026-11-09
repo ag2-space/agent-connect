@@ -150,7 +150,7 @@ separate repo that connects a running Sutando on its own terms.
   To connect a running Sutando:  pipx install ag2-sparrow
                                  (see that package's README for its directory
                                   and token settings)
-  To run an agent from here:     install.sh --token <TOKEN> [--adapter ...]
+  To run an agent from here:     install.sh --base <URL> --agent-id <MXID> [--adapter ...]
 GONE
   exit 2
 }
@@ -248,6 +248,9 @@ if { [ "$TOKEN_STDIN" -eq 1 ] || [ "$CODE" = - ]; } && stdin_is_script; then
   echo "install.sh: stdin is this script here (curl | sh). Download install.sh and run it with sh, or leave out --code to be asked for the code." >&2
   exit 2
 fi
+case $- in
+  *x*) set +x; echo "install.sh: tracing is off from here: it would print the code and the token." >&2 ;;
+esac
 if [ "$TOKEN_STDIN" -eq 1 ]; then
   IFS= read -r TOKEN || true
   [ -n "$TOKEN" ] || { echo "install.sh: --token-stdin read no token." >&2; exit 2; }
@@ -261,9 +264,11 @@ elif [ -n "$BASE" ] && [ -z "$CODE" ]; then
     exit 2
   fi
   printf 's.space code: ' >/dev/tty
+  trap 'stty echo </dev/tty 2>/dev/null; exit 130' INT TERM
   stty -echo </dev/tty 2>/dev/null || true
   IFS= read -r CODE </dev/tty || true
   stty echo </dev/tty 2>/dev/null || true
+  trap - INT TERM
   printf '\n' >/dev/tty
   [ -n "$CODE" ] || { echo "install.sh: no code was entered." >&2; exit 2; }
 fi
@@ -572,7 +577,7 @@ if [ -n "$BASE" ]; then
   say "redeeming the one-time code with $BASE"
   REDEEM_PY="$APP_DIR/.redeem.py"
   cat > "$REDEEM_PY" <<'PY'
-import json, sys, time, urllib.error, urllib.parse, urllib.request
+import json, re, sys, time, urllib.error, urllib.parse, urllib.request
 
 base, agent_id, trusted = sys.argv[1], sys.argv[2], sys.argv[3].strip().rstrip(".").lower()
 code = sys.stdin.readline().strip()
@@ -584,7 +589,15 @@ def die(msg):
     sys.exit(1)
 
 
+def clean(value):
+    # One line of the config file, and one `|` between URL and secret: only
+    # printable ASCII, no space, quote, backslash or `|`.
+    return bool(value) and all(0x21 <= ord(c) <= 0x7E and c not in '|"\\' for c in value)
+
+
 def url_problem(url, what):
+    if not clean(url):
+        return what + " has a character a URL here may not carry"
     try:
         parts = urllib.parse.urlsplit(url)
         parts.port
@@ -592,6 +605,8 @@ def url_problem(url, what):
         return what + " is not a URL"
     if parts.scheme not in ("https", "http") or not parts.hostname or parts.username or parts.password:
         return what + " is not an https URL"
+    if not re.fullmatch(r"[a-z0-9.-]+|[0-9a-f:.]+", parts.hostname):
+        return what + " has a host name with characters a host may not carry"
     if parts.scheme == "http" and parts.hostname not in LOOPBACK:
         return what + " is not https; only a loopback host may use plain http"
     return ""
@@ -605,6 +620,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 why = url_problem(base, "--base")
 if why:
     die(why + "; the code was not used")
+if not clean(agent_id):
+    die("--agent-id has a space or a character a Matrix id may not carry; the code was not used")
 opener = urllib.request.build_opener(NoRedirect)
 url = base.rstrip("/") + "/connect/poll"
 body = json.dumps({"device_code": code}).encode()
@@ -645,7 +662,7 @@ if status != 200:
 got = {k: answer.get(k) for k in ("relay_url", "bearer", "agent_id")}
 if not all(isinstance(v, str) and v.strip() for v in got.values()):
     die("s.space's answer had no relay_url, bearer or agent_id; the code is spent, make a new one")
-relay, bearer, got_id = (got[k].strip() for k in ("relay_url", "bearer", "agent_id"))
+relay, bearer, got_id = (got[k] for k in ("relay_url", "bearer", "agent_id"))
 if got_id != agent_id:
     die("the code is for a different agent than %s; the code is spent and nothing was written: "
         "make a new code for the agent you meant" % agent_id)
@@ -658,7 +675,7 @@ if host != base_host and not host.endswith("." + base_host) and host != trusted:
     die("the relay URL s.space returned is on %s, not %s or a host under it; the code is spent and "
         "nothing was written. If that relay is expected, run this again with a new code and "
         "--trust-relay-host %s" % (host, base_host, host))
-if any(c.isspace() or c == "|" or ord(c) < 0x20 or ord(c) == 0x7F for c in bearer):
+if not clean(bearer):
     die("s.space's answer held a malformed credential; the code is spent and nothing was written")
 sys.stdout.write(relay + "|" + bearer)
 PY
@@ -666,7 +683,14 @@ PY
   TOKEN="$(printf '%s\n' "$CODE" | python3 -I "$REDEEM_PY" "$BASE" "$AGENT_ID" "$TRUST_RELAY_HOST")" || _rc=$?
   rm -f "$REDEEM_PY"
   [ "$_rc" -eq 0 ] || exit 1
-  say "code redeemed for $AGENT_ID; its token goes only into the config file"
+  # Backstop: exactly one `|`, and nothing that could end the config line.
+  reject_multiline --token "$TOKEN"
+  case "$TOKEN" in
+    *'|'*'|'*|*'"'*|*\\*|*[[:space:]]*|*[![:print:]]*|'|'*|*'|') echo "install.sh: the redeemed token is malformed; nothing was written." >&2; exit 1 ;;
+    *'|'*) : ;;
+    *) echo "install.sh: the redeemed token is malformed; nothing was written." >&2; exit 1 ;;
+  esac
+  say "code redeemed for $AGENT_ID; its token is stored only in the config file"
 fi
 
 MIGRATE_DEFAULT=0

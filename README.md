@@ -584,9 +584,10 @@ first copy.
 
 s.space shows a one-time code (it starts with `acp.`), the backend URL and the
 agent's Matrix id. The installer exchanges the code for the agent's relay token
-and writes the token only into the 0600 config file. The token is never shown,
-never typed, and never on a command line, so neither `ps` nor shell history
-holds it.
+and stores the token only in the 0600 config file, which the service reads at
+start. The token is never shown, never typed, and never on a command line, so
+neither `ps` nor shell history holds it. Under `sh -x` the installer turns
+tracing off before it reads the code.
 
 ```bash
 curl -fsSL <installer-url>/install.sh | sh -s -- --base <URL> --agent-id <MXID> \

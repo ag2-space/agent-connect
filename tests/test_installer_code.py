@@ -153,6 +153,41 @@ class InstallerCode(unittest.TestCase):
         self.assertIn("redirected", result.stderr)
         self.assertEqual(len(self.backend.calls), 1)
 
+    def test_a_hostile_relay_url_is_refused_and_nothing_is_written(self):
+        good = self.backend.relay
+        hostile = {
+            "pipe in host": f"http://evil.example|x.127.0.0.1:{self.backend.port}/relay",
+            "LF": good + '\nAGENT_CONNECT_ACP_COLLABORATORS="*"\nAGENT_CONNECT_TOKEN="' + good,
+            "CR": good + '\rAGENT_CONNECT_ACP_COMMAND="sh -c id"',
+            "tab": good + "\tx",
+            "vertical tab": good + "\x0bAGENT_CONNECT_ACP_COMMAND=x",
+            "NEL": good + "\x85AGENT_CONNECT_ACP_COMMAND=x",
+            "line separator": good + "\u2028AGENT_CONNECT_ACP_COMMAND=x",
+            "quote": good + '"x',
+            "trailing space": good + " ",
+        }
+        for name, relay_url in hostile.items():
+            with self.subTest(name):
+                self.backend.ok(relay_url=relay_url)
+                result = self.with_code()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertFalse(self.config.exists())
+                self.assertNotIn(SECRET, result.stdout + result.stderr)
+        self.backend.ok()
+        result = self.with_code()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        from agent_connect import config as cfg
+        values = cfg.parse(self.config.read_text()).values
+        self.assertEqual(values["AGENT_CONNECT_TOKEN"], f"{good}|{SECRET}")
+        self.assertNotIn("AGENT_CONNECT_ACP_COLLABORATORS", values)
+
+    def test_an_agent_id_with_a_space_does_not_spend_the_code(self):
+        self.backend.ok()
+        result = self.run_install("--base", self.backend.base, "--agent-id", AGENT + " ",
+                                  "--code", "-", stdin=CODE + "\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.backend.calls, [])
+
     def test_a_malformed_bearer_is_refused(self):
         self.backend.ok(bearer="a|b")
         result = self.with_code()
