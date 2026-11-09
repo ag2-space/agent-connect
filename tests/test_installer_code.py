@@ -132,6 +132,15 @@ class InstallerCode(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.stored_token(), f"{other}|{SECRET}")
 
+    def test_a_rotation_code_waits_for_confirmation(self):
+        self.backend.replies.append((202, {"retry_after": 1}, {}))
+        self.backend.ok(intent="rotate", env_line="x", remote_task_token_line="y")
+        result = self.with_code(stdin="rot.Qq7-rotate\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.backend.calls[-1], ("/api/connect/poll", {"device_code": "rot.Qq7-rotate"}))
+        self.assertEqual(self.stored_token(), f"{self.backend.relay}|{SECRET}")
+        self.assertNotIn(SECRET, result.stdout + result.stderr)
+
     def test_a_used_code_says_so(self):
         self.backend.replies.append((404, {"error": "unknown"}, {}))
         result = self.with_code()
@@ -156,7 +165,8 @@ class InstallerCode(unittest.TestCase):
     def test_a_hostile_relay_url_is_refused_and_nothing_is_written(self):
         good = self.backend.relay
         hostile = {
-            "pipe in host": f"http://evil.example|x.127.0.0.1:{self.backend.port}/relay",
+            # https, so only the character check can refuse it.
+            "pipe in host": "https://evil.example|x.127.0.0.1/relay",
             "LF": good + '\nAGENT_CONNECT_ACP_COLLABORATORS="*"\nAGENT_CONNECT_TOKEN="' + good,
             "CR": good + '\rAGENT_CONNECT_ACP_COMMAND="sh -c id"',
             "tab": good + "\tx",

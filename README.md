@@ -587,7 +587,8 @@ agent's Matrix id. The installer exchanges the code for the agent's relay token
 and stores the token only in the 0600 config file, which the service reads at
 start. The token is never shown, never typed, and never on a command line, so
 neither `ps` nor shell history holds it. Under `sh -x` the installer turns
-tracing off before it reads the code.
+tracing off before it reads the code; a token you pass yourself in
+`AGENT_CONNECT_TOKEN` or `--token` is read before that, so tracing shows it.
 
 ```bash
 curl -fsSL <installer-url>/install.sh | sh -s -- --base <URL> --agent-id <MXID> \
@@ -612,9 +613,15 @@ installer itself; the installer refuses it rather than read its own text.
 - **Checked before anything is written.** The installer refuses an answer that
   names a different agent than `--agent-id`, or a relay that is not https on
   the backend's host or a host under it (`--trust-relay-host <host>` accepts one
-  you expect). A refused code is spent, and nothing is written.
+  you expect). A refused code is spent, and nothing is written. The match is
+  by host, not exact origin, so anyone who controls a subdomain of the
+  backend's domain could be named as the relay; keep that domain's DNS tight.
 - **Used, expired, busy.** A used or expired code says so; make a new one in
   s.space. "Still redeeming" and a busy backend are retried with backoff.
+- **A new machine or a lost config.** Rotate the agent's token in s.space and
+  pass its `rot.` code the same way. The installer waits, for up to three
+  minutes, for you to confirm the rotation on the verify page. Rotating retires
+  the old token, so the agent's other install stops working.
 - **Re-running.** `install.sh --agent-id <MXID>` with no credential keeps the
   token already in that install's config, for an upgrade or a changed setting.
   A bare `install.sh` with no credential and no `--agent-id` or `--instance` is
