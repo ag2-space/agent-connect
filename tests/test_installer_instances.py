@@ -189,6 +189,9 @@ else:
         named = legacy.with_name("space.ag2.agent-connect.second.plist")
         data = plistlib.loads(named.read_bytes())
         self.assertEqual(data["Label"], "space.ag2.agent-connect.second")
+        # Without it launchd kills the worker 5 s after SIGTERM, before its
+        # clean stop can release the poller guard (STOP_BUDGET_S is 12).
+        self.assertGreaterEqual(data.get("ExitTimeOut", 0), 20)
         self.assertEqual(data["EnvironmentVariables"]["AGENT_CONNECT_CONFIG"],
                          str(self.directory("second") / "config.env"))
         self.assertNotIn("token-b", named.read_text())

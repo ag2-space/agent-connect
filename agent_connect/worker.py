@@ -659,11 +659,10 @@ def preflight(adapter, status: Optional[StatusFile] = None) -> str:
 #: What a stop may spend waiting for the Relay Client's poll thread to leave.
 #:
 #: The arithmetic, because the number is a trade and not a taste. launchd sends
-#: SIGKILL 20 s after its SIGTERM (`ExitTimeOut`'s default; the plist in
-#: `install.sh` sets none), and everything after the wait — the `stopped` write
-#: that the whole handler exists for — has to happen before that. Twelve leaves
-#: eight for the loop to tear down and the file to be written, which measures in
-#: milliseconds once no answer is on the default executor (`in_daemon_thread`).
+#: SIGKILL `ExitTimeOut` after its SIGTERM: 30 s in the plist `install.sh`
+#: writes, and 5 s when a plist sets none (measured, not the documented 20).
+#: Everything after the wait — the `stopped` write that the whole handler exists
+#: for — has to happen before that.
 #:
 #: **What the wait buys is the singleton guard's release.** The library releases
 #: it only when the join actually joined — a guard released while the loop may
