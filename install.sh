@@ -12,10 +12,21 @@
 # one bearer with no lease between them, and a task the losing half never saw
 # was a message that vanished without an error. The launch unit is a process.
 #
-#   curl -fsSL <installer-url>/install.sh | sh -s -- --token <TOKEN> [--adapter codex]
+#   curl -fsSL <installer-url>/install.sh | sh -s -- --base <URL> --agent-id <MXID> [--adapter codex]
 #
-# Flags (also read from env):
-#   --token   AGENT_CONNECT_TOKEN    your agent's relay token from the Agent Portal [required]
+# That asks for the one-time code s.space shows, without echoing it. The token
+# the code is exchanged for goes only into the 0600 config file.
+#
+# Credential, one of (a re-run with none keeps the instance's stored token):
+#   --base    AGENT_CONNECT_BASE     s.space backend URL that redeems a one-time code;
+#                                    needs --agent-id
+#   --code    AGENT_CONNECT_CODE     the acp. code: `-` reads one line from stdin; with
+#                                    neither, it is asked for on the terminal. A code
+#                                    typed here works once, but shell history keeps it
+#   --trust-relay-host HOST          accept a relay the code names on another host
+#   --token-stdin                    read the relay token as one line from stdin
+#   --token   AGENT_CONNECT_TOKEN    the relay token itself (kept by ps and shell
+#                                    history; prefer the two above)
 #   --adapter AGENT_CONNECT_ADAPTER  codex | omnigent | ollama | cline | acp  [default: codex]
 #   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini
 #             [default: claude, or `custom` when --acp-command is given]
@@ -59,6 +70,12 @@ set -eu
 
 # ── args ────────────────────────────────────────────────────────────────────
 TOKEN="${AGENT_CONNECT_TOKEN:-}"
+TOKEN_STDIN=0
+TOKEN_ARGV=0
+BASE="${AGENT_CONNECT_BASE:-}"
+CODE="${AGENT_CONNECT_CODE:-}"
+CODE_ARGV=0
+TRUST_RELAY_HOST=""
 INSTANCE="${AGENT_CONNECT_INSTANCE:-default}"
 AGENT_ID=""
 AGENT_ID_GIVEN=0
@@ -133,7 +150,7 @@ separate repo that connects a running Sutando on its own terms.
   To connect a running Sutando:  pipx install ag2-sparrow
                                  (see that package's README for its directory
                                   and token settings)
-  To run an agent from here:     install.sh --token <TOKEN> [--adapter ...]
+  To run an agent from here:     install.sh --base <URL> --agent-id <MXID> [--adapter ...]
 GONE
   exit 2
 }
@@ -142,7 +159,11 @@ GONE
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --token)   TOKEN="$2"; shift 2 ;;
+    --token)   TOKEN="$2"; TOKEN_ARGV=1; shift 2 ;;
+    --token-stdin) TOKEN_STDIN=1; shift ;;
+    --base)    BASE="$2"; shift 2 ;;
+    --code)    CODE="$2"; [ "$2" = - ] || CODE_ARGV=1; shift 2 ;;
+    --trust-relay-host) TRUST_RELAY_HOST="$2"; shift 2 ;;
     --adapter) ADAPTER="$2"; shift 2 ;;
     --acp-agent) ACP_AGENT="$2"; shift 2 ;;
     --acp-command) ACP_COMMAND="$2"; shift 2 ;;
@@ -155,7 +176,10 @@ while [ $# -gt 0 ]; do
     --agent-id) AGENT_ID="${2:-}"; AGENT_ID_GIVEN=1; [ $# -ge 2 ] || { echo 'install.sh: --agent-id needs a Matrix id.' >&2; exit 2; }; shift 2 ;;
     --sutando-workspace|--sutando-workspace=*) sutando_gone ;;
     --no-start) START=0; shift ;;
-    --token=*)   TOKEN="${1#*=}"; shift ;;
+    --token=*)   TOKEN="${1#*=}"; TOKEN_ARGV=1; shift ;;
+    --base=*)    BASE="${1#*=}"; shift ;;
+    --code=*)    CODE="${1#*=}"; [ "$CODE" = - ] || CODE_ARGV=1; shift ;;
+    --trust-relay-host=*) TRUST_RELAY_HOST="${1#*=}"; shift ;;
     --adapter=*) ADAPTER="${1#*=}"; shift ;;
     --acp-agent=*) ACP_AGENT="${1#*=}"; shift ;;
     --acp-command=*) ACP_COMMAND="${1#*=}"; shift ;;
@@ -193,9 +217,69 @@ if [ "${#INSTANCE}" -gt 32 ]; then
   exit 2
 fi
 
-if [ -z "$TOKEN" ]; then
-  echo "install.sh: --token is required (get it from the s.space Agent Portal)." >&2
+# Credential source. Exactly one; none means "keep the stored token" and is
+# settled once the config path is known.
+_sources=0
+[ -z "$TOKEN" ] || _sources=$((_sources+1))
+[ "$TOKEN_STDIN" -eq 0 ] || _sources=$((_sources+1))
+[ -z "$BASE$CODE" ] || _sources=$((_sources+1))
+if [ "$_sources" -eq 0 ] && [ "$AGENT_ID_GIVEN" -eq 0 ] && [ "$INSTANCE_GIVEN" -eq 0 ]; then
+  # Keeping a stored token is a re-run of one named install, never a bare run:
+  # a bare run would rewrite the default install with this script's defaults.
+  echo "install.sh: no credential: pass --base and --agent-id to use the one-time code s.space shows, --token-stdin, or --agent-id/--instance to re-run an install with its stored token." >&2
   exit 2
+fi
+if [ "$_sources" -gt 1 ]; then
+  echo "install.sh: pass one of --token, --token-stdin or --base/--code." >&2
+  exit 2
+fi
+if [ -n "$CODE" ] && [ -z "$BASE" ]; then
+  echo "install.sh: --code needs --base, the s.space backend URL shown beside the code." >&2
+  exit 2
+fi
+if [ -n "$BASE" ] && [ "$AGENT_ID_GIVEN" -eq 0 ]; then
+  echo "install.sh: --base needs --agent-id, the Matrix id shown beside the code." >&2
+  exit 2
+fi
+# Under `curl … | sh`, stdin is this script: reading a line from it would eat
+# the installer's own text.
+stdin_is_script() { [ ! -f "$0" ]; }
+if { [ "$TOKEN_STDIN" -eq 1 ] || [ "$CODE" = - ]; } && stdin_is_script; then
+  echo "install.sh: stdin is this script here (curl | sh). Download install.sh and run it with sh, or leave out --code to be asked for the code." >&2
+  exit 2
+fi
+case $- in
+  *x*) set +x; echo "install.sh: tracing is off from here: it would print the code and the token." >&2 ;;
+esac
+if [ "$TOKEN_STDIN" -eq 1 ]; then
+  IFS= read -r TOKEN || true
+  [ -n "$TOKEN" ] || { echo "install.sh: --token-stdin read no token." >&2; exit 2; }
+fi
+if [ "$CODE" = - ]; then
+  IFS= read -r CODE || true
+  [ -n "$CODE" ] || { echo "install.sh: --code - read no code." >&2; exit 2; }
+elif [ -n "$BASE" ] && [ -z "$CODE" ]; then
+  if ! { : </dev/tty; } 2>/dev/null; then
+    echo "install.sh: no terminal to ask for the code on; pipe it in with --code -." >&2
+    exit 2
+  fi
+  printf 's.space code: ' >/dev/tty
+  trap 'stty echo </dev/tty 2>/dev/null; exit 130' INT TERM
+  stty -echo </dev/tty 2>/dev/null || true
+  IFS= read -r CODE </dev/tty || true
+  stty echo </dev/tty 2>/dev/null || true
+  trap - INT TERM
+  printf '\n' >/dev/tty
+  [ -n "$CODE" ] || { echo "install.sh: no code was entered." >&2; exit 2; }
+fi
+[ "$TOKEN_ARGV" -eq 0 ] || echo "install.sh: note: a token on the command line is kept by ps and shell history; next time use --base/--code or --token-stdin." >&2
+[ "$CODE_ARGV" -eq 0 ] || echo "install.sh: note: a code on the command line is kept by shell history; it works once, but next time use --code - or the prompt." >&2
+CODE="$(printf '%s' "$CODE" | tr -d '[:space:]')"
+if [ -n "$BASE" ]; then
+  case "$CODE" in
+    acp.?*) : ;;
+    *) echo "install.sh: that is not an agent code (it starts with acp.); copy it from s.space again. The code was not used." >&2; exit 2 ;;
+  esac
 fi
 
 # Captured before any default fills the variable in; the defaults are settled
@@ -230,7 +314,8 @@ reject_multiline() {  # <flag> <value>
       exit 2 ;;
   esac
 }
-reject_multiline --token "$TOKEN"
+[ -z "$TOKEN" ] || reject_multiline --token "$TOKEN"
+[ -z "$BASE" ] || reject_multiline --base "$BASE"
 reject_multiline --repo "$REPO"
 reject_multiline --adapter "$ADAPTER"
 [ -z "$AGENT_ID" ] || reject_multiline --agent-id "$AGENT_ID"
@@ -336,17 +421,13 @@ stored() {  # <KEY> [config path]
 ACP_COMMAND_STORED="$(stored AGENT_CONNECT_ACP_COMMAND)"
 ACP_AGENT_STORED="$(stored AGENT_CONNECT_ACP_AGENT)"
 ACP_URL_STORED="$(stored AGENT_CONNECT_ACP_URL)"
-MIGRATE_DEFAULT=0
-if [ "$INSTANCE" != default ]; then
-  LEGACY_TOKEN="$(stored AGENT_CONNECT_TOKEN "$HOME/.agent-connect/config.env")"
-  if [ "$LEGACY_TOKEN" = "$TOKEN" ]; then
-    # Only retire the legacy service when it uses this exact credential. A
-    # different agent's default service must keep running beside this one.
-    MIGRATE_DEFAULT=1
-  elif [ -n "$LEGACY_TOKEN" ]; then
-    say "legacy default has a different credential; its service is left unchanged"
-    say "if that credential was revoked, stop and disable the old service after confirming it is obsolete (README: Legacy migration cleanup)"
+if [ "$_sources" -eq 0 ]; then
+  TOKEN="$(stored AGENT_CONNECT_TOKEN)"
+  if [ -z "$TOKEN" ]; then
+    echo "install.sh: no credential: pass --base and --agent-id to use the one-time code s.space shows, or --token-stdin." >&2
+    exit 2
   fi
+  say "no credential given: keeping the token already in $CONFIG"
 fi
 
 # A stored command outranks any preset at runtime, so each way of arriving has
@@ -485,6 +566,143 @@ if [ "$ADAPTER" = "acp" ]; then
       say "ACP agent '$ACP_AGENT': install and log into it yourself; agent-connect only pins the Claude Code bridge"
       ;;
   esac
+  fi
+fi
+
+# ── 1b') redeem the one-time code ───────────────────────────────────────────
+# Only now, with the worker installed: a machine that cannot run the agent
+# never spends the code. The code goes in on stdin and the token comes back on
+# stdout into a variable, so neither is ever an argument of any process.
+if [ -n "$BASE" ]; then
+  say "redeeming the one-time code with $BASE"
+  REDEEM_PY="$APP_DIR/.redeem.py"
+  cat > "$REDEEM_PY" <<'PY'
+import json, re, sys, time, urllib.error, urllib.parse, urllib.request
+
+base, agent_id, trusted = sys.argv[1], sys.argv[2], sys.argv[3].strip().rstrip(".").lower()
+code = sys.stdin.readline().strip()
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
+def die(msg):
+    sys.stderr.write("install.sh: " + msg + "\n")
+    sys.exit(1)
+
+
+def clean(value):
+    # One line of the config file, and one `|` between URL and secret: only
+    # printable ASCII, no space, quote, backslash or `|`.
+    return bool(value) and all(0x21 <= ord(c) <= 0x7E and c not in '|"\\' for c in value)
+
+
+def url_problem(url, what):
+    if not clean(url):
+        return what + " has a character a URL here may not carry"
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port
+    except ValueError:
+        return what + " is not a URL"
+    if parts.scheme not in ("https", "http") or not parts.hostname or parts.username or parts.password:
+        return what + " is not an https URL"
+    if not re.fullmatch(r"[a-z0-9.-]+|[0-9a-f:.]+", parts.hostname):
+        return what + " has a host name with characters a host may not carry"
+    if parts.scheme == "http" and parts.hostname not in LOOPBACK:
+        return what + " is not https; only a loopback host may use plain http"
+    return ""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+why = url_problem(base, "--base")
+if why:
+    die(why + "; the code was not used")
+if not clean(agent_id):
+    die("--agent-id has a space or a character a Matrix id may not carry; the code was not used")
+opener = urllib.request.build_opener(NoRedirect)
+url = base.rstrip("/") + "/connect/poll"
+body = json.dumps({"device_code": code}).encode()
+for wait in (1, 2, 4, 8, 16, None):
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with opener.open(req, timeout=15) as resp:
+            status, raw = resp.status, resp.read(65536)
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, (e.read(65536) or b"")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        die("could not reach %s (%s); the code is still valid until it expires, run this again" %
+            (base, type(e).__name__))
+    try:
+        answer = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        answer = {}
+    answer = answer if isinstance(answer, dict) else {}
+    if status in (202, 503) and wait is not None:
+        after = answer.get("retry_after")
+        ok = status == 202 and isinstance(after, (int, float)) and not isinstance(after, bool) and after == after
+        time.sleep(min(max(float(after), 1.0), 30.0) if ok else wait)
+        continue
+    break
+if status == 202:
+    die("s.space is still redeeming the code; run this again with the same code in a minute")
+if status == 503:
+    die("s.space is busy (HTTP 503 on every try); the code is still valid, try again in a minute")
+if status == 404:
+    if answer.get("error") == "agent_revoked" or answer.get("reason") == "agent_revoked":
+        die("the agent was removed in s.space; add it again there for a new code")
+    die("the code was already used or has expired; make a new one in s.space")
+if 300 <= status < 400:
+    die("s.space redirected (HTTP %d); not following it with a code" % status)
+if status != 200:
+    die("s.space refused the code (HTTP %d)" % status)
+got = {k: answer.get(k) for k in ("relay_url", "bearer", "agent_id")}
+if not all(isinstance(v, str) and v.strip() for v in got.values()):
+    die("s.space's answer had no relay_url, bearer or agent_id; the code is spent, make a new one")
+relay, bearer, got_id = (got[k] for k in ("relay_url", "bearer", "agent_id"))
+if got_id != agent_id:
+    die("the code is for a different agent than %s; the code is spent and nothing was written: "
+        "make a new code for the agent you meant" % agent_id)
+why = url_problem(relay, "the relay URL s.space returned")
+if why:
+    die(why + "; the code is spent and nothing was written")
+host = urllib.parse.urlsplit(relay).hostname.rstrip(".").lower()
+base_host = urllib.parse.urlsplit(base).hostname.rstrip(".").lower()
+if host != base_host and not host.endswith("." + base_host) and host != trusted:
+    die("the relay URL s.space returned is on %s, not %s or a host under it; the code is spent and "
+        "nothing was written. If that relay is expected, run this again with a new code and "
+        "--trust-relay-host %s" % (host, base_host, host))
+if not clean(bearer):
+    die("s.space's answer held a malformed credential; the code is spent and nothing was written")
+sys.stdout.write(relay + "|" + bearer)
+PY
+  _rc=0
+  TOKEN="$(printf '%s\n' "$CODE" | python3 -I "$REDEEM_PY" "$BASE" "$AGENT_ID" "$TRUST_RELAY_HOST")" || _rc=$?
+  rm -f "$REDEEM_PY"
+  [ "$_rc" -eq 0 ] || exit 1
+  # Backstop: exactly one `|`, and nothing that could end the config line.
+  reject_multiline --token "$TOKEN"
+  case "$TOKEN" in
+    *'|'*'|'*|*'"'*|*\\*|*[[:space:]]*|*[![:print:]]*|'|'*|*'|') echo "install.sh: the redeemed token is malformed; nothing was written." >&2; exit 1 ;;
+    *'|'*) : ;;
+    *) echo "install.sh: the redeemed token is malformed; nothing was written." >&2; exit 1 ;;
+  esac
+  say "code redeemed for $AGENT_ID; its token is stored only in the config file"
+fi
+
+MIGRATE_DEFAULT=0
+if [ "$INSTANCE" != default ]; then
+  LEGACY_TOKEN="$(stored AGENT_CONNECT_TOKEN "$HOME/.agent-connect/config.env")"
+  if [ "$LEGACY_TOKEN" = "$TOKEN" ]; then
+    # Only retire the legacy service when it uses this exact credential. A
+    # different agent's default service must keep running beside this one.
+    MIGRATE_DEFAULT=1
+  elif [ -n "$LEGACY_TOKEN" ]; then
+    say "legacy default has a different credential; its service is left unchanged"
+    say "if that credential was revoked, stop and disable the old service after confirming it is obsolete (README: Legacy migration cleanup)"
   fi
 fi
 
