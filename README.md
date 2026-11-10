@@ -263,7 +263,7 @@ Name your agent and the worker knows what to run:
 
 ```bash
 export AGENT_CONNECT_ADAPTER=acp
-export AGENT_CONNECT_ACP_AGENT=claude          # a preset: claude | gemini
+export AGENT_CONNECT_ACP_AGENT=claude          # a preset: claude | gemini | hermes
 export AGENT_CONNECT_REPO=/path/to/the/repo    # the session's working directory
 ```
 
@@ -1013,7 +1013,7 @@ ACP adapter (see the section above):
 
 | Setting | What it does | Default |
 | --- | --- | --- |
-| `AGENT_CONNECT_ACP_AGENT` | preset naming the ACP agent to run: `claude`, `gemini` | *(unset)* |
+| `AGENT_CONNECT_ACP_AGENT` | preset naming the ACP agent to run: `claude`, `gemini`, `hermes` | *(unset)* |
 | `AGENT_CONNECT_ACP_COMMAND` | the ACP agent's command line, split as a shell would. **Overrides any preset**. `install.sh --acp-command` writes it; a re-run without that flag keeps it | *(unset)* |
 | `AGENT_CONNECT_ACP_URL` | an ACP agent **already running** behind a WebSocket URL, dialled instead of spawned (e.g. `ws://127.0.0.1:8802/acp`). Mutually exclusive with `AGENT_CONNECT_ACP_COMMAND` — setting both is refused rather than resolved, because they name two different agents. Needs the SDK's transport extra: `pip install 'agent-client-protocol[http]'` | *(unset)* |
 | `AGENT_CONNECT_ACP_TOKEN` | bearer for that URL's door, sent on the WebSocket handshake. Read at dial time, so rotating it needs no restart | *(unset)* |

@@ -28,7 +28,7 @@
 #   --token   AGENT_CONNECT_TOKEN    the relay token itself (kept by ps and shell
 #                                    history; prefer the two above)
 #   --adapter AGENT_CONNECT_ADAPTER  codex | omnigent | ollama | cline | acp  [default: codex]
-#   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini
+#   --acp-agent AGENT_CONNECT_ACP_AGENT  which ACP agent, when --adapter acp: claude | gemini | hermes
 #             [default: claude, or `custom` when --acp-command is given]
 #   --acp-url AGENT_CONNECT_ACP_URL      dial an ACP agent already running behind
 #                                        this ws:// URL instead of spawning one.

@@ -280,7 +280,21 @@ PRESETS: Dict[str, Preset] = {
              "from its documentation, NOT observed here: if it has moved, set "
              f"{COMMAND_ENV} and the preset is out of your way.",
     ),
+    "hermes": Preset(
+        binary="hermes",
+        fallback=("hermes", "acp"),
+        install="install Hermes Agent, then run `hermes setup`",
+        login="hermes setup  (or `hermes model`)",
+        verified=True,
+        args=("acp",),
+        note="Hermes Agent speaks ACP itself with `hermes acp`. To run a Hermes "
+             f"profile, set {COMMAND_ENV} to `hermes -p <profile> acp`.",
+    ),
 }
+
+#: ACP Agents that list `authMethods` on every `initialize`, logged in or not,
+#: by the name they give there. For them the list says nothing about login.
+ALWAYS_OFFERS_AUTH = frozenset({"hermes-agent"})
 
 #: Who `trust` is a command *to*. It is a message to the concierge and nothing
 #: else: `relay_allowlist.parse_command` on the s.space side is only ever
@@ -1354,7 +1368,8 @@ class AcpAdapter:
         except Exception as exc:  # noqa: BLE001 — a startup check reports, never raises
             return f"the ACP Agent would not start: {exc}"
         self.agent_description = agent
-        if agent.auth_methods and not _truthy(os.environ.get(SKIP_AUTH_ENV)):
+        if (agent.auth_methods and not _truthy(os.environ.get(SKIP_AUTH_ENV))
+                and (agent.name or "") not in ALWAYS_OFFERS_AUTH):
             return login_advice(agent)
         return None
 
