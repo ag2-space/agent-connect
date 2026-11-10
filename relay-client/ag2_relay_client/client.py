@@ -97,7 +97,7 @@ from .status import (
     STOPPED,
     StatusReporter,
 )
-from .transport import AuthRejected, RelayHTTP, RelayHTTPError
+from .transport import Abort, AuthRejected, RelayHTTP, RelayHTTPError
 
 log = logging.getLogger(__name__)
 
@@ -263,7 +263,7 @@ class RelayClient:
         "_reconciler", "_live", "_presence",
         "_ack_disabled_until", "_ack_owed", "_intake_deadline",
         "_result_retry_at", "_parked", "_heartbeat_disabled", "_last_heartbeat",
-        "_deferred_auth", "_drain_lock", "_stop", "_thread",
+        "_deferred_auth", "_drain_lock", "_stop", "_thread", "_poll_abort",
     )
 
     #: Written once, in `__init__`, and never again. `_room_ops` is sealed for
@@ -421,6 +421,8 @@ class RelayClient:
         self._deferred_auth: Optional[AuthRejected] = None
         self._drain_lock = threading.Lock()
         self._stop = threading.Event()
+        #: Fired by `stop()` to cut the long poll short; fresh on every start.
+        self._poll_abort = Abort()
         self._thread: Optional[threading.Thread] = None
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
@@ -492,6 +494,7 @@ class RelayClient:
             self.guard.release()
         self.prepare()
         self._stop.clear()
+        self._poll_abort = Abort()
         self._thread = threading.Thread(
             target=self._run, name=f"ag2-relay-{self.layout.instance}", daemon=True)
         self._thread.start()
@@ -547,6 +550,9 @@ class RelayClient:
         length of a long poll to learn that.
         """
         self._stop.set()
+        # Before the join, so the join has something to wait for that ends now
+        # rather than at the long poll's window.
+        self._poll_abort.fire()
         thread, self._thread = self._thread, None
         left = True
         if thread is not None and thread is not threading.current_thread():
@@ -634,9 +640,10 @@ class RelayClient:
         try:
             self._before_the_wire()
             self._raise_deferred_auth()
-            answer = self._http.get(
-                "/v1/tasks", params={"wait": self.poll_wait},
-                timeout=self.poll_wait + self.socket_margin)
+            with self._poll_abort.armed():
+                answer = self._http.get(
+                    "/v1/tasks", params={"wait": self.poll_wait},
+                    timeout=self.poll_wait + self.socket_margin)
             self._keep_guard_fresh()
             self._intake_all(answer)
             self._keep_guard_fresh()
@@ -651,6 +658,11 @@ class RelayClient:
         except AuthRejected as exc:
             return self._on_auth_rejected(exc)
         except Exception as exc:  # noqa: BLE001 — D1
+            if self._stop.is_set():
+                # `stop()` cut the long poll short: the sound of a shutdown,
+                # not a failure, so no warning and no RECONNECTING status.
+                log.debug("poll ended by stop(): %r", exc)
+                return 0.0
             delay = self.backoff.after_error()
             log.warning("poll failed (%s) — retrying in %ss",
                         _describe(exc), delay)
