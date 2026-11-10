@@ -497,14 +497,16 @@ fi
 #   dedicated venv    → fallback; deterministic bin paths for the service unit.
 WORKER_BIN=""
 say "installing the agent-connect worker (it carries its own relay client)"
+# --no-cache-dir: pip caches the package index, so a run soon after a release
+# can miss it ("no matching distribution") while PyPI already serves it.
 if command -v pipx >/dev/null 2>&1; then
-  pipx install --force "$AC_PIP_SPEC" >/dev/null
+  pipx install --force --pip-args=--no-cache-dir "$AC_PIP_SPEC" >/dev/null
   WORKER_BIN="$(command -v agent-connect || echo "$HOME/.local/bin/agent-connect")"
 else
   VENV="$APP_DIR/venv"
   python3 -m venv "$VENV"
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
-  "$VENV/bin/python" -m pip install --upgrade "$AC_PIP_SPEC" >/dev/null
+  "$VENV/bin/python" -m pip install --no-cache-dir --upgrade "$AC_PIP_SPEC" >/dev/null
   WORKER_BIN="$VENV/bin/agent-connect"
 fi
 

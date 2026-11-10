@@ -81,6 +81,9 @@ out="$(PATH="$TMP:$PATH" HOME="$TMP" TMP_PIPX_LOG="$PIPX_LOG" \
 grep -q "agent-connect" "$PIPX_LOG" \
   && ok "the installer installs the worker" \
   || { sed 's/^/    /' "$PIPX_LOG"; bad "pipx was never asked for the worker"; }
+grep -q -- "--pip-args=--no-cache-dir" "$PIPX_LOG" \
+  && ok "and bypasses pip's index cache, so a fresh release is found" \
+  || { sed 's/^/    /' "$PIPX_LOG"; bad "pipx install does not pass --no-cache-dir"; }
 grep -q "ag2-sparrow" "$PIPX_LOG" \
   && { sed 's/^/    /' "$PIPX_LOG"; bad "the installer still installs ag2-sparrow"; } \
   || ok "and installs no relay client beside it — the worker carries its own"
