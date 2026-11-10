@@ -56,6 +56,23 @@ PROTOCOL_VERSION = acp.PROTOCOL_VERSION
 # absence of `terminal` stays a decision rather than an oversight.
 CLIENT_CAPABILITIES = {"fs": {"readTextFile": False, "writeTextFile": False}}
 
+#: The worker's own credentials. A spawned ACP Agent never needs them, and an
+#: inherited relay token would let the agent act as the worker on the relay.
+WORKER_SECRET_ENV = (
+    "AGENT_CONNECT_TOKEN",
+    "REMOTE_TASK_TOKEN",
+    "AG2_REMOTE_TOKEN",
+    "AGENT_CONNECT_ACP_TOKEN",
+    "AGENT_CONNECT_CONFIG",
+)
+
+
+def child_env(extra: Optional[dict] = None) -> dict:
+    """The worker's environment minus its secrets, then `extra` on top."""
+    env = {k: v for k, v in os.environ.items() if k not in WORKER_SECRET_ENV}
+    env.update(extra or {})
+    return env
+
 
 class AcpError(Exception):
     """Anything the ACP Agent, or the connection to it, got wrong.
@@ -437,7 +454,7 @@ class AcpClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
-                env={**os.environ, **(env or {})} if env else None,
+                env=child_env(env),
             )
         except FileNotFoundError as exc:
             # Ticket 05 turns this into operator-facing install advice; the core
