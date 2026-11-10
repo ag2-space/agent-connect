@@ -9,6 +9,7 @@ restart. Cutting the long poll short is what lets the join succeed.
 Run: python3 tests/test_stop.py
 """
 import _bootstrap  # noqa: F401 — distribution root on sys.path
+import sys
 import tempfile
 import time
 
@@ -54,11 +55,21 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
     started = time.monotonic()
     client.stop(timeout=5.0)
     took = time.monotonic() - started
-    check(took < 2.0,
-          f"stop() returns at once instead of waiting out its join ({took:.2f}s)")
     lock = client.layout.singleton_path
-    check(lock.exists() and lock.read_text().strip() == "",
-          "the guard is released, so a replacement can poll immediately (J1)")
+    released = lock.exists() and lock.read_text().strip() == ""
+    if sys.platform == "win32":
+        # Winsock's shutdown() does not wake a recv another thread is already
+        # blocked in, so on Windows the stop still waits out its join, as it
+        # did before. What must hold there is the old invariant: a join that
+        # timed out leaves the guard held (B6), never a fast stop that lies.
+        check(released == (took < 2.0),
+              f"Windows: the guard is released only if the join joined "
+              f"({took:.2f}s, released={released})")
+    else:
+        check(took < 2.0,
+              f"stop() returns at once instead of waiting out its join ({took:.2f}s)")
+        check(released,
+              "the guard is released, so a replacement can poll immediately (J1)")
     check(RECONNECTING not in statuses[before_stop:],
           "a poll cut short by stop() is not reported as a reconnect")
     check(len(broker.took("GET", "/v1/tasks")) == 1,
