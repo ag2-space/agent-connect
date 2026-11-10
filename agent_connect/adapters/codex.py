@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import subprocess
 
+from agent_connect.childenv import child_env
+
 # Map our two tiers to codex's sandbox modes.
 SANDBOX = {"workspace-write": "workspace-write", "read-only": "read-only"}
 
@@ -38,6 +40,7 @@ def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=child_env(),
         )
     except FileNotFoundError:
         return "agent-connect: `codex` CLI not found on PATH — install + auth it first."

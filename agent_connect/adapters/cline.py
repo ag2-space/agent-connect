@@ -26,6 +26,8 @@ import os
 import re
 import subprocess
 
+from agent_connect.childenv import child_env
+
 BIN = os.environ.get("AGENT_CONNECT_CLINE_BIN", "cline")
 PROVIDER = os.environ.get("AGENT_CONNECT_CLINE_PROVIDER", "").strip()
 MODEL = os.environ.get("AGENT_CONNECT_CLINE_MODEL", "").strip()
@@ -68,6 +70,7 @@ def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=child_env(),
             cwd=cwd or None,
         )
     except FileNotFoundError:

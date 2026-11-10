@@ -24,6 +24,8 @@ import os
 import re
 import subprocess
 
+from agent_connect.childenv import child_env
+
 BIN = os.environ.get("AGENT_CONNECT_OMNIGENT_BIN", "omnigent")
 HARNESS = os.environ.get("AGENT_CONNECT_OMNIGENT_HARNESS", "claude")
 MODEL = os.environ.get("AGENT_CONNECT_OMNIGENT_MODEL", "").strip()
@@ -53,6 +55,7 @@ def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=child_env(),
             cwd=cwd or None,
         )
     except FileNotFoundError:
