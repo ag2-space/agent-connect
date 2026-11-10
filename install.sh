@@ -910,6 +910,9 @@ if [ "$OS" = "Darwin" ]; then
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <!-- launchd SIGKILLs 5 s after SIGTERM without this; a killed worker cannot
+       release its poller guard, and the next one stands by about 2.5 min. -->
+  <key>ExitTimeOut</key><integer>30</integer>
   <key>StandardOutPath</key><string>$APP_DIR/agent-connect.log</string>
   <key>StandardErrorPath</key><string>$APP_DIR/agent-connect.log</string>
 </dict></plist>
