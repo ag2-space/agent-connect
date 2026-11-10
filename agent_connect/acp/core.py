@@ -40,6 +40,8 @@ from typing import Any, Callable, Optional
 
 import acp
 
+from agent_connect.childenv import child_env
+
 # Protocol version this Client speaks. Verified against
 # @agentclientprotocol/claude-agent-acp 0.64.2, which also negotiates 1.
 PROTOCOL_VERSION = acp.PROTOCOL_VERSION
@@ -437,7 +439,7 @@ class AcpClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
-                env={**os.environ, **(env or {})} if env else None,
+                env=child_env(env),
             )
         except FileNotFoundError as exc:
             # Ticket 05 turns this into operator-facing install advice; the core
