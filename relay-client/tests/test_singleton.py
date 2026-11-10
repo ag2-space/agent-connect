@@ -50,6 +50,7 @@ from ag2_relay_client.locking import (
 )
 from ag2_relay_client.singleton import DEGRADED, HELD, IDLE, LOST, PollerGuard
 from ag2_relay_client.status import DISPLACED, STANDBY
+from ag2_relay_client.transport import RelayHTTP
 
 fails = 0
 
@@ -627,9 +628,36 @@ with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
 # out used to release anyway — emptying the record while the poll thread was
 # still inside `GET /v1/tasks`, so another client polled alongside it, which is
 # the precise thing the release-after-join ordering exists to prevent.
+#
+# `stop()` now cuts a long poll short through its socket, so a slow broker no
+# longer outlives the join. The case B6 guards is a poll the abort cannot
+# reach, so it is staged with a transport whose GET blocks without a socket.
+class _StuckGet:
+    def __init__(self, inner, seconds):
+        self.inner, self.seconds = inner, seconds
+
+    @property
+    def base_url(self):
+        return self.inner.base_url
+
+    def get(self, path, params=None, timeout=None):
+        if path == "/v1/tasks":
+            time.sleep(self.seconds)
+        return self.inner.get(path, params=params, timeout=timeout)
+
+    def post(self, path, payload=None, timeout=None):
+        return self.inner.post(path, payload, timeout=timeout)
+
+
 with FakeBroker() as broker, tempfile.TemporaryDirectory() as tmp:
-    broker.on("GET", "/v1/tasks", json={"tasks": []}, delay=1.0)
-    slow = client_for(broker, tmp, idle_gap=0.01)
+    broker.on("GET", "/v1/tasks", json={"tasks": []})
+    broker.on("POST", "/v1/tasks/*/ack", json={"ok": True})
+    broker.on("POST", "/v1/heartbeat", json={"ok": True})
+    slow = RelayClient(TokenSource(token=f"{broker.url}|SECRET"), tmp,
+                       instance="test", idle_gap=0.01,
+                       http=_StuckGet(RelayHTTP(TokenSource(
+                           token=f"{broker.url}|SECRET")), 1.0))
+    slow.prepare()
     slow.start()
     time.sleep(0.3)
     slow.stop(timeout=0.05)     # shorter than the poll it is inside

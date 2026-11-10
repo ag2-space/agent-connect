@@ -35,10 +35,12 @@ functions a test can call directly.
 """
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import logging
 import socket
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -501,9 +503,80 @@ def _bind(connection_class, resolver: BoundedResolver):
         # check to stay out of unrelated traffic, and a re-exec guard to avoid
         # recursing into itself.
         connection._create_connection = resolver.create_connection
+        abort = getattr(_ARMED, "abort", None)
+        if abort is not None:
+            connect = connection.connect
+
+            def connect_then_register():
+                connect()
+                abort._attach(connection)
+
+            connection.connect = connect_then_register
         return connection
 
     return factory
+
+
+_ARMED = threading.local()
+
+
+class Abort:
+    """Cuts short the one request a `stop()` would otherwise have to wait out.
+
+    The long poll blocks for up to its window inside `http.client`, often before
+    a response object exists, so the stop cannot reach it through the response
+    the way `close_stream` does. Instead the connection registers itself here
+    once its socket is up, for requests made inside `armed()` on this thread,
+    and `fire()` shuts that socket down: the blocked read fails at once and the
+    poll thread can be joined, which is what lets the guard be released (J1).
+
+    Thread-local arming keeps every request signature unchanged, so a wrapper
+    around the transport needs to know nothing about it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._connection = None
+        self._fired = False
+
+    @property
+    def fired(self) -> bool:
+        return self._fired
+
+    @contextlib.contextmanager
+    def armed(self):
+        _ARMED.abort = self
+        try:
+            yield
+        finally:
+            _ARMED.abort = None
+            with self._lock:
+                self._connection = None
+
+    def fire(self) -> None:
+        with self._lock:
+            self._fired = True
+            connection = self._connection
+        if connection is not None:
+            _shut(connection)
+
+    def _attach(self, connection) -> None:
+        with self._lock:
+            self._connection = connection
+            fired = self._fired
+        if fired:  # fired while the socket was still connecting
+            _shut(connection)
+
+
+def _shut(connection) -> None:
+    """Wake whatever is blocked on this connection's socket. Never raises."""
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except (OSError, ValueError):  # already closed, or the TLS layer is gone
+        pass
 
 
 class _ResolvingHTTPHandler(urllib.request.HTTPHandler):
