@@ -85,7 +85,7 @@ envelope carries what the broker attests about the sender — `user_id`,
 `reply_to_me`, `reply_to_sender`, `addressed_to`, `source_message_id`,
 `thread_root`, `source_room_id`, `platform_card`, `attempt`, and the
 AgentTrigger fields `event_type`, `agent_trigger_id`, `playbook` with the
-`trigger`, `summon` and `hook` context blocks. Plus `attachments`, which the
+`agent_trigger`, `summon` and `hook` context blocks. Plus `attachments`, which the
 media stage fills.
 
 All of it crosses **as data**. This library maps none of it to a decision: the
@@ -103,8 +103,8 @@ A platform card arrives whole or not at all: all five of `card_url`,
 `thread_root` and `source_room_id` are ingress only: the broker inherits a
 result's route from the task id, and a consumer that echoed them back could
 name a thread it was not asked in. `event_type` is carried whatever its value,
-so a trigger type added later still arrives; a context block is a flat mapping
-of string keys to scalars, or `None` when not sent.
+so a trigger type added later still arrives; a context block is a mapping of
+string keys to scalars, nested at most two levels, or `None` when not sent.
 
 The queue is a **handoff, not durability**. What survives a restart is the
 journal under the state dir, and the promise attached to it is worth stating

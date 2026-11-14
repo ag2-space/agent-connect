@@ -342,16 +342,27 @@ check(join.event_type == "room.joined" and join.agent_trigger_id == "join|@a:x|!
 check(parse_task(task_dict(event_type="room.future.v9")).event_type == "room.future.v9",
       "a type added after this release is carried, not dropped")
 check(all(getattr(plain, f) == "" for f in ("event_type", "agent_trigger_id", "playbook"))
-      and plain.trigger is None and plain.summon is None and plain.hook is None,
+      and plain.agent_trigger is None and plain.summon is None and plain.hook is None,
       "a payload with no trigger reads every trigger field as absent")
 blocks = parse_task(task_dict(
-    summon={"task_id": "s1", "row_id": "r1", "deep": {"x": 1}, 3: "k"},
-    trigger={"kind": "room.joined", "n": 2, "ok": True, "line": "a\nb"},
+    summon={"task_id": "s1", "row_id": "r1", 3: "k", "k" * 65: "long",
+            "changed_by": {"mxid": "@w:x", "is_agent": False, "owner_mxid": None},
+            "changes": [{"column": "Status", "to": "Doing"}],
+            "deep": {"a": {"b": {"c": 1}}}, "score": float("nan")},
+    agent_trigger={"event_type": "room.joined", "n": 2, "ok": True, "line": "a\nb"},
     hook="not a mapping"))
-check(blocks.summon == {"task_id": "s1", "row_id": "r1"},
-      "a summon block crosses flat: nested values and non-string keys are dropped")
-check(blocks.trigger == {"kind": "room.joined", "n": 2, "ok": True, "line": "a b"},
-      "a trigger block keeps its scalars, one line each")
+check(blocks.summon == {"task_id": "s1", "row_id": "r1",
+                        "changed_by": {"mxid": "@w:x", "is_agent": False,
+                                       "owner_mxid": None},
+                        "changes": [{"column": "Status", "to": "Doing"}],
+                        "deep": {"a": {}}},
+      "a summon block keeps the attested changed_by and its changes; non-string, "
+      "over-long keys, NaN and values past two levels are dropped")
+check(blocks.agent_trigger == {"event_type": "room.joined", "n": 2, "ok": True,
+                               "line": "a b"},
+      "the broker's agent_trigger block crosses under its own name, one line each")
+check(parse_task(task_dict(trigger={"event_type": "x"})).agent_trigger is None,
+      "a `trigger` key is not the broker's field and is not read as one")
 check(blocks.hook is None, "a block that is not a mapping reads as absent")
 
 CARD = {"card_url": "https://x/card.json", "card_sha256": "abc",

@@ -268,7 +268,7 @@ def turn_context(task, repo: str) -> TurnContext:
         agent_trigger_id=getattr(task, "agent_trigger_id", "") or "",
         playbook=getattr(task, "playbook", "") or "",
         trigger_context=tuple((name, tuple(block.items()))
-                              for name in ("trigger", "summon", "hook")
+                              for name in ("agent_trigger", "summon", "hook")
                               if (block := getattr(task, name, None))),
     )
 

@@ -48,14 +48,15 @@ delivered as the mxids it names in both.
 `source`, `interaction_type`, `platform_card`, `thread_root` and
 `source_room_id` are fields a consumer (sutando's task files) has serialized
 since before this package existed, and so are the AgentTrigger fields
-(`event_type`, `agent_trigger_id`, `playbook`) and the `trigger`, `summon` and
-`hook` context blocks; a library that dropped them would make
+(`event_type`, `agent_trigger_id`, `playbook`) and the `agent_trigger`, `summon`
+and `hook` context blocks; a library that dropped them would make
 migrating onto it a quiet loss of context that no test on either side would
 catch. Carried, never interpreted: no vocabulary is enforced, no default is
 substituted, nothing is gated on them.
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -214,7 +215,7 @@ class Task:
         # see the block comment in `__init__` below.
         "session_scope", "source", "interaction_type", "platform_card",
         "thread_root", "source_room_id",
-        "event_type", "agent_trigger_id", "playbook", "trigger", "summon", "hook",
+        "event_type", "agent_trigger_id", "playbook", "agent_trigger", "summon", "hook",
     )
 
     def __init__(
@@ -250,7 +251,7 @@ class Task:
         event_type: str = "",
         agent_trigger_id: str = "",
         playbook: str = "",
-        trigger: Optional[Mapping[str, Any]] = None,
+        agent_trigger: Optional[Mapping[str, Any]] = None,
         summon: Optional[Mapping[str, Any]] = None,
         hook: Optional[Mapping[str, Any]] = None,
     ):
@@ -348,8 +349,8 @@ class Task:
         self.event_type = event_type
         self.agent_trigger_id = agent_trigger_id
         self.playbook = playbook
-        #: Structured context blocks, flat and bounded; `None` when not sent.
-        self.trigger = trigger
+        #: Structured context blocks, bounded; `None` when not sent.
+        self.agent_trigger = agent_trigger
         self.summon = summon
         self.hook = hook
 
@@ -423,7 +424,7 @@ def parse_task(raw: Mapping[str, Any]) -> Optional[Task]:
         event_type=_text(raw.get("event_type")),
         agent_trigger_id=_text(raw.get("agent_trigger_id")),
         playbook=_text(raw.get("playbook")),
-        trigger=_context_block(raw.get("trigger")),
+        agent_trigger=_context_block(raw.get("agent_trigger")),
         summon=_context_block(raw.get("summon")),
         hook=_context_block(raw.get("hook")),
     )
@@ -470,29 +471,54 @@ def _platform_card(value: Any) -> Optional[Mapping[str, str]]:
     return card
 
 
-#: A context block's bounds: how many keys it keeps and how long a key may be.
+#: A context block's bounds: keys per mapping, items per list, key length, depth.
 MAX_BLOCK_KEYS = 32
+MAX_BLOCK_ITEMS = 16
+MAX_BLOCK_KEY = 64
+MAX_BLOCK_DEPTH = 2
+
+
+def _block_value(value: Any, depth: int) -> Any:
+    """A bounded copy of one block value, or `_DROP` for a shape not carried."""
+    if isinstance(value, str):
+        return _text(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _DROP
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if depth > MAX_BLOCK_DEPTH:
+        return _DROP
+    if isinstance(value, Mapping):
+        out = {}
+        for key, held in value.items():
+            if len(out) >= MAX_BLOCK_KEYS:
+                break
+            # An over-long key is dropped, not cut: two cut keys could collide.
+            if (not isinstance(key, str) or not key or len(key) > MAX_BLOCK_KEY
+                    or _text(key, MAX_BLOCK_KEY) != key):
+                continue
+            kept = _block_value(held, depth + 1)
+            if kept is not _DROP:
+                out[key] = kept
+        return out
+    if isinstance(value, (list, tuple)):
+        items = (_block_value(v, depth + 1) for v in list(value)[:MAX_BLOCK_ITEMS])
+        return [v for v in items if v is not _DROP]
+    return _DROP
+
+
+_DROP = object()
 
 
 def _context_block(value: Any) -> Optional[Mapping[str, Any]]:
-    """A flat context block (`trigger`, `summon`, `hook`), or `None`.
+    """A context block (`agent_trigger`, `summon`, `hook`), or `None`.
 
-    String keys and scalar values only, each bounded like any wire string; a
-    nested value or a non-string key is dropped rather than guessed at.
+    String keys; scalars, and mappings or lists of them two levels deep, each
+    bounded like any wire string. Non-finite numbers and deeper values are dropped.
     """
     if not isinstance(value, Mapping):
         return None
-    block = {}
-    for key, held in value.items():
-        if len(block) >= MAX_BLOCK_KEYS:
-            break
-        if not isinstance(key, str) or not _text(key, 64):
-            continue
-        if isinstance(held, str):
-            block[_text(key, 64)] = _text(held)
-        elif held is None or isinstance(held, (bool, int, float)):
-            block[_text(key, 64)] = held
-    return block or None
+    return _block_value(value, 0) or None
 
 
 def _members(value: Any) -> Tuple[str, ...]:

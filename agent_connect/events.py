@@ -143,7 +143,7 @@ class TurnContext:
     interaction_type: str = ""
     agent_trigger_id: str = ""
     playbook: str = ""
-    #: The broker's `trigger`, `summon` and `hook` blocks, by name, when sent.
+    #: The broker's `agent_trigger`, `summon` and `hook` blocks, by name, when sent.
     trigger_context: Tuple[Tuple[str, Any], ...] = ()
 
     @property
