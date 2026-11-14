@@ -25,6 +25,8 @@ from __future__ import annotations
 import os
 import subprocess
 
+from agent_connect.childenv import child_env
+
 BIN = os.environ.get("AGENT_CONNECT_KILO_BIN", "kilo")
 
 
@@ -37,6 +39,7 @@ def run(task: str, sandbox: str, cwd: str, timeout: int = 600) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=child_env(),
             cwd=cwd or None,
         )
     except FileNotFoundError:

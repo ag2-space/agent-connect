@@ -37,9 +37,12 @@ if sh -n "$HERE/run-agent.sh" 2>/dev/null || bash -n "$HERE/run-agent.sh"; then
   ok "run-agent.sh syntax clean"; else bad "run-agent.sh syntax"; fi
 
 # 2) missing --token exits 2
-if sh "$SCRIPT" >/dev/null 2>&1; then bad "no-token should exit non-zero"; else
+# A scratch HOME: this must never reach a real install, whatever it does.
+_home="$(mktemp -d)"
+if HOME="$_home" sh "$SCRIPT" >/dev/null 2>&1; then bad "no-token should exit non-zero"; else
   rc=$?; [ "$rc" -eq 2 ] && ok "missing --token → exit 2" || bad "missing --token → exit $rc (want 2)"
 fi
+rm -rf "$_home"
 
 # 3) unknown arg exits 2
 if sh "$SCRIPT" --token T --bogus >/dev/null 2>&1; then bad "unknown arg should fail"; else
@@ -78,6 +81,9 @@ out="$(PATH="$TMP:$PATH" HOME="$TMP" TMP_PIPX_LOG="$PIPX_LOG" \
 grep -q "agent-connect" "$PIPX_LOG" \
   && ok "the installer installs the worker" \
   || { sed 's/^/    /' "$PIPX_LOG"; bad "pipx was never asked for the worker"; }
+grep -q -- "--pip-args=--no-cache-dir" "$PIPX_LOG" \
+  && ok "and bypasses pip's index cache, so a fresh release is found" \
+  || { sed 's/^/    /' "$PIPX_LOG"; bad "pipx install does not pass --no-cache-dir"; }
 grep -q "ag2-sparrow" "$PIPX_LOG" \
   && { sed 's/^/    /' "$PIPX_LOG"; bad "the installer still installs ag2-sparrow"; } \
   || ok "and installs no relay client beside it — the worker carries its own"

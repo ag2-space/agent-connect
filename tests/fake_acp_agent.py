@@ -33,6 +33,7 @@ answers every prompt with one message and stops with `end_turn`.
     {
       "agentCapabilities": {...},     # merged over the default capabilities
       "authMethods": [...],           # advertised by initialize
+      "agentName": "...",             # agentInfo.name (default fake-acp-agent)
       "newSessionError": {"code": -32000, "message": "..."},
       "promptError":     {"code": -32000, "message": "..."},
       "loadSessionError": {...},      # refuse Session resumption
@@ -272,7 +273,8 @@ class FakeAcpAgent:
         return {
             "protocolVersion": PROTOCOL_VERSION,
             "agentCapabilities": capabilities,
-            "agentInfo": {"name": "fake-acp-agent", "version": "1.0.0"},
+            "agentInfo": {"name": self.script.get("agentName") or "fake-acp-agent",
+                          "version": "1.0.0"},
             "authMethods": self.script.get("authMethods") or [],
         }
 

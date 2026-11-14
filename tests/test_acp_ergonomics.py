@@ -150,6 +150,11 @@ check(BRIDGE_VERSION.count(".") == 2 and "latest" not in BRIDGE_SPEC,
 for name, preset in sorted(PRESETS.items()):
     check(preset.install and preset.login,
           f"the {name} preset says how to install it and how to log in")
+with tempfile.TemporaryDirectory() as d:
+    fake = Path(d) / "hermes"
+    fake.write_text("#!/bin/sh\n"); fake.chmod(0o755)
+    check(PRESETS["hermes"].command({"PATH": d}) == [str(fake), "acp"],
+          "the hermes preset runs the installed `hermes acp`")
 check(PRESETS["claude"].verified and not PRESETS["gemini"].verified,
       "presets say whether a real Turn was observed against them — claude was, "
       "gemini was read from documentation")
@@ -252,6 +257,18 @@ check(ok_problem is None,
       "an authenticated ACP Agent — no authMethods — passes the startup check")
 check("fake-acp-agent" in bench.adapter.describe(),
       "and the Worker can say which agent it found")
+
+# Hermes lists authMethods on every initialize, logged in or not.
+HERMES = {"agentName": "hermes-agent", "authMethods": [
+    {"id": "nous", "name": "nous runtime credentials"},
+    {"id": "provider", "name": "Configure Hermes provider"},
+]}
+bench = FakeAgentBench(HERMES)
+check(bench.preflight(**{AGENT_ENV: None, SKIP_AUTH_ENV: None}) is None,
+      "an agent known to always list authMethods (hermes-agent) passes the check")
+bench = FakeAgentBench(dict(LOGGED_OUT, agentName="other-agent"))
+check(bench.preflight(**{AGENT_ENV: None, SKIP_AUTH_ENV: None}) is not None,
+      "any other agent listing authMethods is still stopped")
 
 
 # --- 4) the Worker itself stops, rather than answering a room with a login --
