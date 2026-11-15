@@ -263,7 +263,7 @@ Name your agent and the worker knows what to run:
 
 ```bash
 export AGENT_CONNECT_ADAPTER=acp
-export AGENT_CONNECT_ACP_AGENT=claude          # a preset: claude | gemini | hermes
+export AGENT_CONNECT_ACP_AGENT=claude          # a preset: claude | gemini | hermes | antigravity
 export AGENT_CONNECT_REPO=/path/to/the/repo    # the session's working directory
 ```
 
@@ -272,6 +272,16 @@ Or install it in one line, with the bridge pinned for you:
 ```bash
 curl -fsSL <installer-url>/install.sh | sh -s -- --base <URL> --agent-id <MXID> --adapter acp --acp-agent claude
 ```
+
+Which presets have run a real Turn: `claude` and `hermes` have. `gemini` runs
+`gemini --acp` (Gemini CLI 0.59.0 or later; older releases spelled it
+`--experimental-acp`, which you can still pass with `--acp-command`). Its
+handshake was checked against 0.59.0, but not a full Turn. The preset also sets
+`GEMINI_CLI_NO_RELAUNCH=true`, without which the CLI never answered the worker;
+put `env GEMINI_CLI_NO_RELAUNCH=true` in front of your own `--acp-command` if
+you run Gemini that way. `antigravity` runs
+`agy acp` and is read from Antigravity's documentation only. For both, log in
+first (`gemini` then `/auth`, or `GEMINI_API_KEY`; `agy acp --login`).
 
 **Presets never block you.** They live in code (`agent_connect/adapters/acp.py`)
 and cover the agents we know about. For anything else, give the command
@@ -1013,7 +1023,7 @@ ACP adapter (see the section above):
 
 | Setting | What it does | Default |
 | --- | --- | --- |
-| `AGENT_CONNECT_ACP_AGENT` | preset naming the ACP agent to run: `claude`, `gemini`, `hermes` | *(unset)* |
+| `AGENT_CONNECT_ACP_AGENT` | preset naming the ACP agent to run: `claude`, `gemini`, `hermes`, `antigravity` | *(unset)* |
 | `AGENT_CONNECT_ACP_COMMAND` | the ACP agent's command line, split as a shell would. **Overrides any preset**. `install.sh --acp-command` writes it; a re-run without that flag keeps it | *(unset)* |
 | `AGENT_CONNECT_ACP_URL` | an ACP agent **already running** behind a WebSocket URL, dialled instead of spawned (e.g. `ws://127.0.0.1:8802/acp`). Mutually exclusive with `AGENT_CONNECT_ACP_COMMAND` — setting both is refused rather than resolved, because they name two different agents. Needs the SDK's transport extra: `pip install 'agent-client-protocol[http]'` | *(unset)* |
 | `AGENT_CONNECT_ACP_TOKEN` | bearer for that URL's door, sent on the WebSocket handshake. Read at dial time, so rotating it needs no restart | *(unset)* |

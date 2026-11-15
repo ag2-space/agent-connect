@@ -47,6 +47,7 @@ try:
         install_advice,
         preset_for,
         resolve_command,
+        resolve_endpoint,
     )
     from agent_connect.events import TurnContext
 except ImportError as exc:  # pragma: no cover — an environment problem, not a bug
@@ -155,9 +156,34 @@ with tempfile.TemporaryDirectory() as d:
     fake.write_text("#!/bin/sh\n"); fake.chmod(0o755)
     check(PRESETS["hermes"].command({"PATH": d}) == [str(fake), "acp"],
           "the hermes preset runs the installed `hermes acp`")
-check(PRESETS["claude"].verified and not PRESETS["gemini"].verified,
+    for name, binary, args in (("gemini", "gemini", ["--acp"]),
+                               ("antigravity", "agy", ["acp"])):
+        fake = Path(d) / binary
+        fake.write_text("#!/bin/sh\n"); fake.chmod(0o755)
+        check(PRESETS[name].command({"PATH": d}) == [str(fake), *args],
+              f"the {name} preset runs the installed `{binary} {' '.join(args)}`")
+with tempfile.TemporaryDirectory() as d:
+    check(PRESETS["gemini"].command({"PATH": d})[-1] == "--acp"
+          and "--experimental-acp" not in PRESETS["gemini"].command({"PATH": d}),
+          "the gemini fallback asks for --acp, not the deprecated flag")
+    check(PRESETS["antigravity"].command({"PATH": d}) == ["agy", "acp"],
+          "the antigravity preset has no fetch to fall back to, so it names agy")
+# Gemini CLI relaunches itself unless told not to, and the relaunched copy
+# left the Worker's `initialize` unanswered on 0.59.0.
+with tempfile.TemporaryDirectory() as d:
+    gem = {"PATH": d, AGENT_ENV: "gemini"}
+    check(dict(resolve_endpoint(gem).env) == {"GEMINI_CLI_NO_RELAUNCH": "true"},
+          "the gemini preset spawns with GEMINI_CLI_NO_RELAUNCH=true")
+    check(resolve_endpoint(dict(gem, GEMINI_CLI_NO_RELAUNCH="false")).env == (),
+          "but an operator's own GEMINI_CLI_NO_RELAUNCH is left alone")
+    check(resolve_endpoint(dict(gem, **{COMMAND_ENV: "gemini --acp"})).env == (),
+          "and an explicit command gets no preset environment")
+    check(resolve_endpoint({"PATH": d, AGENT_ENV: "claude"}).env == (),
+          "presets without an environment add none")
+check(PRESETS["claude"].verified and not PRESETS["gemini"].verified
+      and not PRESETS["antigravity"].verified,
       "presets say whether a real Turn was observed against them — claude was, "
-      "gemini was read from documentation")
+      "gemini and antigravity were not")
 
 # The pure function ticket 04 left alone still behaves as it did.
 check(command_from_env({COMMAND_ENV: "npx @scope/pkg --acp"})
@@ -266,6 +292,14 @@ HERMES = {"agentName": "hermes-agent", "authMethods": [
 bench = FakeAgentBench(HERMES)
 check(bench.preflight(**{AGENT_ENV: None, SKIP_AUTH_ENV: None}) is None,
       "an agent known to always list authMethods (hermes-agent) passes the check")
+# Gemini CLI builds the same list in every initialize (0.59.0's own reply).
+GEMINI = {"agentName": "gemini-cli", "authMethods": [
+    {"id": "oauth-personal", "name": "Log in with Google"},
+    {"id": "gemini-api-key", "name": "Gemini API key"},
+]}
+bench = FakeAgentBench(GEMINI)
+check(bench.preflight(**{AGENT_ENV: None, SKIP_AUTH_ENV: None}) is None,
+      "gemini-cli, which always lists authMethods, passes the check too")
 bench = FakeAgentBench(dict(LOGGED_OUT, agentName="other-agent"))
 check(bench.preflight(**{AGENT_ENV: None, SKIP_AUTH_ENV: None}) is not None,
       "any other agent listing authMethods is still stopped")

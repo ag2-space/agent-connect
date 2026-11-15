@@ -249,6 +249,8 @@ class Preset:
     verified: bool
     args: Tuple[str, ...] = ()
     note: str = ""
+    #: Set for the spawned agent unless the operator already set them.
+    env: Tuple[Tuple[str, str], ...] = ()
 
     def command(self, env: Optional[dict] = None) -> List[str]:
         """The command to run: the installed copy, else the pinned fetch."""
@@ -271,14 +273,19 @@ PRESETS: Dict[str, Preset] = {
     ),
     "gemini": Preset(
         binary="gemini",
-        fallback=("npx", "-y", "@google/gemini-cli", "--experimental-acp"),
+        fallback=("npx", "-y", "@google/gemini-cli", "--acp"),
         install="npm install -g @google/gemini-cli",
-        login="gemini  (then /auth)",
+        login="gemini  (then /auth), or set GEMINI_API_KEY",
         verified=False,
-        args=("--experimental-acp",),
-        note="Gemini CLI speaks ACP itself, behind --experimental-acp. Read "
-             "from its documentation, NOT observed here: if it has moved, set "
-             f"{COMMAND_ENV} and the preset is out of your way.",
+        args=("--acp",),
+        # Without it the CLI relaunches itself in a child node process, and the
+        # Worker's `initialize` was never answered (observed on 0.59.0, macOS).
+        env=(("GEMINI_CLI_NO_RELAUNCH", "true"),),
+        note="Gemini CLI speaks ACP itself with --acp (0.59.0 lists it; older "
+             "releases called it --experimental-acp). Observed here on 0.59.0: "
+             "initialize answered, and a logged-out CLI refused session/new as "
+             "auth-required. No Turn yet, for want of a login: if the flag has "
+             f"moved, set {COMMAND_ENV} and the preset is out of your way.",
     ),
     "hermes": Preset(
         binary="hermes",
@@ -290,11 +297,24 @@ PRESETS: Dict[str, Preset] = {
         note="Hermes Agent speaks ACP itself with `hermes acp`. To run a Hermes "
              f"profile, set {COMMAND_ENV} to `hermes -p <profile> acp`.",
     ),
+    "antigravity": Preset(
+        binary="agy",
+        fallback=("agy", "acp"),
+        install="install the Antigravity CLI: "
+                "https://antigravity.google/docs/install?tab=cli",
+        login="agy acp --login  (or sign in once in an interactive `agy`)",
+        verified=False,
+        args=("acp",),
+        note="Antigravity's CLI speaks ACP with `agy acp`. Read from its "
+             "documentation, NOT observed here: if it has moved, set "
+             f"{COMMAND_ENV} and the preset is out of your way.",
+    ),
 }
 
 #: ACP Agents that list `authMethods` on every `initialize`, logged in or not,
 #: by the name they give there. For them the list says nothing about login.
-ALWAYS_OFFERS_AUTH = frozenset({"hermes-agent"})
+#: gemini-cli builds its list as a constant in `initialize` (seen in 0.59.0).
+ALWAYS_OFFERS_AUTH = frozenset({"hermes-agent", "gemini-cli"})
 
 #: Who `trust` is a command *to*. It is a message to the concierge and nothing
 #: else: `relay_allowlist.parse_command` on the s.space side is only ever
@@ -747,6 +767,8 @@ class Endpoint:
     url: str = ""
     token: str = ""
     command: Tuple[str, ...] = ()
+    #: Extra environment for a spawned command, from its preset.
+    env: Tuple[Tuple[str, str], ...] = ()
 
     @property
     def dialled(self) -> bool:
@@ -785,7 +807,20 @@ def resolve_endpoint(env: Optional[dict] = None) -> Endpoint:
         )
     if url:
         return Endpoint(url=resolve_url(url, env), token=token_from_env(env))
-    return Endpoint(command=tuple(resolve_command(env)))
+    return Endpoint(command=tuple(resolve_command(env)), env=preset_env(env))
+
+
+def preset_env(env: Optional[dict] = None) -> Tuple[Tuple[str, str], ...]:
+    """The named preset's environment, minus what the operator already set.
+
+    Empty when an explicit command is in force: that command is the operator's,
+    and a preset they are not using has no business in its environment.
+    """
+    env = os.environ if env is None else env
+    name = (env.get(AGENT_ENV) or "").strip()
+    if (env.get(COMMAND_ENV) or "").strip() or not name:
+        return ()
+    return tuple((k, v) for k, v in preset_for(name).env if k not in env)
 
 
 def preset_for(name: str) -> Preset:
@@ -1265,7 +1300,8 @@ class AcpAdapter:
                 cookie_store=self._cookies,
                 **kwargs,
             )
-        return AcpClient.spawn(list(endpoint.command), cwd=cwd, **kwargs)
+        return AcpClient.spawn(list(endpoint.command), cwd=cwd,
+                               env=dict(endpoint.env) or None, **kwargs)
 
     def mode(self) -> str:
         return self._mode if self._mode is not None else os.environ.get(MODE_ENV, "").strip()

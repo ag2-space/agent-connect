@@ -349,6 +349,14 @@ grep -q '^AGENT_CONNECT_ACP_AGENT="gemini"$' "$TMP/.agent-connect/config.env" \
 grep -q "claude-agent-acp" "$NPM_LOG" \
   && bad "the Claude bridge was installed for a non-Claude preset" \
   || ok "no bridge installed for a preset that does not use one"
+: > "$NPM_LOG"
+out=$(PATH="$TMP:$PATH" HOME="$TMP" TMP_NPM_LOG="$NPM_LOG" \
+      sh "$SCRIPT" --token T --adapter acp --acp-agent antigravity --no-start 2>&1) || bad "acp antigravity dry-run failed"
+grep -q '^AGENT_CONNECT_ACP_AGENT="antigravity"$' "$TMP/.agent-connect/config.env" \
+  && ok "--acp-agent antigravity is written through" || bad "--acp-agent antigravity not wired through"
+grep -q "claude-agent-acp" "$NPM_LOG" \
+  && bad "the Claude bridge was installed for antigravity" \
+  || ok "no bridge installed for antigravity"
 
 # 9b) --acp-command: written through, preset name defaults to a non-preset so
 #     no bridge is fetched, and a re-run without the flag keeps the command.
